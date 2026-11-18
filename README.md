@@ -1,42 +1,81 @@
-# Cybrot SOC Core (prototype, v0.2)
+# Cybrot SOC Core (prototype, v0.3)
 
 Core pipeline for the hospital/clinic SOC service: **logs in -> detection rules -> alert with severity ->
 triage queue with a named owner and response step -> metrics** (alert volume, false-positive rate,
 detection rate on planted attacks, mean time to acknowledge). Test data only - never real patient data.
 
-## Run
+## Run locally
     pip install -r requirements.txt
     python app.py                 # http://localhost:5000
-    # click "Load demo data", then "Auto-label (lab)", or triage alerts by hand (Ack / TP / FP)
-    python generate.py            # or push synthetic logs from the CLI
-    # Docker: docker compose up --build
+    # Click "Load demo data", then "Auto-label (lab)", or triage alerts by hand (Ack / TP / FP / ?)
+    python generate.py            # or push synthetic logs from the command line
+
+## Run with Docker
+    docker compose up --build     # http://localhost:5000
+    # Not yet verified: the Docker build was not run in the development sandbox.
+
+## Configuration
+| Variable | Default | Purpose |
+|---|---|---|
+| `SOC_DB` | `soc.db` (`/data/soc.db` in Docker) | SQLite database path |
+| `ANALYSTS` | `analyst1,analyst2,analyst3` | Owners for alerts, assigned round-robin |
+| `LAB_ENDPOINTS` | `1` | `0` disables `/api/demo`, `/api/autolabel`, `/api/reset` (they return 404) |
+| `SOC_API_TOKEN` | empty (no token) | If set, every `/api/` call needs `Authorization: Bearer <token>` |
+| `PORT` | `5000` | HTTP port when running `python app.py` |
 
 ## Test
-    pip install pytest && pytest -q tests
+    pip install pytest
+    pytest -q tests              # 11 tests; all pass in the development sandbox
 
 ## Layout
 - `app.py`      Flask API + SQLite: `/api/events`, `/api/ingest/wazuh`, `/api/alerts`, `/api/metrics`
-- `detect.py`   built-in rules + playbooks; Wazuh playbooks by rule id (`WAZUH_PLAYBOOK`), level fallback
+- `detect.py`   built-in rules and playbooks; Wazuh playbooks by rule id (`WAZUH_PLAYBOOK`), with a level-based fallback
 - `generate.py` synthetic clinic logs with 3 planted attacks (ground truth in `attack_id`)
-- `static/`     triage dashboard
+- `static/`     triage dashboard (`index.html`)
 - `tests/`      pytest suite; `fixtures/` holds a real Wazuh alert (Sysmon rule 92213)
-- `wazuh/`      sample Wazuh rules + webhook config (untested in this build)
+- `wazuh/`      sample Wazuh rules and webhook config (not yet tested on a Wazuh manager)
 
-## Changes in v0.2
-- Wazuh alerts store the key facts (file path, process) in a `detail` column, shown under the summary.
-- Wazuh alerts get rule-specific response steps (rule 92213 has one) instead of the generic step.
-- Dedupe for Wazuh alerts includes the file/process, so a different file on the same host alerts again.
-- Existing databases are migrated automatically (adds the `detail` column).
-- `LAB_ENDPOINTS=0` disables `/api/demo`, `/api/autolabel` and `/api/reset`. Keep it at 1 for the lab only.
-- Wazuh tuning rule 100200 (wazuh/local_rules.xml) silences the benign PowerShell policy test file. Untested.
+## Built-in detection rules
+| Rule | Severity | Fires when |
+|---|---|---|
+| `FAILED_LOGIN_BURST` | high | 5 or more failed logins from one IP within 5 minutes |
+| `BULK_RECORD_ACCESS` | high | One user opens 15 or more patient records within 10 minutes |
+| `OFFHOURS_ACCESS` | low | Record access between 22:00 and 05:59 (intentionally noisy, for the FP-rate test) |
+| `SUSPICIOUS_PROCESS` | critical | A process command line contains `mimikatz`, `-enc `, `certutil -urlcache`, `nc -e`, or `vssadmin delete shadows` |
+
+## Wazuh integration
+- Wazuh alerts arrive at `POST /api/ingest/wazuh?tenant=<hospital>`. Level 12+ is critical, 10+ high, 7+ medium.
+- Each alert keeps its key facts (file path, process) in the `detail` column, shown under the summary.
+- Rule 92213 (Sysmon file drop) has its own response step. Other Wazuh rules use a level-based step.
+- Repeats of the same rule, host, file and process within 10 minutes are suppressed. A different file alerts again.
+- Tuning rule 100200 in `wazuh/local_rules.xml` silences the benign PowerShell execution-policy test file.
+  **Untested:** check it with `wazuh-logtest` on `tests/fixtures/wazuh_92213_psscriptpolicy.json` before deploying.
 
 ## Security (before any real data)
-- Set `LAB_ENDPOINTS=0`. The dashboard still has the lab buttons; they will return 404.
-- Set `SOC_API_TOKEN` to a long random value. Every `/api/` call then needs `Authorization: Bearer <token>`.
-  The dashboard asks for the token once per browser tab. Wazuh's built-in integration cannot send headers, so
-  `/api/ingest/*` also accepts `?token=` in the URL. That URL can end up in logs: keep the webhook on a private network.
-- This is a shared secret, not user login. Real per-user login and roles are still to be built.
+- Set `LAB_ENDPOINTS=0`. The dashboard still shows the lab buttons, but they will return 404.
+- Set `SOC_API_TOKEN` to a long random value. The dashboard asks for the token once per browser tab.
+- Wazuh's built-in integration cannot send headers, so `/api/ingest/*` also accepts `?token=` in the URL.
+  That URL can end up in logs, so keep the webhook on a private network or behind a reverse proxy.
+- Serve the app over HTTPS behind a reverse proxy.
+- This is a shared secret, not user login. There are no per-user accounts or roles yet.
+
+## Changes
+**v0.3**
+- `SOC_API_TOKEN` gates the `/api/` endpoints. The dashboard prompts for the token.
+- `/api/ingest/*` also accepts `?token=` for Wazuh's built-in integration.
+- Tests for the token rules.
+
+**v0.2**
+- Wazuh alerts store the file path and process in the `detail` column.
+- Wazuh alerts get rule-specific response steps and file-aware dedupe.
+- Existing databases are migrated automatically (adds the `detail` column).
+- `LAB_ENDPOINTS` switch for the lab-only endpoints.
+- Wazuh tuning rule 100200 (untested).
 
 ## Not built yet (next)
-Kafka buffer, Fluent Bit shipping, Shuffle playbooks, TheHive/Jira, MISP, Sigma conversion,
-auth/roles, plan-based feature gating, hospital-facing portal, PDF reports.
+- Per-user login and roles (hospital viewer/admin, Cybrot analyst)
+- Fluent Bit log shipping and Kafka buffer
+- Live Wazuh connection on the VM (agents, Kali attacker VM)
+- Shuffle playbooks, TheHive or Jira case tool
+- MISP and Sigma rule conversion
+- Plan-based feature gating, hospital-facing portal, PDF reports
