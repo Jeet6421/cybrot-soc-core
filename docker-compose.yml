@@ -1,12 +1,14 @@
 # SOC Core app only. Run Wazuh separately (see wazuh/README.md) and point its webhook here.
+# Settings come from a .env file next to this file (see README). Never commit .env.
 services:
   soc-core:
     build: .
     ports: ["5000:5000"]
+    restart: unless-stopped
     environment:
       ANALYSTS: "analyst1,analyst2,analyst3"
-      LAB_ENDPOINTS: "1"   # set to 0 before any real data goes in
-      SOC_API_TOKEN: "${SOC_API_TOKEN:-}"   # set a long random value on any shared deployment
+      LAB_ENDPOINTS: "${LAB_ENDPOINTS:-1}"   # set to 0 before any real data goes in
+      SOC_API_TOKEN: "${SOC_API_TOKEN:-}"    # required on any shared deployment
     volumes: ["soc-data:/data"]
 volumes:
   soc-data:
