@@ -1,5 +1,5 @@
 """Cybrot SOC Core - prototype: ingest -> detect -> triage queue (owner + response step) -> metrics."""
-import os, sqlite3
+import hmac, os, sqlite3
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, send_from_directory
 import detect, generate
@@ -10,6 +10,8 @@ ANALYSTS = os.environ.get("ANALYSTS", "analyst1,analyst2,analyst3").split(",")
 # environment where real logs or real analysts' work could be in the database.
 LAB_ENDPOINTS = os.environ.get("LAB_ENDPOINTS", "1") == "1"
 LAB_PATHS = {"/api/demo", "/api/autolabel", "/api/reset"}
+# If set, every /api/ call needs this token (Authorization: Bearer <token>). Required for any shared deployment.
+API_TOKEN = os.environ.get("SOC_API_TOKEN", "")
 app = Flask(__name__, static_folder="static")
 
 SCHEMA = """
@@ -50,6 +52,20 @@ def raise_alert(c, tenant, rule, sev, summary, key, event_ts, attack_id=None, so
                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (now(), event_ts, tenant, rule, sev, summary, key, owner, step, attack_id, source, detail))
     return cur.lastrowid
+
+
+@app.before_request
+def gate_api():
+    """With SOC_API_TOKEN set, /api/ calls need the token. Wazuh's built-in integration cannot send
+    headers, so /api/ingest/* also accepts ?token=. A reverse proxy with real auth is the better option."""
+    if not API_TOKEN or not request.path.startswith("/api/"):
+        return None
+    supplied = (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+    if not supplied and request.path.startswith("/api/ingest/"):
+        supplied = request.args.get("token", "")
+    if not hmac.compare_digest(supplied, API_TOKEN):
+        return jsonify(error="unauthorized"), 401
+    return None
 
 
 @app.before_request

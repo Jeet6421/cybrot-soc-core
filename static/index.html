@@ -27,16 +27,28 @@ small{color:var(--mut)}
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-async function act(u,b){await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b||{})});load()}
+let TOKEN=sessionStorage.getItem("soc_token")||"", locked=false;
+async function api(u,opts={}){
+  const h={"Content-Type":"application/json"};
+  if(TOKEN)h.Authorization="Bearer "+TOKEN;
+  const r=await fetch(u,{...opts,headers:h});
+  if(r.status===401&&!locked){
+    const t=prompt("API token for this SOC Core instance (cancel to lock)");
+    if(!t){locked=true;$("#m").innerHTML='<div class="card"><b>Locked</b><span>reload the page to enter the API token</span></div>';return r}
+    TOKEN=t;sessionStorage.setItem("soc_token",t);return api(u,opts);
+  }
+  return r;
+}
+async function act(u,b){await api(u,{method:"POST",body:JSON.stringify(b||{})});load()}
 async function load(){
-  const m=await (await fetch("/api/metrics")).json();
+  const mr=await api("/api/metrics");if(!mr.ok)return;const m=await mr.json();
   const pct=x=>x==null?"-":Math.round(x*100)+"%";
   const cards=[["Events",m.events],["Alerts",m.alerts],["Unacknowledged",m.unacknowledged],["Unlabeled",m.unlabeled],
    ["False-positive rate",pct(m.false_positive_rate)],["Attacks detected",m.detected_attacks+" / "+m.planted_attacks],
    ["Detection rate",pct(m.detection_rate)],["Mean time to ack",m.mean_time_to_ack_s==null?"-":m.mean_time_to_ack_s+" s"]];
   $("#m").innerHTML=cards.map(c=>`<div class="card"><b>${esc(c[1])}</b><span>${c[0]}</span></div>`).join("");
   const p=new URLSearchParams();if($("#tn").value)p.set("tenant",$("#tn").value);if($("#st").value)p.set("status",$("#st").value);
-  const a=await (await fetch("/api/alerts?"+p)).json();
+  const ar=await api("/api/alerts?"+p);if(!ar.ok)return;const a=await ar.json();
   $("#t").innerHTML=a.map(x=>`<tr><td>${x.id}</td><td class="sev ${x.severity}">${x.severity}</td><td>${esc(x.rule)}</td><td>${esc(x.tenant)}</td>
    <td>${esc(x.summary)}${x.detail?`<br><small>${esc(x.detail)}</small>`:""}</td><td>${esc(x.owner)}</td><td><small>${esc(x.step)}</small></td><td>${x.status}</td><td>${x.verdict||"-"}</td>
    <td>${x.status=="new"?`<button onclick="act('/api/alerts/${x.id}/ack')">Ack</button> `:""}

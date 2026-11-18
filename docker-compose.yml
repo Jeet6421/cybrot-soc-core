@@ -6,6 +6,7 @@ services:
     environment:
       ANALYSTS: "analyst1,analyst2,analyst3"
       LAB_ENDPOINTS: "1"   # set to 0 before any real data goes in
+      SOC_API_TOKEN: "${SOC_API_TOKEN:-}"   # set a long random value on any shared deployment
     volumes: ["soc-data:/data"]
 volumes:
   soc-data:

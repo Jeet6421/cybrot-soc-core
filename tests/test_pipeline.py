@@ -93,3 +93,25 @@ def test_old_database_gets_detail_column():
         assert "detail" in cols
     finally:
         soc.DB = old_db
+
+
+def test_api_token_gates_api_but_not_dashboard():
+    soc.API_TOKEN = "s3cret"
+    try:
+        assert c.get("/api/metrics").status_code == 401
+        assert c.get("/api/metrics", headers={"Authorization": "Bearer wrong"}).status_code == 401
+        assert c.get("/api/metrics", headers={"Authorization": "Bearer s3cret"}).status_code == 200
+        assert c.get("/").status_code == 200
+    finally:
+        soc.API_TOKEN = ""
+
+
+def test_wazuh_ingest_accepts_query_token_when_gated():
+    c.post("/api/reset")
+    soc.API_TOKEN = "s3cret"
+    try:
+        assert c.post("/api/ingest/wazuh?tenant=city-hospital", json=wazuh_sample()).status_code == 401
+        r = c.post("/api/ingest/wazuh?tenant=city-hospital&token=s3cret", json=wazuh_sample())
+        assert r.status_code == 200 and r.get_json()["alert_id"]
+    finally:
+        soc.API_TOKEN = ""

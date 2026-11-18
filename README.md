@@ -32,7 +32,10 @@ detection rate on planted attacks, mean time to acknowledge). Test data only - n
 
 ## Security (before any real data)
 - Set `LAB_ENDPOINTS=0`. The dashboard still has the lab buttons; they will return 404.
-- The API has no login yet. Put it behind a reverse proxy with authentication, or wait for the login/roles build.
+- Set `SOC_API_TOKEN` to a long random value. Every `/api/` call then needs `Authorization: Bearer <token>`.
+  The dashboard asks for the token once per browser tab. Wazuh's built-in integration cannot send headers, so
+  `/api/ingest/*` also accepts `?token=` in the URL. That URL can end up in logs: keep the webhook on a private network.
+- This is a shared secret, not user login. Real per-user login and roles are still to be built.
 
 ## Not built yet (next)
 Kafka buffer, Fluent Bit shipping, Shuffle playbooks, TheHive/Jira, MISP, Sigma conversion,
