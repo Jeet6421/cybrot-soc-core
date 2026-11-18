@@ -1,0 +1,48 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Cybrot SOC Core</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#f6f8fa;--card:#fff;--tx:#1b2733;--mut:#667;--bd:#d8e0e6;--ac:#1f7a8c}
+@media(prefers-color-scheme:dark){:root{--bg:#10161c;--card:#18212a;--tx:#e6edf3;--mut:#9aa7b3;--bd:#2b3743}}
+body{margin:0;font:14px system-ui,sans-serif;background:var(--bg);color:var(--tx);padding:16px}
+h1{font-size:18px;margin:0 0 12px}.row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:10px 14px;min-width:120px}
+.card b{display:block;font-size:20px}.card span{color:var(--mut);font-size:12px}
+button,select{background:var(--card);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;cursor:pointer}
+button.p{background:var(--ac);color:#fff;border-color:var(--ac)}
+.wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;background:var(--card)}
+th,td{padding:6px 8px;border-bottom:1px solid var(--bd);text-align:left;vertical-align:top}
+th{font-size:12px;color:var(--mut)}.sev{font-weight:600}.critical{color:#c0392b}.high{color:#d35400}.medium{color:#b7950b}.low{color:var(--mut)}
+small{color:var(--mut)}
+</style></head><body>
+<h1>Cybrot SOC Core <small>- prototype, test data only</small></h1>
+<div class="row">
+<button class="p" onclick="act('/api/demo')">Load demo data</button>
+<button onclick="act('/api/autolabel')">Auto-label (lab)</button>
+<button onclick="if(confirm('Delete all events and alerts?'))act('/api/reset')">Reset</button>
+<select id="tn" onchange="load()"><option value="">All hospitals</option><option>city-hospital</option><option>ortho-clinic</option></select>
+<select id="st" onchange="load()"><option value="">All status</option><option>new</option><option>ack</option><option>closed</option></select>
+</div>
+<div class="row" id="m"></div>
+<div class="wrap"><table><thead><tr><th>#</th><th>Sev</th><th>Rule</th><th>Hospital</th><th>Summary</th><th>Owner</th><th>Response step</th><th>Status</th><th>Verdict</th><th></th></tr></thead><tbody id="t"></tbody></table></div>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+async function act(u,b){await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b||{})});load()}
+async function load(){
+  const m=await (await fetch("/api/metrics")).json();
+  const pct=x=>x==null?"-":Math.round(x*100)+"%";
+  const cards=[["Events",m.events],["Alerts",m.alerts],["Unacknowledged",m.unacknowledged],["Unlabeled",m.unlabeled],
+   ["False-positive rate",pct(m.false_positive_rate)],["Attacks detected",m.detected_attacks+" / "+m.planted_attacks],
+   ["Detection rate",pct(m.detection_rate)],["Mean time to ack",m.mean_time_to_ack_s==null?"-":m.mean_time_to_ack_s+" s"]];
+  $("#m").innerHTML=cards.map(c=>`<div class="card"><b>${esc(c[1])}</b><span>${c[0]}</span></div>`).join("");
+  const p=new URLSearchParams();if($("#tn").value)p.set("tenant",$("#tn").value);if($("#st").value)p.set("status",$("#st").value);
+  const a=await (await fetch("/api/alerts?"+p)).json();
+  $("#t").innerHTML=a.map(x=>`<tr><td>${x.id}</td><td class="sev ${x.severity}">${x.severity}</td><td>${esc(x.rule)}</td><td>${esc(x.tenant)}</td>
+   <td>${esc(x.summary)}${x.detail?`<br><small>${esc(x.detail)}</small>`:""}</td><td>${esc(x.owner)}</td><td><small>${esc(x.step)}</small></td><td>${x.status}</td><td>${x.verdict||"-"}</td>
+   <td>${x.status=="new"?`<button onclick="act('/api/alerts/${x.id}/ack')">Ack</button> `:""}
+   <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'tp'})">TP</button>
+   <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'fp'})">FP</button>
+   <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'unclear'})">?</button></td></tr>`).join("");
+}
+load();setInterval(load,5000);
+</script></body></html>

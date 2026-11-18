@@ -1,0 +1,11 @@
+# SOC Core app only. Run Wazuh separately (see wazuh/README.md) and point its webhook here.
+services:
+  soc-core:
+    build: .
+    ports: ["5000:5000"]
+    environment:
+      ANALYSTS: "analyst1,analyst2,analyst3"
+      LAB_ENDPOINTS: "1"   # set to 0 before any real data goes in
+    volumes: ["soc-data:/data"]
+volumes:
+  soc-data:

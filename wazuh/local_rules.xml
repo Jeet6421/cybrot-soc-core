@@ -1,0 +1,37 @@
+<!-- Sample custom rules for clinic logs shipped as JSON. Copy to /var/ossec/etc/rules/local_rules.xml
+     and restart the manager. Field names (data.type, data.patient...) depend on your Fluent Bit output:
+     check them with /var/ossec/bin/wazuh-logtest before relying on these. -->
+<group name="clinic,">
+  <rule id="100100" level="3">
+    <decoded_as>json</decoded_as>
+    <field name="type">auth_fail</field>
+    <description>Clinic: failed login</description>
+  </rule>
+  <rule id="100101" level="10" frequency="5" timeframe="300">
+    <if_matched_sid>100100</if_matched_sid>
+    <same_field>ip</same_field>
+    <description>Clinic: 5+ failed logins from one IP in 5 minutes</description>
+  </rule>
+  <rule id="100110" level="3">
+    <decoded_as>json</decoded_as>
+    <field name="type">ehr_access</field>
+    <description>Clinic: EHR record access</description>
+  </rule>
+  <rule id="100111" level="10" frequency="15" timeframe="600">
+    <if_matched_sid>100110</if_matched_sid>
+    <same_field>user</same_field>
+    <description>Clinic: one user opened 15+ records in 10 minutes</description>
+  </rule>
+</group>
+
+<!-- Tuning, Windows/Sysmon. PowerShell writes __PSScriptPolicyTest_*.ps1 into Temp on each run to check
+     execution policy, and built-in rule 92213 fires on it (seen on SOC-WIN10). Level 0 = do not alert.
+     UNTESTED in this build: confirm with /var/ossec/bin/wazuh-logtest, using the sample alert in
+     tests/fixtures/, before deploying. If the field name differs, fix it there, not here. -->
+<group name="windows_tuning,">
+  <rule id="100200" level="0">
+    <if_sid>92213</if_sid>
+    <field name="win.eventdata.targetFilename" type="pcre2">__PSScriptPolicyTest_</field>
+    <description>Benign: PowerShell execution-policy test file</description>
+  </rule>
+</group>

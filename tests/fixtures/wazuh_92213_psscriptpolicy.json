@@ -1,0 +1,4 @@
+{"input":{"type":"log"},"agent":{"ip":"192.168.56.101","name":"SOC-WIN10","id":"001"},"manager":{"name":"SOC-UBUNTU"},
+"data":{"win":{"eventdata":{"image":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe","processId":"7380","utcTime":"2026-11-18 17:47:30.707","targetFilename":"C:\\Users\\win10\\AppData\\Local\\Temp\\__PSScriptPolicyTest_rhdiecye.4te.ps1","user":"DESKTOP-7VE7OED\\win10"},"system":{"eventID":"11","channel":"Microsoft-Windows-Sysmon/Operational","computer":"DESKTOP-7VE7OED"}}},
+"rule":{"firedtimes":2,"mail":true,"level":15,"description":"Executable file dropped in folder commonly used by malware","groups":["sysmon","sysmon_eid11_detections","windows"],"mitre":{"technique":["Ingress Tool Transfer"],"id":["T1105"],"tactic":["Command and Control"]},"id":"92213"},
+"location":"EventChannel","decoder":{"name":"windows_eventchannel"},"id":"1795024058.3870404","timestamp":"2026-11-18T17:47:38.939+0000"}
