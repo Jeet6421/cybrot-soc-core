@@ -21,6 +21,18 @@ def test_attack_simulations_all_pass():
     assert all(r["passed"] for r in results), results
 
 
+def test_repeat_run_passes_after_alert_list_moves_on():
+    # Regression: a second run used to fail once the first run's alerts fell out of the newest-200 list.
+    c.post("/api/reset")
+    assert all(r["passed"] for r in attack_sim.run(post, get))
+    for i in range(250):  # push the first run's alerts out of the newest-200 window
+        c.post(f"/api/ingest/wazuh?tenant={attack_sim.TENANT}",
+               json={"rule": {"id": "5501", "level": 7, "description": "filler"},
+                                          "agent": {"name": f"filler-{i}"}, "timestamp": "2026-11-20T10:00:00"})
+    results = attack_sim.run(post, get)
+    assert all(r["passed"] for r in results), results
+
+
 def test_load_test_loses_no_events():
     c.post("/api/reset")
     r = load_test.run(post, get, n=1200, batch=250)
