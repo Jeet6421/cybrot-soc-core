@@ -9,6 +9,7 @@ services:
       ANALYSTS: "analyst1,analyst2,analyst3"
       LAB_ENDPOINTS: "${LAB_ENDPOINTS:-1}"   # set to 0 before any real data goes in
       SOC_API_TOKEN: "${SOC_API_TOKEN:-}"    # required on any shared deployment
+      FP_TARGET: "${FP_TARGET:-}"            # agreed false-positive ceiling, e.g. 0.10; empty = not set
     volumes: ["soc-data:/data"]
 volumes:
   soc-data:
