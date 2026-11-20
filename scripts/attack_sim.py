@@ -9,7 +9,7 @@ Usage:
 
 Exit code 0 when every simulation passes, 1 otherwise. Standard library only.
 """
-import argparse, json, os, sys, urllib.request
+import argparse, json, os, secrets, sys, urllib.request
 from datetime import datetime, timedelta, timezone
 
 FMT = "%Y-%m-%dT%H:%M:%S"
@@ -22,18 +22,24 @@ def _base(now=None):
     return (now or datetime.now(timezone.utc)).replace(hour=11, minute=0, second=0, microsecond=0)
 
 
-def scenarios(now=None):
-    """Return (name, expected_rule, attack_id, events) for each simulation."""
+def scenarios(now=None, tag=None):
+    """Return (name, expected_rule, attack_id, events) for each simulation.
+
+    Each run gets its own tag in the IP, user and host. The app suppresses repeats of the same rule and key
+    within 10 minutes, so a second run with the same keys would raise no new alerts.
+    """
+    tag = tag or secrets.token_hex(2)
     base = _base(now)
+    ip = f"203.0.113.{int(tag, 16) % 250 + 1}"  # TEST-NET-3 range, unique per run
 
     def ev(t, **kw):
         return {"ts": t.strftime(FMT), "tenant": TENANT, "source": "sim", **kw}
 
-    brute = [ev(base + timedelta(seconds=20 * i), type="auth_fail", user="admin", ip="203.0.113.50",
+    brute = [ev(base + timedelta(seconds=20 * i), type="auth_fail", user="admin", ip=ip,
                 host="vpn-01", attack_id="SIM-bruteforce") for i in range(6)]
-    bulk = [ev(base + timedelta(seconds=9 * i), type="ehr_access", user="dr.sim", patient=f"S{i:04d}",
+    bulk = [ev(base + timedelta(seconds=9 * i), type="ehr_access", user=f"dr.sim-{tag}", patient=f"S{i:04d}",
                host="ehr-01", attack_id="SIM-bulk-access") for i in range(16)]
-    proc = [ev(base + timedelta(minutes=5), type="process_start", user="dr.sim", host="ws-sim",
+    proc = [ev(base + timedelta(minutes=5), type="process_start", user=f"dr.sim-{tag}", host=f"ws-sim-{tag}",
                detail="powershell.exe -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA", attack_id="SIM-suspicious-process")]
     return [
         ("Failed-login burst", "FAILED_LOGIN_BURST", "SIM-bruteforce", brute),
@@ -42,20 +48,30 @@ def scenarios(now=None):
     ]
 
 
+def _max_alert_id(get):
+    return max((a["id"] for a in get("/api/alerts")), default=0)
+
+
 def run(post, get, now=None):
-    """post(path, body) and get(path) perform the calls. Returns one result per simulation."""
+    """post(path, body) and get(path) perform the calls. Returns one result per simulation.
+
+    Only alerts created after this run started count. The alert list returns the newest 200 alerts,
+    so an alert from an earlier run can drop out of the list and must not be relied on.
+    """
+    before = _max_alert_id(get)
+    tag = secrets.token_hex(2)
     results = []
-    for name, rule, aid, events in scenarios(now):
+    for name, rule, aid, events in scenarios(now, tag):
         post("/api/events", events)
         alerts = get(f"/api/alerts?tenant={TENANT}")
-        hit = any(a["rule"] == rule and a.get("attack_id") == aid for a in alerts)
+        hit = any(a["id"] > before and a["rule"] == rule and a.get("attack_id") == aid for a in alerts)
         results.append({"scenario": name, "expected": rule, "passed": hit})
 
     # Negative control: a single failed login must not raise an alert.
     post("/api/events", [{"ts": _base(now).strftime(FMT), "tenant": TENANT, "source": "sim",
                           "type": "auth_fail", "user": "admin", "ip": NEGATIVE_IP, "host": "vpn-01"}])
     alerts = get(f"/api/alerts?tenant={TENANT}")
-    noisy = any(NEGATIVE_IP in (a.get("summary") or "") for a in alerts)
+    noisy = any(a["id"] > before and NEGATIVE_IP in (a.get("summary") or "") for a in alerts)
     results.append({"scenario": "Single failed login stays quiet", "expected": None, "passed": not noisy})
     return results
 
