@@ -1,4 +1,4 @@
-"""Cybrot SOC Core - prototype: ingest -> detect -> triage queue (owner + response step) -> metrics."""
+"""Cybrot SOC Core - prototype: ingest -> detect -> triage queue (owner + response step) -> metrics -> exit criteria."""
 import hmac, os, sqlite3
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, send_from_directory
@@ -13,6 +13,13 @@ LAB_PATHS = {"/api/demo", "/api/autolabel", "/api/reset"}
 # If set, every /api/ call needs this token (Authorization: Bearer <token>). Required for any shared deployment.
 API_TOKEN = os.environ.get("SOC_API_TOKEN", "")
 app = Flask(__name__, static_folder="static")
+
+GATE_NAMES = {
+    "foundation": "Logs flow end to end",
+    "detection": "All planted attacks detected",
+    "response": "Every alert has an owner and a response step",
+    "review": "False-positive rate within the agreed target",
+}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, ts TEXT, tenant TEXT, source TEXT, type TEXT,
@@ -37,6 +44,15 @@ def db():
 
 def now():
     return datetime.now(timezone.utc).strftime(detect.FMT)
+
+
+def _fp_target():
+    """Agreed false-positive ceiling as a fraction, e.g. FP_TARGET=0.10. Unset until the team agrees a number."""
+    raw = os.environ.get("FP_TARGET", "").strip()
+    try:
+        return float(raw) if raw else None
+    except ValueError:
+        return None
 
 
 def raise_alert(c, tenant, rule, sev, summary, key, event_ts, attack_id=None, source="builtin",
@@ -144,22 +160,76 @@ def verdict(i):
     return jsonify(ok=True)
 
 
-@app.get("/api/metrics")
-def metrics():
+def _metrics():
     c = db()
     q = lambda s, a=(): c.execute(s, a).fetchone()[0]
     tp, fp = q("SELECT COUNT(*) FROM alerts WHERE verdict='tp'"), q("SELECT COUNT(*) FROM alerts WHERE verdict='fp'")
     planted = q("SELECT COUNT(DISTINCT attack_id) FROM events WHERE attack_id IS NOT NULL")
     caught = q("SELECT COUNT(DISTINCT attack_id) FROM alerts WHERE attack_id IS NOT NULL")
     mtta = c.execute("SELECT AVG(strftime('%s',ack_at)-strftime('%s',created)) FROM alerts WHERE ack_at IS NOT NULL").fetchone()[0]
-    return jsonify(events=q("SELECT COUNT(*) FROM events"), alerts=q("SELECT COUNT(*) FROM alerts"),
-                   by_severity={r[0]: r[1] for r in c.execute("SELECT severity, COUNT(*) FROM alerts GROUP BY severity")},
-                   unacknowledged=q("SELECT COUNT(*) FROM alerts WHERE status='new'"),
-                   unlabeled=q("SELECT COUNT(*) FROM alerts WHERE verdict IS NULL"),
-                   false_positive_rate=round(fp / (tp + fp), 3) if tp + fp else None,
-                   planted_attacks=planted, detected_attacks=caught,
-                   detection_rate=round(caught / planted, 3) if planted else None,
-                   mean_time_to_ack_s=round(mtta, 1) if mtta is not None else None)
+    weekly = []
+    for r in c.execute("SELECT strftime('%Y-W%W', created) AS week, SUM(verdict='tp') AS tp, SUM(verdict='fp') AS fp "
+                       "FROM alerts WHERE verdict IN ('tp','fp') GROUP BY week ORDER BY week"):
+        weekly.append({"week": r["week"], "tp": r["tp"], "fp": r["fp"],
+                       "false_positive_rate": round(r["fp"] / (r["tp"] + r["fp"]), 3)})
+    return dict(events=q("SELECT COUNT(*) FROM events"), alerts=q("SELECT COUNT(*) FROM alerts"),
+                by_severity={r[0]: r[1] for r in c.execute("SELECT severity, COUNT(*) FROM alerts GROUP BY severity")},
+                unacknowledged=q("SELECT COUNT(*) FROM alerts WHERE status='new'"),
+                unlabeled=q("SELECT COUNT(*) FROM alerts WHERE verdict IS NULL"),
+                labeled_alerts=tp + fp,
+                false_positive_rate=round(fp / (tp + fp), 3) if tp + fp else None,
+                false_positive_rate_by_week=weekly,
+                planted_attacks=planted, detected_attacks=caught,
+                detection_rate=round(caught / planted, 3) if planted else None,
+                mean_time_to_ack_s=round(mtta, 1) if mtta is not None else None)
+
+
+@app.get("/api/metrics")
+def metrics():
+    return jsonify(_metrics())
+
+
+def _gate_results(m):
+    """Pass, fail, or not_measured for each roadmap gate in the prototype plan. not_measured means no data yet."""
+    c = db()
+    out = []
+
+    def gate(gid, status, detail):
+        out.append({"id": gid, "name": GATE_NAMES[gid], "status": status, "detail": detail})
+
+    gate("foundation", "pass" if m["events"] > 0 else "not_measured",
+         f"{m['events']} events stored" if m["events"] else "no events yet")
+
+    if not m["planted_attacks"]:
+        gate("detection", "not_measured", "no planted attacks in the data yet (run scripts/attack_sim.py)")
+    else:
+        ok = m["detection_rate"] == 1.0
+        gate("detection", "pass" if ok else "fail",
+             f"{m['detected_attacks']} of {m['planted_attacks']} planted attacks detected")
+
+    missing = c.execute("SELECT COUNT(*) FROM alerts WHERE COALESCE(owner,'')='' OR COALESCE(step,'')=''").fetchone()[0]
+    if not m["alerts"]:
+        gate("response", "not_measured", "no alerts yet")
+    else:
+        gate("response", "pass" if missing == 0 else "fail",
+             f"{m['alerts'] - missing} of {m['alerts']} alerts have an owner and a step")
+
+    target = _fp_target()
+    if target is None:
+        gate("review", "not_measured", "set FP_TARGET to the false-positive ceiling the team agrees")
+    elif not m["labeled_alerts"]:
+        gate("review", "not_measured", "no alerts labeled tp or fp yet")
+    else:
+        rate = m["false_positive_rate"]
+        gate("review", "pass" if rate <= target else "fail",
+             f"false-positive rate {rate:.1%} against target {target:.1%}")
+    return out
+
+
+@app.get("/api/exit-criteria")
+def exit_criteria():
+    gates = _gate_results(_metrics())
+    return jsonify(gates=gates, all_pass=all(g["status"] == "pass" for g in gates), fp_target=_fp_target())
 
 
 @app.post("/api/demo")

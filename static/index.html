@@ -13,6 +13,7 @@ button.p{background:var(--ac);color:#fff;border-color:var(--ac)}
 th,td{padding:6px 8px;border-bottom:1px solid var(--bd);text-align:left;vertical-align:top}
 th{font-size:12px;color:var(--mut)}.sev{font-weight:600}.critical{color:#c0392b}.high{color:#d35400}.medium{color:#b7950b}.low{color:var(--mut)}
 small{color:var(--mut)}
+.gate b{font-size:14px}.gate.pass b{color:#1e8449}.gate.fail b{color:#c0392b}
 </style></head><body>
 <h1>Cybrot SOC Core <small>- prototype, test data only</small></h1>
 <div class="row">
@@ -23,6 +24,7 @@ small{color:var(--mut)}
 <select id="st" onchange="load()"><option value="">All status</option><option>new</option><option>ack</option><option>closed</option></select>
 </div>
 <div class="row" id="m"></div>
+<div class="row" id="g"></div>
 <div class="wrap"><table><thead><tr><th>#</th><th>Sev</th><th>Rule</th><th>Hospital</th><th>Summary</th><th>Owner</th><th>Response step</th><th>Status</th><th>Verdict</th><th></th></tr></thead><tbody id="t"></tbody></table></div>
 <script>
 const $=s=>document.querySelector(s);
@@ -47,6 +49,9 @@ async function load(){
    ["False-positive rate",pct(m.false_positive_rate)],["Attacks detected",m.detected_attacks+" / "+m.planted_attacks],
    ["Detection rate",pct(m.detection_rate)],["Mean time to ack",m.mean_time_to_ack_s==null?"-":m.mean_time_to_ack_s+" s"]];
   $("#m").innerHTML=cards.map(c=>`<div class="card"><b>${esc(c[1])}</b><span>${c[0]}</span></div>`).join("");
+  const gr=await api("/api/exit-criteria");
+  if(gr.ok){const g=await gr.json();
+    $("#g").innerHTML=g.gates.map(x=>`<div class="card gate ${x.status}"><b>${esc(x.name)}</b><span>${x.status.replace("_"," ")}: ${esc(x.detail)}</span></div>`).join("");}
   const p=new URLSearchParams();if($("#tn").value)p.set("tenant",$("#tn").value);if($("#st").value)p.set("status",$("#st").value);
   const ar=await api("/api/alerts?"+p);if(!ar.ok)return;const a=await ar.json();
   $("#t").innerHTML=a.map(x=>`<tr><td>${x.id}</td><td class="sev ${x.severity}">${x.severity}</td><td>${esc(x.rule)}</td><td>${esc(x.tenant)}</td>
