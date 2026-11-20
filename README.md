@@ -29,7 +29,7 @@ This version follows the internal test plan in the prototype plan document: the 
 
 ## Tests
     pip install pytest
-    pytest -q tests              # 18 tests
+    pytest -q tests              # 23 tests
 
 ## Test plan tools (scripts/)
 These use only the Python standard library. Run them against an instance with no real data.
@@ -74,7 +74,7 @@ trend (test plan step 4) can be tracked.
 | `FAILED_LOGIN_BURST` | high | 5 or more failed logins from one IP within 5 minutes |
 | `BULK_RECORD_ACCESS` | high | One user opens 15 or more patient records within 10 minutes |
 | `OFFHOURS_ACCESS` | low | Record access between 22:00 and 05:59 (intentionally noisy, for the FP-rate test) |
-| `SUSPICIOUS_PROCESS` | critical | A process command line contains `mimikatz`, `-enc `, `certutil -urlcache`, `nc -e`, or `vssadmin delete shadows` |
+| `SUSPICIOUS_PROCESS` | critical | A process command line contains `mimikatz`, `certutil -urlcache`, `nc -e`, or `vssadmin delete shadows`, or passes a base64 payload with `-e`, `-ec`, `-enc` or `-EncodedCommand` |
 
 ## Wazuh integration
 - Wazuh alerts arrive at `POST /api/ingest/wazuh?tenant=<hospital>`. Level 12+ is critical, 10+ high, 7+ medium.
@@ -82,7 +82,8 @@ trend (test plan step 4) can be tracked.
 - Rule 92213 (Sysmon file drop) has its own response step. Other Wazuh rules use a level-based step.
 - Repeats of the same rule, host, file and process within 10 minutes are suppressed. A different file alerts again.
 - Tuning rule 100200 in `wazuh/local_rules.xml` silences the benign PowerShell execution-policy test file.
-  **Untested:** check it with `wazuh-logtest` on `tests/fixtures/wazuh_92213_psscriptpolicy.json` before deploying.
+  Tested on the lab Windows VM (v0.5): the `__PSScriptPolicyTest_*` file is suppressed, and a different file dropped
+  in the same folder still raises rule 92213.
 
 ## Security (before any real data)
 - Set `LAB_ENDPOINTS=0`. The dashboard still shows the lab buttons, but they will return 404.
@@ -93,6 +94,12 @@ trend (test plan step 4) can be tracked.
 - This is a shared secret, not user login. There are no per-user accounts or roles yet.
 
 ## Changes
+**v0.5**
+- `SUSPICIOUS_PROCESS` now catches the PowerShell encoded-command flags `-e`, `-ec`, `-enc` and `-EncodedCommand`
+  when followed by a base64 payload. The old `-enc ` check missed the `-E` form that Atomic Red Team uses.
+- Tests for the flag forms and for plain text that must not match (`tests/test_detect.py`).
+- Wazuh rule 100200 tested on the lab Windows VM.
+
 **v0.4**
 - Attack simulations (`scripts/attack_sim.py`) and load test (`scripts/load_test.py`) from the test plan.
 - `GET /api/exit-criteria` with the four roadmap gates, and the `FP_TARGET` setting.

@@ -1,9 +1,13 @@
 """Detection rules. Each rule looks at the new event + recent history in SQLite
 and returns (rule, severity, summary, dedupe_key) or None."""
+import re
 from datetime import datetime, timedelta
 
 FMT = "%Y-%m-%dT%H:%M:%S"
-SUSPICIOUS = ["mimikatz", "-enc ", "certutil -urlcache", "nc -e", "vssadmin delete shadows"]
+SUSPICIOUS = ["mimikatz", "certutil -urlcache", "nc -e", "vssadmin delete shadows"]
+# PowerShell accepts -e, -ec, -enc and -EncodedCommand (case-insensitive). Require a base64-looking
+# payload after the flag so plain words like "-encoding" or "-e C:\path" don't match.
+ENCODED_COMMAND = re.compile(r"(?i)\s-(e|ec|enc|encodedcommand)\s+[A-Za-z0-9+/]{16,}={0,2}")
 OFFHOURS = (range(0, 6), range(22, 24))  # 22:00-05:59
 
 PLAYBOOK = {
@@ -64,7 +68,8 @@ def evaluate(db, ev):
         if any(hour in r for r in OFFHOURS):
             return ("OFFHOURS_ACCESS", "low", f"{ev['user']} accessed a record at {ts[11:16]}", ev["user"])
     elif t == "process_start":
-        cmd = (ev.get("detail") or "").lower()
-        if any(s in cmd for s in SUSPICIOUS):
+        raw = ev.get("detail") or ""
+        cmd = raw.lower()
+        if any(s in cmd for s in SUSPICIOUS) or ENCODED_COMMAND.search(raw):
             return ("SUSPICIOUS_PROCESS", "critical", f"Suspicious process on {ev['host']}: {ev['detail'][:60]}", ev["host"])
     return None
