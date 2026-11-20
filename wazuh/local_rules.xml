@@ -26,12 +26,22 @@
 
 <!-- Tuning, Windows/Sysmon. PowerShell writes __PSScriptPolicyTest_*.ps1 into Temp on each run to check
      execution policy, and built-in rule 92213 fires on it (seen on SOC-WIN10). Level 0 = do not alert.
-     UNTESTED in this build: confirm with /var/ossec/bin/wazuh-logtest, using the sample alert in
-     tests/fixtures/, before deploying. If the field name differs, fix it there, not here. -->
+     Tested live on SOC-WIN10 (v0.5): the test file is suppressed, and a different file dropped in the
+     same folder still raises 92213. -->
 <group name="windows_tuning,">
   <rule id="100200" level="0">
     <if_sid>92213</if_sid>
     <field name="win.eventdata.targetFilename" type="pcre2">__PSScriptPolicyTest_</field>
     <description>Benign: PowerShell execution-policy test file</description>
+  </rule>
+
+  <!-- Disk Cleanup (cleanmgr.exe) unpacks signed Windows provider DLLs into a GUID folder under Temp
+       (seen on SOC-WIN10 as rule 92213 alerts). Matches only that exact writer and path shape.
+       UNTESTED live: confirm the alerts stop after deployment. -->
+  <rule id="100201" level="0">
+    <if_sid>92213</if_sid>
+    <field name="win.eventdata.image" type="pcre2">(?i)^C:\\Windows\\system32\\cleanmgr\.exe$</field>
+    <field name="win.eventdata.targetFilename" type="pcre2">(?i)\\Temp\\[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\\[^\\]+\.dll$</field>
+    <description>Benign: Disk Cleanup writes signed Windows provider DLLs to a temp GUID folder</description>
   </rule>
 </group>
