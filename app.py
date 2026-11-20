@@ -28,6 +28,9 @@ CREATE INDEX IF NOT EXISTS ev_idx ON events(tenant, type, ts);
 CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY, created TEXT, event_ts TEXT, tenant TEXT, rule TEXT,
   severity TEXT, summary TEXT, dkey TEXT, owner TEXT, step TEXT, status TEXT DEFAULT 'new',
   ack_at TEXT, verdict TEXT, attack_id TEXT, source TEXT DEFAULT 'builtin', detail TEXT);
+CREATE TABLE IF NOT EXISTS handoffs(id INTEGER PRIMARY KEY, alert_id INTEGER, at TEXT, from_owner TEXT,
+  to_owner TEXT, note TEXT);
+CREATE INDEX IF NOT EXISTS ho_idx ON handoffs(alert_id);
 """
 
 
@@ -39,6 +42,9 @@ def db():
     cols = {r["name"] for r in c.execute("PRAGMA table_info(alerts)")}
     if "detail" not in cols:
         c.execute("ALTER TABLE alerts ADD COLUMN detail TEXT")
+    # Migrate databases created before the 'resolution' column existed (v0.6).
+    if "resolution" not in cols:
+        c.execute("ALTER TABLE alerts ADD COLUMN resolution TEXT")
     return c
 
 
@@ -151,13 +157,50 @@ def ack(i):
 
 @app.post("/api/alerts/<int:i>/verdict")
 def verdict(i):
-    v = (request.get_json(force=True) or {}).get("verdict")
+    body = request.get_json(force=True) or {}
+    v = body.get("verdict")
     if v not in ("tp", "fp", "unclear"):
         return jsonify(error="verdict must be tp, fp or unclear"), 400
+    note = (body.get("note") or "").strip()[:500]  # optional closing note, kept with the alert
     c = db()
-    c.execute("UPDATE alerts SET verdict=?, status='closed', ack_at=COALESCE(ack_at,?) WHERE id=?", (v, now(), i))
+    c.execute("UPDATE alerts SET verdict=?, status='closed', ack_at=COALESCE(ack_at,?), "
+              "resolution=COALESCE(NULLIF(?,''), resolution) WHERE id=?", (v, now(), note, i))
     c.commit()
     return jsonify(ok=True)
+
+
+@app.get("/api/analysts")
+def analysts():
+    return jsonify(analysts=ANALYSTS)
+
+
+@app.post("/api/alerts/<int:i>/handoff")
+def handoff(i):
+    """Pass an open alert to another analyst. The owner changes and the handoff is kept in history."""
+    body = request.get_json(force=True) or {}
+    to = (body.get("to_owner") or "").strip()
+    note = (body.get("note") or "").strip()[:500]
+    if to not in ANALYSTS:
+        return jsonify(error=f"to_owner must be one of: {', '.join(ANALYSTS)}"), 400
+    c = db()
+    row = c.execute("SELECT owner, status FROM alerts WHERE id=?", (i,)).fetchone()
+    if not row:
+        return jsonify(error="alert not found"), 404
+    if row["status"] == "closed":
+        return jsonify(error="alert is closed"), 409
+    if to == row["owner"]:
+        return jsonify(error=f"alert is already owned by {to}"), 400
+    c.execute("INSERT INTO handoffs(alert_id,at,from_owner,to_owner,note) VALUES(?,?,?,?,?)",
+              (i, now(), row["owner"], to, note))
+    c.execute("UPDATE alerts SET owner=? WHERE id=?", (to, i))
+    c.commit()
+    return jsonify(ok=True, from_owner=row["owner"], to_owner=to)
+
+
+@app.get("/api/alerts/<int:i>/handoffs")
+def handoffs(i):
+    rows = db().execute("SELECT at, from_owner, to_owner, note FROM handoffs WHERE alert_id=? ORDER BY id", (i,)).fetchall()
+    return jsonify([dict(r) for r in rows])
 
 
 def _metrics():
@@ -251,7 +294,7 @@ def autolabel():
 @app.post("/api/reset")
 def reset():
     c = db()
-    c.executescript("DELETE FROM events; DELETE FROM alerts;")
+    c.executescript("DELETE FROM events; DELETE FROM alerts; DELETE FROM handoffs;")
     return jsonify(ok=True)
 
 

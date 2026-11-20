@@ -29,7 +29,7 @@ This version follows the internal test plan in the prototype plan document: the 
 
 ## Tests
     pip install pytest
-    pytest -q tests              # 23 tests
+    pytest -q tests              # 33 tests
 
 ## Test plan tools (scripts/)
 These use only the Python standard library. Run them against an instance with no real data.
@@ -59,7 +59,7 @@ The dashboard shows these at the top. `GET /api/metrics` also returns `false_pos
 trend (test plan step 4) can be tracked.
 
 ## Layout
-- `app.py`      Flask API + SQLite: `/api/events`, `/api/ingest/wazuh`, `/api/alerts`, `/api/metrics`, `/api/exit-criteria`
+- `app.py`      Flask API + SQLite: `/api/events`, `/api/ingest/wazuh`, `/api/alerts`, `/api/alerts/<id>/handoff`, `/api/metrics`, `/api/exit-criteria`
 - `detect.py`   built-in rules and playbooks; Wazuh playbooks by rule id (`WAZUH_PLAYBOOK`), with a level-based fallback
 - `generate.py` synthetic clinic logs with 3 planted attacks (ground truth in `attack_id`)
 - `scripts/`    attack simulations and load test (see above)
@@ -94,6 +94,14 @@ trend (test plan step 4) can be tracked.
 - This is a shared secret, not user login. There are no per-user accounts or roles yet.
 
 ## Changes
+**v0.6**
+- Simple case queue: `POST /api/alerts/<id>/handoff` passes an open alert to another analyst, and
+  `GET /api/alerts/<id>/handoffs` shows the history (from, to, time, note). Closed alerts are refused (409).
+- `POST /api/alerts/<id>/verdict` takes an optional `note`, kept as the alert's resolution.
+- Dashboard: "Hand off" button on open alerts, and the closing note shows under each alert.
+- `GET /api/analysts` lists the analysts for the handoff.
+- `/api/reset` also clears handoff history.
+
 **v0.5**
 - `SUSPICIOUS_PROCESS` now catches the PowerShell encoded-command flags `-e`, `-ec`, `-enc` and `-EncodedCommand`
   when followed by a base64 payload. The old `-enc ` check missed the `-E` form that Atomic Red Team uses.
@@ -119,7 +127,7 @@ trend (test plan step 4) can be tracked.
 - Wazuh tuning rule 100200 (untested).
 
 ## Not built yet (next)
-- Case tool (TheHive or Jira Service Management). The plan leaves this choice open.
+- External case tool (TheHive or Jira Service Management). v0.6 has a simple case queue inside SOC Core instead.
 - Per-user login and roles (hospital viewer/admin, Cybrot analyst)
 - Fluent Bit log shipping and Kafka buffer
 - Live Wazuh connection on the VM (agents, Kali attacker VM)
