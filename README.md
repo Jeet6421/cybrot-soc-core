@@ -1,4 +1,4 @@
-# Cybrot SOC Core (prototype, v0.4)
+# Cybrot SOC Core (prototype, v0.6)
 
 Core pipeline for the hospital/clinic SOC service: **logs in -> detection rules -> alert with severity ->
 triage queue with a named owner and response step -> metrics -> exit criteria**. Test data only - never real patient data.
@@ -52,7 +52,7 @@ These use only the Python standard library. Run them against an instance with no
 |---|---|
 | Foundation: logs flow end to end | At least one event is stored |
 | Detection: all planted attacks detected | Every planted attack has an alert |
-| Response: handoff tested | Every alert has an owner and a response step |
+| Response: every alert has an owner and a step | Every alert has an owner and a response step |
 | Review: false positives within target | The false-positive rate is at or below `FP_TARGET` |
 
 The dashboard shows these at the top. `GET /api/metrics` also returns `false_positive_rate_by_week`, so the weekly
@@ -65,7 +65,7 @@ trend (test plan step 4) can be tracked.
 - `scripts/`    attack simulations and load test (see above)
 - `static/`     triage dashboard (`index.html`)
 - `tests/`      pytest suite; `fixtures/` holds a real Wazuh alert (Sysmon rule 92213)
-- `wazuh/`      sample Wazuh rules and webhook config (not yet tested on a Wazuh manager)
+- `wazuh/`      Wazuh rules and webhook config (tuning rules 100200 and 100201 tested on the lab Windows VM)
 - `.github/workflows/tests.yml`  runs the tests and the Docker build on every push and pull request
 
 ## Built-in detection rules
@@ -84,6 +84,10 @@ trend (test plan step 4) can be tracked.
 - Tuning rule 100200 in `wazuh/local_rules.xml` silences the benign PowerShell execution-policy test file.
   Tested on the lab Windows VM (v0.5): the `__PSScriptPolicyTest_*` file is suppressed, and a different file dropped
   in the same folder still raises rule 92213.
+- Tuning rule 100201 silences Disk Cleanup (`cleanmgr.exe`) drops of signed Windows DLLs into a temp GUID folder.
+  It matches only that exact writer and path. Deployed on the lab VM (v0.5.2); not yet confirmed on a live Disk Cleanup run.
+- Encoded PowerShell commands raise critical Wazuh alerts (rules 92057 and 92071), which reach the triage queue.
+- The internal test plan's Atomic Red Team test (T1059.001-15) was detected this way on the lab VM.
 
 ## Security (before any real data)
 - Set `LAB_ENDPOINTS=0`. The dashboard still shows the lab buttons, but they will return 404.
@@ -93,6 +97,20 @@ trend (test plan step 4) can be tracked.
 - Serve the app over HTTPS behind a reverse proxy.
 - This is a shared secret, not user login. There are no per-user accounts or roles yet.
 
+## API
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/events` | Ingest events; runs the built-in rules |
+| `POST /api/ingest/wazuh` | Ingest a Wazuh integration alert |
+| `GET /api/alerts` | Newest 200 alerts; filter with `tenant`, `status`, `owner` |
+| `POST /api/alerts/<id>/ack` | Acknowledge an alert |
+| `POST /api/alerts/<id>/verdict` | Close with `tp`, `fp` or `unclear`, and an optional `note` |
+| `POST /api/alerts/<id>/handoff` | Pass an open alert to another analyst: `to_owner`, `note` |
+| `GET /api/alerts/<id>/handoffs` | Handoff history for an alert |
+| `GET /api/analysts` | Analysts that alerts can be handed to |
+| `GET /api/metrics` | Counts, false-positive rate (overall and weekly), detection rate, mean time to ack |
+| `GET /api/exit-criteria` | The four roadmap gates, as `pass`, `fail` or `not_measured` |
+
 ## Changes
 **v0.6**
 - Simple case queue: `POST /api/alerts/<id>/handoff` passes an open alert to another analyst, and
@@ -101,6 +119,13 @@ trend (test plan step 4) can be tracked.
 - Dashboard: "Hand off" button on open alerts, and the closing note shows under each alert.
 - `GET /api/analysts` lists the analysts for the handoff.
 - `/api/reset` also clears handoff history.
+
+**v0.5.2**
+- Wazuh rule 100201 suppresses Disk Cleanup DLL drops (exact `cleanmgr.exe` writer and path only).
+
+**v0.5.1**
+- `scripts/attack_sim.py` uses unique keys per run and counts only alerts from that run, so it passes on repeat runs.
+  Regression test added.
 
 **v0.5**
 - `SUSPICIOUS_PROCESS` now catches the PowerShell encoded-command flags `-e`, `-ec`, `-enc` and `-EncodedCommand`
