@@ -55,11 +55,21 @@ async function load(){
   const p=new URLSearchParams();if($("#tn").value)p.set("tenant",$("#tn").value);if($("#st").value)p.set("status",$("#st").value);
   const ar=await api("/api/alerts?"+p);if(!ar.ok)return;const a=await ar.json();
   $("#t").innerHTML=a.map(x=>`<tr><td>${x.id}</td><td class="sev ${x.severity}">${x.severity}</td><td>${esc(x.rule)}</td><td>${esc(x.tenant)}</td>
-   <td>${esc(x.summary)}${x.detail?`<br><small>${esc(x.detail)}</small>`:""}</td><td>${esc(x.owner)}</td><td><small>${esc(x.step)}</small></td><td>${x.status}</td><td>${x.verdict||"-"}</td>
+   <td>${esc(x.summary)}${x.detail?`<br><small>${esc(x.detail)}</small>`:""}${x.resolution?`<br><small>Note: ${esc(x.resolution)}</small>`:""}</td><td>${esc(x.owner)}</td><td><small>${esc(x.step)}</small></td><td>${x.status}</td><td>${x.verdict||"-"}</td>
    <td>${x.status=="new"?`<button onclick="act('/api/alerts/${x.id}/ack')">Ack</button> `:""}
    <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'tp'})">TP</button>
    <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'fp'})">FP</button>
-   <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'unclear'})">?</button></td></tr>`).join("");
+   <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'unclear'})">?</button>
+   ${x.status!="closed"?`<button onclick="handoff(${x.id})">Hand off</button>`:""}</td></tr>`).join("");
 }
+async function handoff(id){
+  const to=prompt("Hand off to (one of: "+ANALYSTS.join(", ")+")");if(!to)return;
+  const note=prompt("Handoff note: what the next owner should do")||"";
+  const r=await api(`/api/alerts/${id}/handoff`,{method:"POST",body:JSON.stringify({to_owner:to.trim(),note})});
+  if(!r.ok){alert("Handoff refused: "+((await r.json()).error||r.status))}
+  load();
+}
+let ANALYSTS=[];
+api("/api/analysts").then(r=>r.ok?r.json():{analysts:[]}).then(j=>{ANALYSTS=j.analysts||[]});
 load();setInterval(load,5000);
 </script></body></html>
