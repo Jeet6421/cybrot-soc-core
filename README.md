@@ -27,11 +27,12 @@ This version follows the internal test plan in the prototype plan document: the 
 | `FP_TARGET` | not set | The false-positive ceiling the team agrees, as a fraction (e.g. `0.10`). Until set, the Review gate is `not_measured`. |
 | `PLAYBOOK_WEBHOOK` | empty (off) | v0.7: each new alert is POSTed as JSON to this URL, e.g. a Shuffle webhook. Sent after the database commit; a failed send is logged and never blocks ingest. |
 | `PLAYBOOK_TIMEOUT` | `3` | Seconds to wait for the playbook webhook |
+| `PLAYBOOK_SECRET` | empty (unsigned) | v0.8: if set, each playbook request carries `X-Cybrot-Signature` (HMAC-SHA256). Set it whenever `PLAYBOOK_WEBHOOK` is set. |
 | `PORT` | `5000` | HTTP port when running `python app.py` |
 
 ## Tests
     pip install pytest
-    pytest -q tests              # 42 tests
+    pytest -q tests              # 46 tests
 
 ## Test plan tools (scripts/)
 These use only the Python standard library. Run them against an instance with no real data.
@@ -114,6 +115,13 @@ trend (test plan step 4) can be tracked.
 | `GET /api/exit-criteria` | The four roadmap gates, as `pass`, `fail` or `not_measured` |
 
 ## Changes
+**v0.8**
+- Playbook webhook is signed when `PLAYBOOK_SECRET` is set: `X-Cybrot-Signature` (HMAC-SHA256 over `<timestamp>.<raw body>`),
+  `X-Cybrot-Timestamp`, and `X-Cybrot-Event-Id` (`alert-<id>`, the same on retries so the receiver can de-duplicate).
+- Retries: up to 3 attempts for server and network errors (1 s, 2 s backoff). 4xx replies are not retried.
+- `docs/SHUFFLE.md`: how to connect Shuffle, verify the signature, test it, and troubleshoot.
+- Tests: 4 more in `tests/test_playbook.py` (signature, no signature without a secret, retry, no retry on 4xx). 46 tests in total.
+
 **v0.7.1**
 - The dashboard shows each alert's latest handoff under the summary ("Handoff: analyst2 -> analyst1: note").
   Before this, a handoff note was saved in the history only, and the row showed only the closing note.
