@@ -1,8 +1,5 @@
-import hmac, json, os, sys, tempfile, threading, time
+import hmac, json, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-os.environ.setdefault("SOC_DB", os.path.join(tempfile.mkdtemp(), "playbook.db"))
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
 import app as soc
 
 c = soc.app.test_client()

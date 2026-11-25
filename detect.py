@@ -1,4 +1,4 @@
-"""Detection rules. Each rule looks at the new event + recent history in SQLite
+"""Detection rules. Each rule looks at the new event + recent history in the database
 and returns (rule, severity, summary, dedupe_key) or None."""
 import re
 from datetime import datetime, timedelta
@@ -55,13 +55,13 @@ def _ago(ts, minutes):
 def evaluate(db, ev):
     t, ts, tenant = ev["type"], ev["ts"], ev["tenant"]
     if t == "auth_fail":
-        n = db.execute("SELECT COUNT(*) FROM events WHERE tenant=? AND ip=? AND type='auth_fail' AND ts>=? AND ts<=?",
+        n = db.execute("SELECT COUNT(*) FROM events WHERE tenant=%s AND ip=%s AND type='auth_fail' AND ts>=%s AND ts<=%s",
                        (tenant, ev["ip"], _ago(ts, 5), ts)).fetchone()[0]
         if n >= 5:
             return ("FAILED_LOGIN_BURST", "high", f"{n} failed logins from {ev['ip']} in 5 min", ev["ip"])
     elif t == "ehr_access":
-        n = db.execute("SELECT COUNT(DISTINCT patient) FROM events WHERE tenant=? AND user=? AND type='ehr_access' AND ts>=? AND ts<=?",
-                       (tenant, ev["user"], _ago(ts, 10), ts)).fetchone()[0]
+        n = db.execute('SELECT COUNT(DISTINCT patient) FROM events WHERE tenant=%s AND "user"=%s AND type=\'ehr_access\' '
+                       "AND ts>=%s AND ts<=%s", (tenant, ev["user"], _ago(ts, 10), ts)).fetchone()[0]
         if n >= 15:
             return ("BULK_RECORD_ACCESS", "high", f"{ev['user']} opened {n} patient records in 10 min", ev["user"])
         hour = int(ts[11:13])

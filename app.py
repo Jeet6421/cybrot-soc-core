@@ -1,10 +1,12 @@
 """Cybrot SOC Core - prototype: ingest -> detect -> triage queue (owner + response step) -> metrics -> exit criteria."""
-import hashlib, hmac, json, os, sqlite3, sys, threading, time, urllib.error, urllib.request
+import hashlib, hmac, json, os, sys, threading, time, urllib.error, urllib.request
 from datetime import datetime, timezone
-from flask import Flask, request, jsonify, send_from_directory
+import psycopg
+from flask import Flask, g, request, jsonify, send_from_directory
 import detect, generate
 
-DB = os.environ.get("SOC_DB", "soc.db")
+# PostgreSQL connection string. Set DATABASE_URL in every real deployment. The default is for local development only.
+DEFAULT_DATABASE_URL = "postgresql://soc:soc@localhost:5432/soc"
 ANALYSTS = os.environ.get("ANALYSTS", "analyst1,analyst2,analyst3").split(",")
 # Lab-only endpoints (synthetic data, demo load, reset). Set LAB_ENDPOINTS=0 in any
 # environment where real logs or real analysts' work could be in the database.
@@ -23,31 +25,64 @@ GATE_NAMES = {
     "review": "False-positive rate within the agreed target",
 }
 
+# "user" is a reserved word in PostgreSQL, so the column is quoted wherever it appears.
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, ts TEXT, tenant TEXT, source TEXT, type TEXT,
-  user TEXT, host TEXT, ip TEXT, patient TEXT, detail TEXT, attack_id TEXT);
+CREATE TABLE IF NOT EXISTS events(id BIGSERIAL PRIMARY KEY, ts TEXT, tenant TEXT, source TEXT, type TEXT,
+  "user" TEXT, host TEXT, ip TEXT, patient TEXT, detail TEXT, attack_id TEXT);
 CREATE INDEX IF NOT EXISTS ev_idx ON events(tenant, type, ts);
-CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY, created TEXT, event_ts TEXT, tenant TEXT, rule TEXT,
+CREATE TABLE IF NOT EXISTS alerts(id BIGSERIAL PRIMARY KEY, created TEXT, event_ts TEXT, tenant TEXT, rule TEXT,
   severity TEXT, summary TEXT, dkey TEXT, owner TEXT, step TEXT, status TEXT DEFAULT 'new',
   ack_at TEXT, verdict TEXT, attack_id TEXT, source TEXT DEFAULT 'builtin', detail TEXT);
-CREATE TABLE IF NOT EXISTS handoffs(id INTEGER PRIMARY KEY, alert_id INTEGER, at TEXT, from_owner TEXT,
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS detail TEXT;
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS resolution TEXT;
+CREATE TABLE IF NOT EXISTS handoffs(id BIGSERIAL PRIMARY KEY, alert_id BIGINT, at TEXT, from_owner TEXT,
   to_owner TEXT, note TEXT);
 CREATE INDEX IF NOT EXISTS ho_idx ON handoffs(alert_id);
 """
 
+_schema_ready = set()  # database URLs whose schema has been checked in this process
+
+
+class Row(dict):
+    """A row that can be read by column name or by position, like sqlite3.Row."""
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return dict.__getitem__(self, key)
+
+
+def _row_factory(cursor):
+    names = [d.name for d in (cursor.description or [])]
+
+    def make(values):
+        return Row(zip(names, values))
+    return make
+
+
+def connect():
+    """Open a new connection and make sure the schema exists. Read the URL at call time."""
+    url = os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
+    c = psycopg.connect(url, row_factory=_row_factory)
+    if url not in _schema_ready:
+        c.execute(SCHEMA)
+        c.commit()
+        _schema_ready.add(url)
+    return c
+
 
 def db():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
-    c.executescript(SCHEMA)
-    # Migrate databases created before the 'detail' column existed.
-    cols = {r["name"] for r in c.execute("PRAGMA table_info(alerts)")}
-    if "detail" not in cols:
-        c.execute("ALTER TABLE alerts ADD COLUMN detail TEXT")
-    # Migrate databases created before the 'resolution' column existed (v0.6).
-    if "resolution" not in cols:
-        c.execute("ALTER TABLE alerts ADD COLUMN resolution TEXT")
-    return c
+    """One connection per request. It is closed when the request ends (see _close_db)."""
+    if "db" not in g:
+        g.db = connect()
+    return g.db
+
+
+@app.teardown_appcontext
+def _close_db(exc):
+    c = g.pop("db", None)
+    if c is not None:
+        c.close()
 
 
 def now():
@@ -65,7 +100,7 @@ def _fp_target():
 
 def raise_alert(c, tenant, rule, sev, summary, key, event_ts, attack_id=None, source="builtin",
                 detail="", step=None):
-    dup = c.execute("SELECT 1 FROM alerts WHERE rule=? AND tenant=? AND dkey=? AND event_ts>=?",
+    dup = c.execute("SELECT 1 FROM alerts WHERE rule=%s AND tenant=%s AND dkey=%s AND event_ts>=%s",
                     (rule, tenant, key, detect._ago(event_ts, 10))).fetchone() if event_ts else None
     if dup:
         return None
@@ -73,9 +108,9 @@ def raise_alert(c, tenant, rule, sev, summary, key, event_ts, attack_id=None, so
     owner = ANALYSTS[n % len(ANALYSTS)]
     step = step or detect.PLAYBOOK.get(rule, "Review the alert details and decide: escalate, fix, or close as benign.")
     cur = c.execute("INSERT INTO alerts(created,event_ts,tenant,rule,severity,summary,dkey,owner,step,attack_id,source,detail) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                     (now(), event_ts, tenant, rule, sev, summary, key, owner, step, attack_id, source, detail))
-    return cur.lastrowid
+    return cur.fetchone()["id"]
 
 
 def _playbook_url():
@@ -135,7 +170,7 @@ def _notify_new(c, ids):
     url = _playbook_url()
     if not url or not ids:
         return
-    marks = ",".join("?" * len(ids))
+    marks = ",".join(["%s"] * len(ids))
     for row in c.execute(f"SELECT * FROM alerts WHERE id IN ({marks}) ORDER BY id", ids).fetchall():
         _dispatch(url, _alert_payload(row))
 
@@ -170,8 +205,8 @@ def ingest():
         e.setdefault("attack_id", None)
         for k in ("user", "host", "ip", "patient", "detail", "source"):
             e.setdefault(k, "")
-        c.execute("INSERT INTO events(ts,tenant,source,type,user,host,ip,patient,detail,attack_id) "
-                  "VALUES(:ts,:tenant,:source,:type,:user,:host,:ip,:patient,:detail,:attack_id)", e)
+        c.execute('INSERT INTO events(ts,tenant,source,type,"user",host,ip,patient,detail,attack_id) '
+                  "VALUES(%(ts)s,%(tenant)s,%(source)s,%(type)s,%(user)s,%(host)s,%(ip)s,%(patient)s,%(detail)s,%(attack_id)s)", e)
         hit = detect.evaluate(c, e)
         if hit:
             i = raise_alert(c, e["tenant"], *hit[:3], hit[3], e["ts"], e["attack_id"])
@@ -213,7 +248,7 @@ def alerts():
     args = []
     for f in ("tenant", "status", "owner"):
         if request.args.get(f):
-            q += f" AND {f}=?"
+            q += f" AND {f}=%s"
             args.append(request.args[f])
     rows = db().execute(q + " ORDER BY id DESC LIMIT 200", args).fetchall()
     return jsonify([dict(r) for r in rows])
@@ -222,7 +257,7 @@ def alerts():
 @app.post("/api/alerts/<int:i>/ack")
 def ack(i):
     c = db()
-    c.execute("UPDATE alerts SET status='ack', ack_at=? WHERE id=? AND status='new'", (now(), i))
+    c.execute("UPDATE alerts SET status='ack', ack_at=%s WHERE id=%s AND status='new'", (now(), i))
     c.commit()
     return jsonify(ok=True)
 
@@ -235,8 +270,8 @@ def verdict(i):
         return jsonify(error="verdict must be tp, fp or unclear"), 400
     note = (body.get("note") or "").strip()[:500]  # optional closing note, kept with the alert
     c = db()
-    c.execute("UPDATE alerts SET verdict=?, status='closed', ack_at=COALESCE(ack_at,?), "
-              "resolution=COALESCE(NULLIF(?,''), resolution) WHERE id=?", (v, now(), note, i))
+    c.execute("UPDATE alerts SET verdict=%s, status='closed', ack_at=COALESCE(ack_at,%s), "
+              "resolution=COALESCE(NULLIF(%s,''), resolution) WHERE id=%s", (v, now(), note, i))
     c.commit()
     return jsonify(ok=True)
 
@@ -255,23 +290,23 @@ def handoff(i):
     if to not in ANALYSTS:
         return jsonify(error=f"to_owner must be one of: {', '.join(ANALYSTS)}"), 400
     c = db()
-    row = c.execute("SELECT owner, status FROM alerts WHERE id=?", (i,)).fetchone()
+    row = c.execute("SELECT owner, status FROM alerts WHERE id=%s", (i,)).fetchone()
     if not row:
         return jsonify(error="alert not found"), 404
     if row["status"] == "closed":
         return jsonify(error="alert is closed"), 409
     if to == row["owner"]:
         return jsonify(error=f"alert is already owned by {to}"), 400
-    c.execute("INSERT INTO handoffs(alert_id,at,from_owner,to_owner,note) VALUES(?,?,?,?,?)",
+    c.execute("INSERT INTO handoffs(alert_id,at,from_owner,to_owner,note) VALUES(%s,%s,%s,%s,%s)",
               (i, now(), row["owner"], to, note))
-    c.execute("UPDATE alerts SET owner=? WHERE id=?", (to, i))
+    c.execute("UPDATE alerts SET owner=%s WHERE id=%s", (to, i))
     c.commit()
     return jsonify(ok=True, from_owner=row["owner"], to_owner=to)
 
 
 @app.get("/api/alerts/<int:i>/handoffs")
 def handoffs(i):
-    rows = db().execute("SELECT at, from_owner, to_owner, note FROM handoffs WHERE alert_id=? ORDER BY id", (i,)).fetchall()
+    rows = db().execute("SELECT at, from_owner, to_owner, note FROM handoffs WHERE alert_id=%s ORDER BY id", (i,)).fetchall()
     return jsonify([dict(r) for r in rows])
 
 
@@ -281,9 +316,11 @@ def _metrics():
     tp, fp = q("SELECT COUNT(*) FROM alerts WHERE verdict='tp'"), q("SELECT COUNT(*) FROM alerts WHERE verdict='fp'")
     planted = q("SELECT COUNT(DISTINCT attack_id) FROM events WHERE attack_id IS NOT NULL")
     caught = q("SELECT COUNT(DISTINCT attack_id) FROM alerts WHERE attack_id IS NOT NULL")
-    mtta = c.execute("SELECT AVG(strftime('%s',ack_at)-strftime('%s',created)) FROM alerts WHERE ack_at IS NOT NULL").fetchone()[0]
+    mtta = q("SELECT CAST(AVG(EXTRACT(EPOCH FROM (CAST(ack_at AS timestamp) - CAST(created AS timestamp)))) "
+             "AS DOUBLE PRECISION) FROM alerts WHERE ack_at IS NOT NULL")
     weekly = []
-    for r in c.execute("SELECT strftime('%Y-W%W', created) AS week, SUM(verdict='tp') AS tp, SUM(verdict='fp') AS fp "
+    for r in c.execute("SELECT to_char(CAST(created AS timestamp), 'IYYY-\"W\"IW') AS week, "
+                       "COUNT(*) FILTER (WHERE verdict='tp') AS tp, COUNT(*) FILTER (WHERE verdict='fp') AS fp "
                        "FROM alerts WHERE verdict IN ('tp','fp') GROUP BY week ORDER BY week"):
         weekly.append({"week": r["week"], "tp": r["tp"], "fp": r["fp"],
                        "false_positive_rate": round(r["fp"] / (r["tp"] + r["fp"]), 3)})
@@ -366,7 +403,8 @@ def autolabel():
 @app.post("/api/reset")
 def reset():
     c = db()
-    c.executescript("DELETE FROM events; DELETE FROM alerts; DELETE FROM handoffs;")
+    c.execute("TRUNCATE events, alerts, handoffs RESTART IDENTITY")
+    c.commit()
     return jsonify(ok=True)
 
 

@@ -1,11 +1,28 @@
-# SOC Core app only. Run Wazuh separately (see wazuh/README.md) and point its webhook here.
+# SOC Core app + PostgreSQL. Run Wazuh separately (see wazuh/README.md) and point its webhook here.
 # Settings come from a .env file next to this file (see README). Never commit .env.
 services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: soc
+      POSTGRES_USER: soc
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (letters and digits only)}"
+    volumes: ["pg-data:/var/lib/postgresql/data"]   # the database is not exposed to the host network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U soc -d soc"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
   soc-core:
     build: .
     ports: ["5000:5000"]
     restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
+      DATABASE_URL: "postgresql://soc:${POSTGRES_PASSWORD}@db:5432/soc"
       ANALYSTS: "analyst1,analyst2,analyst3"
       LAB_ENDPOINTS: "${LAB_ENDPOINTS:-1}"   # set to 0 before any real data goes in
       SOC_API_TOKEN: "${SOC_API_TOKEN:-}"    # required on any shared deployment
@@ -13,6 +30,5 @@ services:
       PLAYBOOK_WEBHOOK: "${PLAYBOOK_WEBHOOK:-}"    # v0.7: POST each new alert here (e.g. Shuffle); empty = off
       PLAYBOOK_TIMEOUT: "${PLAYBOOK_TIMEOUT:-3}"   # seconds to wait for the playbook webhook
       PLAYBOOK_SECRET: "${PLAYBOOK_SECRET:-}"      # v0.8: signs each playbook request (HMAC); set it with PLAYBOOK_WEBHOOK
-    volumes: ["soc-data:/data"]
 volumes:
-  soc-data:
+  pg-data:

@@ -1,7 +1,3 @@
-import os, sys, tempfile
-os.environ.setdefault("SOC_DB", os.path.join(tempfile.mkdtemp(), "handoff.db"))
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
 import app as soc
 
 c = soc.app.test_client()
