@@ -1,71 +1,104 @@
 # Connecting Shuffle to SOC Core (playbooks)
 
-SOC Core sends each new alert to `PLAYBOOK_WEBHOOK` as JSON. Shuffle receives the alert through a webhook
-trigger and runs a playbook from it. This guide covers the SOC Core side, the signature check, and a test.
-Shuffle itself is installed separately, on its own host or VM, following Shuffle's own documentation.
+SOC Core sends each new alert to `PLAYBOOK_WEBHOOK` as signed JSON. Shuffle receives the alert through a webhook
+trigger, checks the signature, and runs a playbook. This guide covers installing Shuffle, locking it down,
+connecting it, and testing the chain. Install steps follow Shuffle's official guide:
+https://github.com/Shuffle/Shuffle/blob/master/.github/install-guide.md
 
-## 1. What SOC Core sends
+## Before you start
 
-Each request is an HTTPS-style POST with a JSON body:
+- **Own VM.** Shuffle needs at least 4 GB of RAM and Docker. Install it on a separate VM from SOC Core, so a
+  problem in Shuffle cannot stop the SOC pipeline. Check the RAM with `free -h`.
+- **Pin a release.** Use a tagged Shuffle release, not `master`, on any system that matters. Find the latest tag at
+  https://github.com/Shuffle/Shuffle/releases and check it out in step 1.
+- **Read the production guide.** Shuffle's official guide says its default setup is not scalable and points to
+  https://shuffler.io/docs/configuration for production settings.
 
-    {"event": "alert.created",
-     "alert": {"id": 12, "created": "...", "tenant": "city-hospital", "rule": "SUSPICIOUS_PROCESS",
-               "severity": "critical", "summary": "...", "owner": "analyst1", "step": "...",
-               "detail": "...", "attack_id": null, "source": "builtin"}}
+## 1. Install Shuffle (on its own VM)
 
-Headers:
+    git clone https://github.com/Shuffle/Shuffle
+    cd Shuffle
+    git checkout <release-tag>
+    mkdir -p shuffle-database
+    sudo chown -R 1000:1000 shuffle-database      # if this fails, run: sudo useradd opensearch, then retry
+    sudo swapoff -a
+    docker compose up -d
+    sudo sysctl -w vm.max_map_count=262144        # needed by OpenSearch
+    echo "vm.max_map_count=262144" | sudo tee -a /etc/sysctl.conf   # keeps the setting after a reboot
 
-| Header | Meaning |
-|---|---|
-| `X-Cybrot-Event-Id` | `alert-<id>`. The same on every retry, so use it to drop duplicates. |
-| `X-Cybrot-Timestamp` | Unix time in seconds when the request was sent. |
-| `X-Cybrot-Signature` | `sha256=<hex>`, present only when `PLAYBOOK_SECRET` is set. |
+Shuffle's web UI is then at `https://<shuffle-vm-ip>:3443`. Port 3001 serves HTTP.
 
-Delivery: up to 3 attempts. Server errors and network errors are retried after 1 s and 2 s. A 4xx reply is not
-retried. The request times out after `PLAYBOOK_TIMEOUT` seconds (default 3).
+## 2. Lock it down
 
-## 2. Set up the receiver in Shuffle
+- **Create the admin account yourself.** Shuffle has no default username or password. Use a strong, unique password.
+- **Limit the network.** Allow only the admin machine and the SOC Core VM to reach the Shuffle ports. Example for the
+  lab subnet, run on the Shuffle VM:
 
-1. In Shuffle, create a new workflow for alerts.
-2. Add a **webhook trigger** and copy its URL.
-3. Add a **Python step** (or your Shuffle version's equivalent) that verifies the signature, then runs the playbook.
-   The verification code is in section 3.
-4. Put the URL in SOC Core's `.env`, together with a long random secret:
+      sudo ufw allow from 192.168.56.0/24 to any port 3443 proto tcp
+      sudo ufw enable
 
-       PLAYBOOK_WEBHOOK=https://<shuffle-host>/api/v1/hooks/<webhook-id>
-       PLAYBOOK_SECRET=<a long random value, e.g. from: python3 -c "import secrets; print(secrets.token_hex(32))">
+  In production, use the specific IP addresses, not a whole subnet.
+- **Use a certificate SOC Core trusts.** SOC Core verifies the TLS certificate of the webhook. A self-signed certificate
+  makes every delivery fail with a `URLError`. Use a certificate from your internal CA, or put Shuffle behind a
+  reverse proxy with a trusted certificate. (If you must use a self-signed certificate, tell me and we will add
+  support for a CA file.)
+- **Keep the secret out of workflows as plain text.** Store `PLAYBOOK_SECRET` in Shuffle's secrets or variables if your
+  version has them.
 
-   Generate the secret on the VM, keep it out of chat and tickets, and use the same value in Shuffle.
-5. Restart SOC Core: `docker compose up -d`.
+## 3. Create the webhook in Shuffle
 
-## 3. Verify the signature in Shuffle
+1. Log in to Shuffle and create a new workflow for alerts.
+2. Add a **Webhook** trigger. Copy the URL that Shuffle shows. Copy it from the UI rather than building it by hand,
+   because the path depends on the Shuffle version.
+3. Add a **Python** step (or your version's custom code step) that runs the check in section 4 first. The playbook
+   actions come after that check, and a failed check stops the run.
+4. Save the workflow and start it.
 
-Verification needs the exact bytes that SOC Core sent. If a Shuffle step parses the JSON and sends it on
-again, the bytes change and the check will fail. Check the raw body before relying on it.
+## 4. Check every request
 
-    import hashlib, hmac, time
+`shuffle/verify_alert.py` in this repository holds the checks. It is covered by `tests/test_shuffle_verify.py`.
+Paste the file into the Python step, then call:
 
-    def verify(secret, timestamp, raw_body, signature):
-        if abs(time.time() - int(timestamp)) > 300:      # reject old requests (replay protection)
-            return False
-        expected = "sha256=" + hmac.new(secret.encode(), f"{timestamp}.".encode() + raw_body,
-                                        hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, signature)
+    ok = verify(secret, headers["X-Cybrot-Timestamp"], raw_body, headers["X-Cybrot-Signature"])
+    if ok and dedupe.first_time(headers["X-Cybrot-Event-Id"]):
+        ...run the playbook...
+    else:
+        ...stop the run...
 
-Also drop a repeat when `X-Cybrot-Event-Id` has already been handled. Keep the ids for at least 24 hours.
+- `raw_body` must be the exact bytes SOC Core sent. If a step parses the JSON and sends it on again, the bytes change
+  and the check fails. Test with one alert before you rely on it.
+- The checks reject a request whose timestamp is more than 5 minutes away from the current time (replay protection).
+- `DedupeLog` keeps its ids in memory, so it resets when the worker restarts. For production, store the ids in
+  Shuffle's datastore, or check the alert id in SOC Core before acting.
 
-## 4. Test it
+## 5. Connect SOC Core
 
-1. Run one test event, as in the playbook test on the VM.
-2. In Shuffle, check that the workflow started and that `verify(...)` returned `True`.
-3. Change the secret in Shuffle, then send another event. The check should now return `False`, which shows
-   the signature is being enforced. Put the correct secret back.
+On the SOC Core VM, add these two lines to `.env` (the webhook URL from step 3, and the secret the Shuffle step uses):
 
-## 5. Troubleshooting
+    PLAYBOOK_WEBHOOK=<the webhook URL copied from Shuffle>
+    PLAYBOOK_SECRET=<the same secret>
+
+Then restart the container:
+
+    docker compose up -d
+
+Generate the secret on the VM with `python3 -c "import secrets; print(secrets.token_hex(32))"`, keep it out of chat and
+tickets, and put the same value in Shuffle.
+
+## 6. Test
+
+1. Send one test alert, using the same `curl` command as in the earlier VM tests.
+2. In Shuffle, check that the workflow ran, and that `verify` returned `True`.
+3. Call `verify` with a wrong secret, or change a character in the body. It must return `False`, and the playbook
+   must not run.
+4. Send the same alert again. The second run must stop at the duplicate check.
+
+## 7. Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
-| `playbook webhook failed: HTTP 404` in `docker compose logs` | The Shuffle URL is wrong or the workflow is not running. |
-| `playbook webhook failed: HTTP 401` or `403` | Shuffle rejected the request. Check any auth set on the webhook trigger. |
-| `playbook webhook failed: URLError` | SOC Core cannot reach the Shuffle host. Check the VM's network and DNS. |
-| Verification always fails | The Shuffle step re-serialized the JSON, or the secret differs. Compare the raw body. |
+| `playbook webhook failed: HTTP 404` in `docker compose logs` | The URL is wrong, or the workflow is not running. Copy the URL again from Shuffle. |
+| `playbook webhook failed: HTTP 401` or `403` | Shuffle rejected the request. Check any authentication set on the webhook trigger. |
+| `playbook webhook failed: URLError` | SOC Core cannot reach Shuffle, or the certificate is not trusted. Check the network, then the certificate. |
+| `verify` always returns `False` | The Shuffle step changed the raw body, the secret differs, or the VM clocks are more than 5 minutes apart. |
+| Shuffle install stops at `docker compose up` | Check RAM (4 GB minimum), and that `vm.max_map_count` is set. |

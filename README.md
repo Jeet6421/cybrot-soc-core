@@ -32,7 +32,7 @@ This version follows the internal test plan in the prototype plan document: the 
 
 ## Tests
     pip install pytest
-    pytest -q tests              # 46 tests
+    pytest -q tests              # 53 tests
 
 ## Test plan tools (scripts/)
 These use only the Python standard library. Run them against an instance with no real data.
@@ -115,6 +115,12 @@ trend (test plan step 4) can be tracked.
 | `GET /api/exit-criteria` | The four roadmap gates, as `pass`, `fail` or `not_measured` |
 
 ## Changes
+**v0.9**
+- Shuffle setup guide rewritten from Shuffle's official install guide: own VM, pinned release, ports 3443 (HTTPS) and 3001 (HTTP),
+  `vm.max_map_count`, firewall limits, a trusted certificate, and a test plan.
+- `shuffle/verify_alert.py`: the signature, timestamp and duplicate checks for a Shuffle Python step (standard library only).
+- Tests: 7 in `tests/test_shuffle_verify.py`. 53 tests in total.
+
 **v0.8**
 - Playbook webhook is signed when `PLAYBOOK_SECRET` is set: `X-Cybrot-Signature` (HMAC-SHA256 over `<timestamp>.<raw body>`),
   `X-Cybrot-Timestamp`, and `X-Cybrot-Event-Id` (`alert-<id>`, the same on retries so the receiver can de-duplicate).
