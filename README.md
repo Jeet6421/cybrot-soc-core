@@ -31,7 +31,7 @@ This version follows the internal test plan in the prototype plan document: the 
 
 ## Tests
     pip install pytest
-    pytest -q tests              # 39 tests
+    pytest -q tests              # 42 tests
 
 ## Test plan tools (scripts/)
 These use only the Python standard library. Run them against an instance with no real data.
@@ -114,6 +114,11 @@ trend (test plan step 4) can be tracked.
 | `GET /api/exit-criteria` | The four roadmap gates, as `pass`, `fail` or `not_measured` |
 
 ## Changes
+**v0.7.1**
+- The dashboard shows each alert's latest handoff under the summary ("Handoff: analyst2 -> analyst1: note").
+  Before this, a handoff note was saved in the history only, and the row showed only the closing note.
+- `GET /api/alerts` adds a `last_handoff` field (null when the alert was never handed off).
+
 **v0.7**
 - Playbook hook (roadmap phase 3, Response): with `PLAYBOOK_WEBHOOK` set, each new alert is POSTed as JSON
   (`{"event": "alert.created", "alert": {...}}`) to that URL, so Shuffle or another SOAR tool can run a playbook.

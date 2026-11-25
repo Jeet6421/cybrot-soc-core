@@ -180,7 +180,11 @@ def ingest_wazuh():
 
 @app.get("/api/alerts")
 def alerts():
-    q, args = "SELECT * FROM alerts WHERE 1=1", []
+    # last_handoff: the latest handoff as "from -> to: note", so the dashboard can show it (v0.7.1).
+    q = ("SELECT alerts.*, (SELECT from_owner || ' -> ' || to_owner || ': ' || COALESCE(NULLIF(note, ''), 'no note') "
+         "FROM handoffs h WHERE h.alert_id = alerts.id ORDER BY h.id DESC LIMIT 1) AS last_handoff "
+         "FROM alerts WHERE 1=1")
+    args = []
     for f in ("tenant", "status", "owner"):
         if request.args.get(f):
             q += f" AND {f}=?"
