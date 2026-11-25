@@ -1,7 +1,5 @@
-import os, sys, tempfile
-os.environ.setdefault("SOC_DB", os.path.join(tempfile.mkdtemp(), "tools.db"))
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "scripts"))
+import os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 import app as soc
 import attack_sim, load_test
 

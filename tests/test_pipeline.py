@@ -1,6 +1,7 @@
-import json, os, sqlite3, tempfile
-os.environ["SOC_DB"] = os.path.join(tempfile.mkdtemp(), "t.db")
+import json, os
+import psycopg
 import app as soc
+
 c = soc.app.test_client()
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "wazuh_92213_psscriptpolicy.json")
@@ -79,20 +80,20 @@ def test_lab_endpoints_can_be_disabled():
         soc.LAB_ENDPOINTS = True
 
 
-def test_old_database_gets_detail_column():
-    path = os.path.join(tempfile.mkdtemp(), "old.db")
-    old = sqlite3.connect(path)
-    old.executescript("""CREATE TABLE alerts(id INTEGER PRIMARY KEY, created TEXT, event_ts TEXT, tenant TEXT, rule TEXT,
-      severity TEXT, summary TEXT, dkey TEXT, owner TEXT, step TEXT, status TEXT DEFAULT 'new',
-      ack_at TEXT, verdict TEXT, attack_id TEXT, source TEXT DEFAULT 'builtin');""")
-    old.commit(); old.close()
-    old_db = soc.DB
-    soc.DB = path
+def test_old_database_gets_new_columns(scratch_db, monkeypatch):
+    # An alerts table from before the detail/resolution columns existed must be upgraded in place.
+    with psycopg.connect(scratch_db) as old:
+        old.execute("""CREATE TABLE alerts(id BIGSERIAL PRIMARY KEY, created TEXT, event_ts TEXT, tenant TEXT, rule TEXT,
+          severity TEXT, summary TEXT, dkey TEXT, owner TEXT, step TEXT, status TEXT DEFAULT 'new',
+          ack_at TEXT, verdict TEXT, attack_id TEXT, source TEXT DEFAULT 'builtin')""")
+    monkeypatch.setenv("DATABASE_URL", scratch_db)
+    conn = soc.connect()
     try:
-        cols = {r["name"] for r in soc.db().execute("PRAGMA table_info(alerts)")}
-        assert "detail" in cols
+        cols = {r["column_name"] for r in conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name='alerts'").fetchall()}
     finally:
-        soc.DB = old_db
+        conn.close()
+    assert {"detail", "resolution"} <= cols
 
 
 def test_api_token_gates_api_but_not_dashboard():

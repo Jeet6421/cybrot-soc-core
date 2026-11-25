@@ -1,4 +1,4 @@
-# Cybrot SOC Core (prototype, v0.7)
+# Cybrot SOC Core (prototype, v1.0)
 
 Core pipeline for the hospital/clinic SOC service: **logs in -> detection rules -> alert with severity ->
 triage queue with a named owner and response step -> metrics -> exit criteria**. Test data only - never real patient data.
@@ -7,6 +7,8 @@ This version follows the internal test plan in the prototype plan document: the 
 (Foundation, Detection, Response, Review) are checked by the app and by scripts.
 
 ## Run locally
+    # PostgreSQL 16 is required. Start one (the defaults below match DATABASE_URL's default):
+    docker run -d --name soc-pg -e POSTGRES_USER=soc -e POSTGRES_PASSWORD=soc -e POSTGRES_DB=soc -p 5432:5432 postgres:16
     pip install -r requirements.txt
     python app.py                 # http://localhost:5000
     # Click "Load demo data", then "Auto-label (lab)", or triage alerts by hand (Ack / TP / FP / ?)
@@ -15,12 +17,15 @@ This version follows the internal test plan in the prototype plan document: the 
 ## Run with Docker
     docker compose up -d --build  # http://localhost:5000
     # Settings are read from a .env file next to docker-compose.yml. Never commit .env.
+    # .env must set POSTGRES_PASSWORD (letters and digits only, so it fits in the connection URL).
+    # The database runs in its own container with a named volume (pg-data) and is not published to the host.
     # The Docker build runs in GitHub Actions on every push (see .github/workflows/tests.yml).
 
 ## Configuration
 | Variable | Default | Purpose |
 |---|---|---|
-| `SOC_DB` | `soc.db` (`/data/soc.db` in Docker) | SQLite database path |
+| `DATABASE_URL` | `postgresql://soc:soc@localhost:5432/soc` (Docker: built from `POSTGRES_PASSWORD`) | PostgreSQL connection string. The schema is created on first connect. |
+| `POSTGRES_PASSWORD` | required in Docker | Password for the `soc` database role (docker-compose only) |
 | `ANALYSTS` | `analyst1,analyst2,analyst3` | Owners for alerts, assigned round-robin |
 | `LAB_ENDPOINTS` | `1` | `0` disables `/api/demo`, `/api/autolabel`, `/api/reset` (they return 404) |
 | `SOC_API_TOKEN` | empty (no token) | If set, every `/api/` call needs `Authorization: Bearer <token>` |
@@ -31,8 +36,11 @@ This version follows the internal test plan in the prototype plan document: the 
 | `PORT` | `5000` | HTTP port when running `python app.py` |
 
 ## Tests
+Tests need a PostgreSQL server. Each test session creates its own database and drops it at the end,
+so the tests never touch your data. The admin URL must be allowed to create and drop databases.
+
     pip install pytest
-    pytest -q tests              # 46 tests
+    TEST_ADMIN_URL=postgresql://soc:soc@localhost:5432/postgres pytest -q tests   # this is the default
 
 ## Test plan tools (scripts/)
 These use only the Python standard library. Run them against an instance with no real data.
@@ -62,7 +70,7 @@ The dashboard shows these at the top. `GET /api/metrics` also returns `false_pos
 trend (test plan step 4) can be tracked.
 
 ## Layout
-- `app.py`      Flask API + SQLite: `/api/events`, `/api/ingest/wazuh`, `/api/alerts`, `/api/alerts/<id>/handoff`, `/api/metrics`, `/api/exit-criteria`
+- `app.py`      Flask API + PostgreSQL (psycopg 3): `/api/events`, `/api/ingest/wazuh`, `/api/alerts`, `/api/alerts/<id>/handoff`, `/api/metrics`, `/api/exit-criteria`
 - `detect.py`   built-in rules and playbooks; Wazuh playbooks by rule id (`WAZUH_PLAYBOOK`), with a level-based fallback
 - `generate.py` synthetic clinic logs with 3 planted attacks (ground truth in `attack_id`)
 - `scripts/`    attack simulations and load test (see above)
@@ -115,6 +123,14 @@ trend (test plan step 4) can be tracked.
 | `GET /api/exit-criteria` | The four roadmap gates, as `pass`, `fail` or `not_measured` |
 
 ## Changes
+**v1.0 (PostgreSQL)**
+- The database is PostgreSQL 16 (was SQLite). `DATABASE_URL` sets the connection; `docker compose` runs a `db` service with a named volume.
+- One connection per request, closed at the end of the request. The schema is created on the first connect to each database.
+- Row-level security and per-tenant roles are not in this version. They are the next step (see `docs/MULTITENANT.md`).
+- Weekly false-positive labels use ISO weeks (`2026-W47`). The old SQLite labels were `%Y-W%W`, so a week at a year boundary can get a different label.
+- SQLite data is not migrated. The prototype data is test data, so start with an empty database.
+- Tests create and drop their own PostgreSQL databases. They also check that an old `alerts` table gets the new columns.
+
 **v0.8**
 - Playbook webhook is signed when `PLAYBOOK_SECRET` is set: `X-Cybrot-Signature` (HMAC-SHA256 over `<timestamp>.<raw body>`),
   `X-Cybrot-Timestamp`, and `X-Cybrot-Event-Id` (`alert-<id>`, the same on retries so the receiver can de-duplicate).
