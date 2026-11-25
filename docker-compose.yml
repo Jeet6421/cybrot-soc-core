@@ -12,6 +12,7 @@ services:
       FP_TARGET: "${FP_TARGET:-}"            # agreed false-positive ceiling, e.g. 0.10; empty = not set
       PLAYBOOK_WEBHOOK: "${PLAYBOOK_WEBHOOK:-}"    # v0.7: POST each new alert here (e.g. Shuffle); empty = off
       PLAYBOOK_TIMEOUT: "${PLAYBOOK_TIMEOUT:-3}"   # seconds to wait for the playbook webhook
+      PLAYBOOK_SECRET: "${PLAYBOOK_SECRET:-}"      # v0.8: signs each playbook request (HMAC); set it with PLAYBOOK_WEBHOOK
     volumes: ["soc-data:/data"]
 volumes:
   soc-data:

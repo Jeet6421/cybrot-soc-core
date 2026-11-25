@@ -1,5 +1,5 @@
 """Cybrot SOC Core - prototype: ingest -> detect -> triage queue (owner + response step) -> metrics -> exit criteria."""
-import hmac, json, os, sqlite3, sys, threading, urllib.request
+import hashlib, hmac, json, os, sqlite3, sys, threading, time, urllib.error, urllib.request
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, send_from_directory
 import detect, generate
@@ -88,16 +88,42 @@ def _alert_payload(row):
     return {"event": "alert.created", "alert": {k: row[k] for k in keys}}
 
 
-def _send(url, payload, timeout=None):
-    """POST one alert to the playbook webhook. Returns True on a 2xx reply. Never raises; the URL is not logged."""
-    try:
-        req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                                     headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout or PLAYBOOK_TIMEOUT) as r:
-            return 200 <= r.status < 300
-    except Exception as e:  # delivery problems must never break ingest
-        print(f"playbook webhook failed: {type(e).__name__}", file=sys.stderr, flush=True)
-        return False
+def _playbook_secret():
+    return os.environ.get("PLAYBOOK_SECRET", "")
+
+
+def sign(secret, timestamp, body):
+    """HMAC-SHA256 over '<timestamp>.<raw body>'. The receiver recomputes it and compares (see docs/SHUFFLE.md)."""
+    mac = hmac.new(secret.encode(), f"{timestamp}.".encode() + body, hashlib.sha256)
+    return "sha256=" + mac.hexdigest()
+
+
+def _send(url, payload, timeout=None, attempts=3, delay=1.0):
+    """POST one alert to the playbook webhook. Returns True on a 2xx reply. Never raises; the URL is not logged.
+    Signed with PLAYBOOK_SECRET when set. Server errors and network errors are retried with backoff;
+    4xx replies are not, because retrying a rejected request does not help."""
+    body = json.dumps(payload).encode()
+    secret = _playbook_secret()
+    event_id = f"alert-{payload.get('alert', {}).get('id', 'unknown')}"  # same on every retry: lets the receiver de-duplicate
+    for n in range(attempts):
+        ts = str(int(time.time()))
+        headers = {"Content-Type": "application/json", "X-Cybrot-Event-Id": event_id, "X-Cybrot-Timestamp": ts}
+        if secret:
+            headers["X-Cybrot-Signature"] = sign(secret, ts, body)
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or PLAYBOOK_TIMEOUT) as r:
+                if 200 <= r.status < 300:
+                    return True
+        except urllib.error.HTTPError as e:
+            print(f"playbook webhook failed: HTTP {e.code}", file=sys.stderr, flush=True)
+            if 400 <= e.code < 500:
+                return False
+        except Exception as e:  # delivery problems must never break ingest
+            print(f"playbook webhook failed: {type(e).__name__}", file=sys.stderr, flush=True)
+        if n < attempts - 1:
+            time.sleep(delay * (2 ** n))
+    return False
 
 
 def _dispatch(url, payload):
