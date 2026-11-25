@@ -30,13 +30,24 @@ GATE_NAMES = {
 # "user" is a reserved word in PostgreSQL, so the column is quoted wherever it appears.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events(id BIGSERIAL PRIMARY KEY, ts TEXT, tenant TEXT, source TEXT, type TEXT,
-  "user" TEXT, host TEXT, ip TEXT, patient TEXT, detail TEXT, attack_id TEXT);
+  "user" TEXT, host TEXT, ip TEXT, patient TEXT, detail TEXT, attack_id TEXT,
+  destination TEXT, data_classification TEXT, destination_approved BOOLEAN,
+  src_zone TEXT, dst_zone TEXT, boundary_violation BOOLEAN, approved_change BOOLEAN);
 CREATE INDEX IF NOT EXISTS ev_idx ON events(tenant, type, ts);
+CREATE INDEX IF NOT EXISTS ev_host_type_idx ON events(tenant, host, type, ts);
+ALTER TABLE events ADD COLUMN IF NOT EXISTS destination TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS data_classification TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS destination_approved BOOLEAN;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS src_zone TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS dst_zone TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS boundary_violation BOOLEAN;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS approved_change BOOLEAN;
 CREATE TABLE IF NOT EXISTS alerts(id BIGSERIAL PRIMARY KEY, created TEXT, event_ts TEXT, tenant TEXT, rule TEXT,
-  severity TEXT, summary TEXT, dkey TEXT, owner TEXT, step TEXT, status TEXT DEFAULT 'new',
+  rule_version TEXT, severity TEXT, summary TEXT, dkey TEXT, owner TEXT, step TEXT, status TEXT DEFAULT 'new',
   ack_at TEXT, verdict TEXT, attack_id TEXT, source TEXT DEFAULT 'builtin', detail TEXT);
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS detail TEXT;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS resolution TEXT;
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS rule_version TEXT;
 CREATE TABLE IF NOT EXISTS handoffs(id BIGSERIAL PRIMARY KEY, alert_id BIGINT, at TEXT, from_owner TEXT,
   to_owner TEXT, note TEXT);
 ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS tenant TEXT;
@@ -116,9 +127,9 @@ def raise_alert(c, tenant, rule, sev, summary, key, event_ts, attack_id=None, so
     n = c.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
     owner = ANALYSTS[n % len(ANALYSTS)]
     step = step or detect.PLAYBOOK.get(rule, "Review the alert details and decide: escalate, fix, or close as benign.")
-    cur = c.execute("INSERT INTO alerts(created,event_ts,tenant,rule,severity,summary,dkey,owner,step,attack_id,source,detail) "
-                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-                    (now(), event_ts, tenant, rule, sev, summary, key, owner, step, attack_id, source, detail))
+    cur = c.execute("INSERT INTO alerts(created,event_ts,tenant,rule,rule_version,severity,summary,dkey,owner,step,attack_id,source,detail) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    (now(), event_ts, tenant, rule, detect.rule_version(rule), sev, summary, key, owner, step, attack_id, source, detail))
     return cur.fetchone()["id"]
 
 
@@ -128,7 +139,7 @@ def _playbook_url():
 
 
 def _alert_payload(row):
-    keys = ("id", "created", "tenant", "rule", "severity", "summary", "owner", "step", "detail", "attack_id", "source")
+    keys = ("id", "created", "tenant", "rule", "rule_version", "severity", "summary", "owner", "step", "detail", "attack_id", "source")
     return {"event": "alert.created", "alert": {k: row[k] for k in keys}}
 
 
@@ -240,8 +251,13 @@ def _store_events(c, evs):
         e.setdefault("attack_id", None)
         for k in ("user", "host", "ip", "patient", "detail", "source"):
             e.setdefault(k, "")
-        c.execute('INSERT INTO events(ts,tenant,source,type,"user",host,ip,patient,detail,attack_id) '
-                  "VALUES(%(ts)s,%(tenant)s,%(source)s,%(type)s,%(user)s,%(host)s,%(ip)s,%(patient)s,%(detail)s,%(attack_id)s)", e)
+        for k in ("destination", "data_classification", "destination_approved", "src_zone", "dst_zone",
+                  "boundary_violation", "approved_change"):
+            e.setdefault(k, None)
+        c.execute('INSERT INTO events(ts,tenant,source,type,"user",host,ip,patient,detail,attack_id, '
+                  'destination,data_classification,destination_approved,src_zone,dst_zone,boundary_violation,approved_change) '
+                  "VALUES(%(ts)s,%(tenant)s,%(source)s,%(type)s,%(user)s,%(host)s,%(ip)s,%(patient)s,%(detail)s,%(attack_id)s, "
+                  "%(destination)s,%(data_classification)s,%(destination_approved)s,%(src_zone)s,%(dst_zone)s,%(boundary_violation)s,%(approved_change)s)", e)
         hit = detect.evaluate(c, e)
         if hit:
             i = raise_alert(c, e["tenant"], *hit[:3], hit[3], e["ts"], e["attack_id"])

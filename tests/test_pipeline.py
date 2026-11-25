@@ -81,11 +81,13 @@ def test_lab_endpoints_can_be_disabled():
 
 
 def test_old_database_gets_new_columns(scratch_db, monkeypatch):
-    # An alerts table from before the detail/resolution columns existed must be upgraded in place.
+    # Old event and alert tables must gain the pilot-rule fields in place.
     with psycopg.connect(scratch_db) as old:
         old.execute("""CREATE TABLE alerts(id BIGSERIAL PRIMARY KEY, created TEXT, event_ts TEXT, tenant TEXT, rule TEXT,
           severity TEXT, summary TEXT, dkey TEXT, owner TEXT, step TEXT, status TEXT DEFAULT 'new',
           ack_at TEXT, verdict TEXT, attack_id TEXT, source TEXT DEFAULT 'builtin')""")
+        old.execute('''CREATE TABLE events(id BIGSERIAL PRIMARY KEY, ts TEXT, tenant TEXT, source TEXT, type TEXT,
+          "user" TEXT, host TEXT, ip TEXT, patient TEXT, detail TEXT, attack_id TEXT)''')
     monkeypatch.setenv("DATABASE_URL", scratch_db)
     conn = soc.connect()
     try:
@@ -93,7 +95,15 @@ def test_old_database_gets_new_columns(scratch_db, monkeypatch):
             "SELECT column_name FROM information_schema.columns WHERE table_name='alerts'").fetchall()}
     finally:
         conn.close()
-    assert {"detail", "resolution"} <= cols
+    assert {"detail", "resolution", "rule_version"} <= cols
+    conn = soc.connect()
+    try:
+        event_cols = {r["column_name"] for r in conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name='events'").fetchall()}
+    finally:
+        conn.close()
+    assert {"destination", "data_classification", "destination_approved", "src_zone", "dst_zone",
+            "boundary_violation", "approved_change"} <= event_cols
 
 
 def test_api_token_gates_api_but_not_dashboard():

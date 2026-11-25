@@ -86,6 +86,14 @@ trend (test plan step 4) can be tracked.
 | `BULK_RECORD_ACCESS` | high | One user opens 15 or more patient records within 10 minutes |
 | `OFFHOURS_ACCESS` | low | Record access between 22:00 and 05:59 (intentionally noisy, for the FP-rate test) |
 | `SUSPICIOUS_PROCESS` | critical | A process command line contains `mimikatz`, `certutil -urlcache`, `nc -e`, or `vssadmin delete shadows`, or passes a base64 payload with `-e`, `-ec`, `-enc` or `-EncodedCommand` |
+| `HC-END-001` | critical | 50 distinct file paths are renamed, modified, or deleted on one host within 5 minutes |
+| `HC-END-004` | high | A normalized endpoint event reports security-agent or EDR tampering outside an approved change |
+| `HC-DLP-002` | high | A transfer marked `phi`, `patient_data`, or `sensitive` targets a destination explicitly marked unapproved |
+| `HC-OPS-002` | high | A backup repository is deleted, retention changes outside an approved change, or 3 jobs fail for one host within 24 hours |
+| `HC-MED-004` | high | A trusted network event marks a flow between clinical zones as a segmentation violation |
+| `HC-AUD-001` | high | A normalized event reports audit-log clearing, audit service stop, forwarding disablement, or audit configuration change |
+
+The six `HC-*` rules are a pilot implementation of the P1 items in the healthcare detection report. Their event contract, required fields, tuning risks, and validation approach are in [docs/DETECTION_RULES.md](docs/DETECTION_RULES.md). The file-activity and backup-failure thresholds are starting values only; the rules have not been validated against hospital baselines. They emit alerts and do not perform containment.
 
 ## Wazuh integration
 - Wazuh alerts arrive at `POST /api/ingest/wazuh?tenant=<hospital>`. Level 12+ is critical, 10+ high, 7+ medium.
