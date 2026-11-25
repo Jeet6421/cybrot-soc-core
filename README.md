@@ -1,4 +1,4 @@
-# Cybrot SOC Core (prototype, v0.6)
+# Cybrot SOC Core (prototype, v0.7)
 
 Core pipeline for the hospital/clinic SOC service: **logs in -> detection rules -> alert with severity ->
 triage queue with a named owner and response step -> metrics -> exit criteria**. Test data only - never real patient data.
@@ -25,11 +25,13 @@ This version follows the internal test plan in the prototype plan document: the 
 | `LAB_ENDPOINTS` | `1` | `0` disables `/api/demo`, `/api/autolabel`, `/api/reset` (they return 404) |
 | `SOC_API_TOKEN` | empty (no token) | If set, every `/api/` call needs `Authorization: Bearer <token>` |
 | `FP_TARGET` | not set | The false-positive ceiling the team agrees, as a fraction (e.g. `0.10`). Until set, the Review gate is `not_measured`. |
+| `PLAYBOOK_WEBHOOK` | empty (off) | v0.7: each new alert is POSTed as JSON to this URL, e.g. a Shuffle webhook. Sent after the database commit; a failed send is logged and never blocks ingest. |
+| `PLAYBOOK_TIMEOUT` | `3` | Seconds to wait for the playbook webhook |
 | `PORT` | `5000` | HTTP port when running `python app.py` |
 
 ## Tests
     pip install pytest
-    pytest -q tests              # 33 tests
+    pytest -q tests              # 39 tests
 
 ## Test plan tools (scripts/)
 These use only the Python standard library. Run them against an instance with no real data.
@@ -112,6 +114,14 @@ trend (test plan step 4) can be tracked.
 | `GET /api/exit-criteria` | The four roadmap gates, as `pass`, `fail` or `not_measured` |
 
 ## Changes
+**v0.7**
+- Playbook hook (roadmap phase 3, Response): with `PLAYBOOK_WEBHOOK` set, each new alert is POSTed as JSON
+  (`{"event": "alert.created", "alert": {...}}`) to that URL, so Shuffle or another SOAR tool can run a playbook.
+- Sends happen after the database commit, on a background thread, with a timeout. A duplicate alert is sent once.
+  Failures are logged without the URL and never fail ingest. The API token is never sent.
+- New settings `PLAYBOOK_WEBHOOK` and `PLAYBOOK_TIMEOUT`, passed through docker-compose.yml.
+- Tests: `tests/test_playbook.py` (6 tests), including a real HTTP round trip to a local receiver.
+
 **v0.6**
 - Simple case queue: `POST /api/alerts/<id>/handoff` passes an open alert to another analyst, and
   `GET /api/alerts/<id>/handoffs` shows the history (from, to, time, note). Closed alerts are refused (409).
@@ -156,6 +166,6 @@ trend (test plan step 4) can be tracked.
 - Per-user login and roles (hospital viewer/admin, Cybrot analyst)
 - Fluent Bit log shipping and Kafka buffer
 - Live Wazuh connection on the VM (agents, Kali attacker VM)
-- Shuffle playbooks
+- Shuffle playbooks (v0.7 sends alerts to a webhook; Shuffle itself is not set up yet)
 - MISP and Sigma rule conversion
 - Hospital-facing portal, PDF reports, plan-based feature gating
