@@ -102,11 +102,30 @@ trend (test plan step 4) can be tracked.
 
 ## Security (before any real data)
 - Set `LAB_ENDPOINTS=0`. The dashboard still shows the lab buttons, but they will return 404.
-- Set `SOC_API_TOKEN` to a long random value. The dashboard asks for the token once per browser tab.
-- Wazuh's built-in integration cannot send headers, so `/api/ingest/*` also accepts `?token=` in the URL.
+- Set `SOC_API_TOKEN` to a long random value. It is the operator token for every `/api/` call. The dashboard asks for it once per browser tab.
+- Each hospital gets its own **ingest key** (see Tenants below). A key can only send events and Wazuh alerts for its own hospital. It cannot read, change or write into another hospital.
+- Wazuh's built-in integration cannot send headers, so `/api/ingest/*` also accepts `?token=` in the URL. The same goes for an ingest key.
   That URL can end up in logs, so keep the webhook on a private network or behind a reverse proxy.
 - Serve the app over HTTPS behind a reverse proxy.
-- This is a shared secret, not user login. There are no per-user accounts or roles yet.
+- The operator token is still a shared secret, not user login. Per-user accounts, roles and MFA are Phase 2 of `docs/MULTITENANT.md`.
+- With `SOC_API_TOKEN` unset, the API is open. That is for the lab only.
+
+## Tenants and ingest keys (v1.1)
+Each hospital is a **tenant**. Tenant ids are 2 to 63 lowercase letters, digits or hyphens.
+
+| Step | Call (operator token) | Result |
+|---|---|---|
+| Create a hospital | `POST /api/tenants` with `{"id":"city-hospital","name":"City Hospital"}` | `201`. `409` if it exists |
+| Issue an ingest key | `POST /api/tenants/<id>/keys` with `{"label":"wazuh-ehr"}` | `201`, with the key in the reply. **Shown once.** Only its SHA-256 hash is stored |
+| List keys | `GET /api/tenants/<id>/keys` | Metadata only, never the key |
+| Revoke a key | `POST /api/keys/<key-id>/revoke` | Revoked keys get `401` |
+
+Events and Wazuh alerts sent with a key are stored under that key's hospital. The `tenant` in the body or the query is ignored for keys. A body that names another hospital gets `403`.
+
+## Hospital data scope (v1.1)
+- `GET /api/metrics?tenant=<id>` and `GET /api/exit-criteria?tenant=<id>` count one hospital's data. Without `tenant`, they count everything (operator view).
+- `GET /api/alerts?tenant=<id>` filters the queue as before.
+- Handoff history rows carry the hospital of their alert.
 
 ## API
 | Endpoint | Purpose |
@@ -123,6 +142,15 @@ trend (test plan step 4) can be tracked.
 | `GET /api/exit-criteria` | The four roadmap gates, as `pass`, `fail` or `not_measured` |
 
 ## Changes
+**v1.1 (tenants and ingest keys, Phase 1 of `docs/MULTITENANT.md`)**
+- New tables `tenants` (with a `default` lab tenant) and `ingest_keys` (hash only). Handoff history records the hospital.
+- Ingest keys: `/api/events` and `/api/ingest/wazuh` accept a key. The tenant comes from the key. A mismatched body tenant gets `403`.
+- Keys cannot call any other endpoint (`401`). Revoked and unknown keys get `401`.
+- Metrics and exit gates take `?tenant=`.
+- `/api/demo` stores events directly instead of calling the API through the test client. Before, it failed with `401` when `SOC_API_TOKEN` was set.
+- Tests: `tests/test_tenants.py` (14 tests): cross-hospital writes and reads refused, Wazuh tenant from the key, revocation, hashed keys, scoped metrics.
+- Still open in Phase 1: row-level security in PostgreSQL. It needs a separate database role for the app, so the policies apply. That is the next PR.
+
 **v1.0 (PostgreSQL)**
 - The database is PostgreSQL 16 (was SQLite). `DATABASE_URL` sets the connection; `docker compose` runs a `db` service with a named volume.
 - One connection per request, closed at the end of the request. The schema is created on the first connect to each database.
