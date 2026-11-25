@@ -10,6 +10,8 @@ services:
       LAB_ENDPOINTS: "${LAB_ENDPOINTS:-1}"   # set to 0 before any real data goes in
       SOC_API_TOKEN: "${SOC_API_TOKEN:-}"    # required on any shared deployment
       FP_TARGET: "${FP_TARGET:-}"            # agreed false-positive ceiling, e.g. 0.10; empty = not set
+      PLAYBOOK_WEBHOOK: "${PLAYBOOK_WEBHOOK:-}"    # v0.7: POST each new alert here (e.g. Shuffle); empty = off
+      PLAYBOOK_TIMEOUT: "${PLAYBOOK_TIMEOUT:-3}"   # seconds to wait for the playbook webhook
     volumes: ["soc-data:/data"]
 volumes:
   soc-data:

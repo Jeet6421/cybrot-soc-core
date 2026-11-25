@@ -1,5 +1,5 @@
 """Cybrot SOC Core - prototype: ingest -> detect -> triage queue (owner + response step) -> metrics -> exit criteria."""
-import hmac, os, sqlite3
+import hmac, json, os, sqlite3, sys, threading, urllib.request
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, send_from_directory
 import detect, generate
@@ -12,6 +12,8 @@ LAB_ENDPOINTS = os.environ.get("LAB_ENDPOINTS", "1") == "1"
 LAB_PATHS = {"/api/demo", "/api/autolabel", "/api/reset"}
 # If set, every /api/ call needs this token (Authorization: Bearer <token>). Required for any shared deployment.
 API_TOKEN = os.environ.get("SOC_API_TOKEN", "")
+# Playbook hook (v0.7): every new alert is POSTed as JSON to this URL, e.g. a Shuffle webhook. Empty = off.
+PLAYBOOK_TIMEOUT = float(os.environ.get("PLAYBOOK_TIMEOUT", "3"))
 app = Flask(__name__, static_folder="static")
 
 GATE_NAMES = {
@@ -76,6 +78,42 @@ def raise_alert(c, tenant, rule, sev, summary, key, event_ts, attack_id=None, so
     return cur.lastrowid
 
 
+def _playbook_url():
+    """Read at call time so the setting can change without reloading the module."""
+    return os.environ.get("PLAYBOOK_WEBHOOK", "").strip()
+
+
+def _alert_payload(row):
+    keys = ("id", "created", "tenant", "rule", "severity", "summary", "owner", "step", "detail", "attack_id", "source")
+    return {"event": "alert.created", "alert": {k: row[k] for k in keys}}
+
+
+def _send(url, payload, timeout=None):
+    """POST one alert to the playbook webhook. Returns True on a 2xx reply. Never raises; the URL is not logged."""
+    try:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout or PLAYBOOK_TIMEOUT) as r:
+            return 200 <= r.status < 300
+    except Exception as e:  # delivery problems must never break ingest
+        print(f"playbook webhook failed: {type(e).__name__}", file=sys.stderr, flush=True)
+        return False
+
+
+def _dispatch(url, payload):
+    threading.Thread(target=_send, args=(url, payload), daemon=True).start()
+
+
+def _notify_new(c, ids):
+    """Called after commit, so a rolled-back alert is never sent."""
+    url = _playbook_url()
+    if not url or not ids:
+        return
+    marks = ",".join("?" * len(ids))
+    for row in c.execute(f"SELECT * FROM alerts WHERE id IN ({marks}) ORDER BY id", ids).fetchall():
+        _dispatch(url, _alert_payload(row))
+
+
 @app.before_request
 def gate_api():
     """With SOC_API_TOKEN set, /api/ calls need the token. Wazuh's built-in integration cannot send
@@ -101,7 +139,7 @@ def ingest():
     body = request.get_json(force=True)
     evs = body if isinstance(body, list) else [body]
     c = db()
-    made = 0
+    made_ids = []
     for e in sorted(evs, key=lambda x: x["ts"]):
         e.setdefault("attack_id", None)
         for k in ("user", "host", "ip", "patient", "detail", "source"):
@@ -109,10 +147,13 @@ def ingest():
         c.execute("INSERT INTO events(ts,tenant,source,type,user,host,ip,patient,detail,attack_id) "
                   "VALUES(:ts,:tenant,:source,:type,:user,:host,:ip,:patient,:detail,:attack_id)", e)
         hit = detect.evaluate(c, e)
-        if hit and raise_alert(c, e["tenant"], *hit[:3], hit[3], e["ts"], e["attack_id"]):
-            made += 1
+        if hit:
+            i = raise_alert(c, e["tenant"], *hit[:3], hit[3], e["ts"], e["attack_id"])
+            if i:
+                made_ids.append(i)
     c.commit()
-    return jsonify(events=len(evs), alerts_created=made)
+    _notify_new(c, made_ids)
+    return jsonify(events=len(evs), alerts_created=len(made_ids))
 
 
 @app.post("/api/ingest/wazuh")
@@ -133,6 +174,7 @@ def ingest_wazuh():
                     key, a.get("timestamp", now())[:19], None, "wazuh",
                     detail=detail, step=detect.wazuh_step(rid, lvl))
     c.commit()
+    _notify_new(c, [i] if i else [])
     return jsonify(alert_id=i)
 
 
