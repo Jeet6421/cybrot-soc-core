@@ -1,5 +1,5 @@
 """Cybrot SOC Core - prototype: ingest -> detect -> triage queue (owner + response step) -> metrics -> exit criteria."""
-import hashlib, hmac, json, os, sys, threading, time, urllib.error, urllib.request
+import hashlib, hmac, json, os, re, secrets, sys, threading, time, urllib.error, urllib.request
 from datetime import datetime, timezone
 import psycopg
 from flask import Flask, g, request, jsonify, send_from_directory
@@ -12,10 +12,12 @@ ANALYSTS = os.environ.get("ANALYSTS", "analyst1,analyst2,analyst3").split(",")
 # environment where real logs or real analysts' work could be in the database.
 LAB_ENDPOINTS = os.environ.get("LAB_ENDPOINTS", "1") == "1"
 LAB_PATHS = {"/api/demo", "/api/autolabel", "/api/reset"}
-# If set, every /api/ call needs this token (Authorization: Bearer <token>). Required for any shared deployment.
+# Operator token for every /api/ call (Authorization: Bearer <token>). Required for any shared deployment.
+# Hospital ingest keys (below) can only send events; they cannot read or change anything.
 API_TOKEN = os.environ.get("SOC_API_TOKEN", "")
 # Playbook hook (v0.7): every new alert is POSTed as JSON to this URL, e.g. a Shuffle webhook. Empty = off.
 PLAYBOOK_TIMEOUT = float(os.environ.get("PLAYBOOK_TIMEOUT", "3"))
+TENANT_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
 app = Flask(__name__, static_folder="static")
 
 GATE_NAMES = {
@@ -37,7 +39,14 @@ ALTER TABLE alerts ADD COLUMN IF NOT EXISTS detail TEXT;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS resolution TEXT;
 CREATE TABLE IF NOT EXISTS handoffs(id BIGSERIAL PRIMARY KEY, alert_id BIGINT, at TEXT, from_owner TEXT,
   to_owner TEXT, note TEXT);
+ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS tenant TEXT;
 CREATE INDEX IF NOT EXISTS ho_idx ON handoffs(alert_id);
+CREATE TABLE IF NOT EXISTS tenants(id TEXT PRIMARY KEY, name TEXT NOT NULL,
+  created TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS'));
+INSERT INTO tenants(id, name) VALUES ('default', 'Default (lab)') ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS ingest_keys(id BIGSERIAL PRIMARY KEY, tenant TEXT NOT NULL REFERENCES tenants(id),
+  label TEXT NOT NULL DEFAULT '', key_hash TEXT NOT NULL UNIQUE,
+  created TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS'), revoked_at TEXT);
 """
 
 _schema_ready = set()  # database URLs whose schema has been checked in this process
@@ -175,15 +184,44 @@ def _notify_new(c, ids):
         _dispatch(url, _alert_payload(row))
 
 
-@app.before_request
-def gate_api():
-    """With SOC_API_TOKEN set, /api/ calls need the token. Wazuh's built-in integration cannot send
-    headers, so /api/ingest/* also accepts ?token=. A reverse proxy with real auth is the better option."""
-    if not API_TOKEN or not request.path.startswith("/api/"):
-        return None
+def _supplied_token():
     supplied = (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
     if not supplied and request.path.startswith("/api/ingest/"):
         supplied = request.args.get("token", "")
+    return supplied
+
+
+def _is_ingest_request():
+    return request.method == "POST" and (request.path == "/api/events" or request.path.startswith("/api/ingest/"))
+
+
+def _key_tenant(token):
+    """The hospital an active ingest key belongs to, or None. Only the SHA-256 hash of a key is stored."""
+    if not token:
+        return None
+    h = hashlib.sha256(token.encode()).hexdigest()
+    row = db().execute("SELECT tenant FROM ingest_keys WHERE key_hash=%s AND revoked_at IS NULL", (h,)).fetchone()
+    return row["tenant"] if row else None
+
+
+@app.before_request
+def gate_api():
+    """Who may call /api/:
+    - A hospital ingest key can only POST events or Wazuh alerts. Its tenant comes from the key, never from the request.
+    - Everything else needs SOC_API_TOKEN, when that is set.
+    - With SOC_API_TOKEN unset (lab only), the API is open.
+    Wazuh's built-in integration cannot send headers, so /api/ingest/* also accepts ?token=."""
+    g.tenant_lock = None
+    if not request.path.startswith("/api/"):
+        return None
+    supplied = _supplied_token()
+    if _is_ingest_request():
+        tenant = _key_tenant(supplied)
+        if tenant:
+            g.tenant_lock = tenant
+            return None
+    if not API_TOKEN:
+        return None
     if not hmac.compare_digest(supplied, API_TOKEN):
         return jsonify(error="unauthorized"), 401
     return None
@@ -195,11 +233,8 @@ def gate_lab_endpoints():
         return jsonify(error="lab endpoint disabled (LAB_ENDPOINTS=0)"), 404
 
 
-@app.post("/api/events")
-def ingest():
-    body = request.get_json(force=True)
-    evs = body if isinstance(body, list) else [body]
-    c = db()
+def _store_events(c, evs):
+    """Store events and run the detection rules. Returns the new alert ids. The caller commits."""
     made_ids = []
     for e in sorted(evs, key=lambda x: x["ts"]):
         e.setdefault("attack_id", None)
@@ -212,6 +247,22 @@ def ingest():
             i = raise_alert(c, e["tenant"], *hit[:3], hit[3], e["ts"], e["attack_id"])
             if i:
                 made_ids.append(i)
+    return made_ids
+
+
+@app.post("/api/events")
+def ingest():
+    body = request.get_json(force=True)
+    evs = body if isinstance(body, list) else [body]
+    lock = g.get("tenant_lock")
+    if lock:
+        # An ingest key is bound to one hospital. Events for any other hospital are refused, not moved.
+        if any(e.get("tenant") not in (None, "", lock) for e in evs):
+            return jsonify(error="event tenant does not match this ingest key"), 403
+        for e in evs:
+            e["tenant"] = lock
+    c = db()
+    made_ids = _store_events(c, evs)
     c.commit()
     _notify_new(c, made_ids)
     return jsonify(events=len(evs), alerts_created=len(made_ids))
@@ -226,7 +277,8 @@ def ingest_wazuh():
     lvl = int(rule.get("level", 3))
     sev = "critical" if lvl >= 12 else "high" if lvl >= 10 else "medium" if lvl >= 7 else "low"
     agent = (a.get("agent") or {}).get("name", "unknown")
-    tenant = request.args.get("tenant") or (a.get("agent") or {}).get("group", "default")
+    # A hospital ingest key decides the tenant. Without a key, the query or the agent group is used (operator only).
+    tenant = g.get("tenant_lock") or request.args.get("tenant") or (a.get("agent") or {}).get("group", "default")
     detail = detect.wazuh_detail(a)
     # Same rule on the same host but a different file/process is a different alert.
     key = f"{agent}|{detail}" if detail else agent
@@ -237,6 +289,60 @@ def ingest_wazuh():
     c.commit()
     _notify_new(c, [i] if i else [])
     return jsonify(alert_id=i)
+
+
+@app.get("/api/tenants")
+def list_tenants():
+    rows = db().execute("SELECT id, name, created FROM tenants ORDER BY id").fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/tenants")
+def create_tenant():
+    body = request.get_json(force=True) or {}
+    tid = (body.get("id") or "").strip()
+    if not TENANT_ID_RE.fullmatch(tid):
+        return jsonify(error="id must be 2 to 63 lowercase letters, digits or hyphens, starting with a letter or digit"), 400
+    name = (body.get("name") or tid).strip()[:120]
+    c = db()
+    if c.execute("SELECT 1 FROM tenants WHERE id=%s", (tid,)).fetchone():
+        return jsonify(error="tenant already exists"), 409
+    c.execute("INSERT INTO tenants(id, name) VALUES(%s, %s)", (tid, name))
+    c.commit()
+    return jsonify(id=tid, name=name), 201
+
+
+@app.get("/api/tenants/<tid>/keys")
+def list_keys(tid):
+    """Key metadata only. The key itself is shown once, when it is created."""
+    rows = db().execute("SELECT id, label, created, revoked_at FROM ingest_keys WHERE tenant=%s ORDER BY id", (tid,)).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/tenants/<tid>/keys")
+def create_key(tid):
+    c = db()
+    if not c.execute("SELECT 1 FROM tenants WHERE id=%s", (tid,)).fetchone():
+        return jsonify(error="tenant not found"), 404
+    body = request.get_json(force=True, silent=True) or {}
+    label = (body.get("label") or "").strip()[:80]
+    key = secrets.token_urlsafe(32)
+    cur = c.execute("INSERT INTO ingest_keys(tenant, label, key_hash) VALUES(%s, %s, %s) RETURNING id",
+                    (tid, label, hashlib.sha256(key.encode()).hexdigest()))
+    kid = cur.fetchone()["id"]
+    c.commit()
+    return jsonify(id=kid, tenant=tid, label=label, key=key,
+                   note="Store this key now. It is not shown again."), 201
+
+
+@app.post("/api/keys/<int:kid>/revoke")
+def revoke_key(kid):
+    c = db()
+    cur = c.execute("UPDATE ingest_keys SET revoked_at=COALESCE(revoked_at, %s) WHERE id=%s RETURNING id", (now(), kid))
+    if not cur.fetchone():
+        return jsonify(error="key not found"), 404
+    c.commit()
+    return jsonify(ok=True)
 
 
 @app.get("/api/alerts")
@@ -290,15 +396,15 @@ def handoff(i):
     if to not in ANALYSTS:
         return jsonify(error=f"to_owner must be one of: {', '.join(ANALYSTS)}"), 400
     c = db()
-    row = c.execute("SELECT owner, status FROM alerts WHERE id=%s", (i,)).fetchone()
+    row = c.execute("SELECT owner, status, tenant FROM alerts WHERE id=%s", (i,)).fetchone()
     if not row:
         return jsonify(error="alert not found"), 404
     if row["status"] == "closed":
         return jsonify(error="alert is closed"), 409
     if to == row["owner"]:
         return jsonify(error=f"alert is already owned by {to}"), 400
-    c.execute("INSERT INTO handoffs(alert_id,at,from_owner,to_owner,note) VALUES(%s,%s,%s,%s,%s)",
-              (i, now(), row["owner"], to, note))
+    c.execute("INSERT INTO handoffs(alert_id,at,from_owner,to_owner,note,tenant) VALUES(%s,%s,%s,%s,%s,%s)",
+              (i, now(), row["owner"], to, note, row["tenant"]))
     c.execute("UPDATE alerts SET owner=%s WHERE id=%s", (to, i))
     c.commit()
     return jsonify(ok=True, from_owner=row["owner"], to_owner=to)
@@ -310,24 +416,33 @@ def handoffs(i):
     return jsonify([dict(r) for r in rows])
 
 
-def _metrics():
+def _metrics(tenant=None):
+    """Counts for one hospital (tenant given) or for all of them (tenant None)."""
     c = db()
-    q = lambda s, a=(): c.execute(s, a).fetchone()[0]
-    tp, fp = q("SELECT COUNT(*) FROM alerts WHERE verdict='tp'"), q("SELECT COUNT(*) FROM alerts WHERE verdict='fp'")
-    planted = q("SELECT COUNT(DISTINCT attack_id) FROM events WHERE attack_id IS NOT NULL")
-    caught = q("SELECT COUNT(DISTINCT attack_id) FROM alerts WHERE attack_id IS NOT NULL")
-    mtta = q("SELECT CAST(AVG(EXTRACT(EPOCH FROM (CAST(ack_at AS timestamp) - CAST(created AS timestamp)))) "
-             "AS DOUBLE PRECISION) FROM alerts WHERE ack_at IS NOT NULL")
+    p = {"t": tenant}
+    scope = "(%(t)s::text IS NULL OR tenant = %(t)s)"  # NULL means no filter
+
+    def one(sql):
+        return c.execute(sql.format(s=scope), p).fetchone()[0]
+
+    tp = one("SELECT COUNT(*) FROM alerts WHERE verdict='tp' AND {s}")
+    fp = one("SELECT COUNT(*) FROM alerts WHERE verdict='fp' AND {s}")
+    planted = one("SELECT COUNT(DISTINCT attack_id) FROM events WHERE attack_id IS NOT NULL AND {s}")
+    caught = one("SELECT COUNT(DISTINCT attack_id) FROM alerts WHERE attack_id IS NOT NULL AND {s}")
+    mtta = one("SELECT CAST(AVG(EXTRACT(EPOCH FROM (CAST(ack_at AS timestamp) - CAST(created AS timestamp)))) "
+               "AS DOUBLE PRECISION) FROM alerts WHERE ack_at IS NOT NULL AND {s}")
     weekly = []
     for r in c.execute("SELECT to_char(CAST(created AS timestamp), 'IYYY-\"W\"IW') AS week, "
                        "COUNT(*) FILTER (WHERE verdict='tp') AS tp, COUNT(*) FILTER (WHERE verdict='fp') AS fp "
-                       "FROM alerts WHERE verdict IN ('tp','fp') GROUP BY week ORDER BY week"):
+                       "FROM alerts WHERE verdict IN ('tp','fp') AND " + scope + " GROUP BY week ORDER BY week", p):
         weekly.append({"week": r["week"], "tp": r["tp"], "fp": r["fp"],
                        "false_positive_rate": round(r["fp"] / (r["tp"] + r["fp"]), 3)})
-    return dict(events=q("SELECT COUNT(*) FROM events"), alerts=q("SELECT COUNT(*) FROM alerts"),
-                by_severity={r[0]: r[1] for r in c.execute("SELECT severity, COUNT(*) FROM alerts GROUP BY severity")},
-                unacknowledged=q("SELECT COUNT(*) FROM alerts WHERE status='new'"),
-                unlabeled=q("SELECT COUNT(*) FROM alerts WHERE verdict IS NULL"),
+    by_sev = {r[0]: r[1] for r in c.execute(
+        "SELECT severity, COUNT(*) FROM alerts WHERE " + scope + " GROUP BY severity", p)}
+    return dict(events=one("SELECT COUNT(*) FROM events WHERE {s}"), alerts=one("SELECT COUNT(*) FROM alerts WHERE {s}"),
+                by_severity=by_sev,
+                unacknowledged=one("SELECT COUNT(*) FROM alerts WHERE status='new' AND {s}"),
+                unlabeled=one("SELECT COUNT(*) FROM alerts WHERE verdict IS NULL AND {s}"),
                 labeled_alerts=tp + fp,
                 false_positive_rate=round(fp / (tp + fp), 3) if tp + fp else None,
                 false_positive_rate_by_week=weekly,
@@ -338,10 +453,10 @@ def _metrics():
 
 @app.get("/api/metrics")
 def metrics():
-    return jsonify(_metrics())
+    return jsonify(_metrics(request.args.get("tenant") or None))
 
 
-def _gate_results(m):
+def _gate_results(m, tenant=None):
     """Pass, fail, or not_measured for each roadmap gate in the prototype plan. not_measured means no data yet."""
     c = db()
     out = []
@@ -359,7 +474,8 @@ def _gate_results(m):
         gate("detection", "pass" if ok else "fail",
              f"{m['detected_attacks']} of {m['planted_attacks']} planted attacks detected")
 
-    missing = c.execute("SELECT COUNT(*) FROM alerts WHERE COALESCE(owner,'')='' OR COALESCE(step,'')=''").fetchone()[0]
+    missing = c.execute("SELECT COUNT(*) FROM alerts WHERE (COALESCE(owner,'')='' OR COALESCE(step,'')='') "
+                        "AND (%(t)s::text IS NULL OR tenant = %(t)s)", {"t": tenant}).fetchone()[0]
     if not m["alerts"]:
         gate("response", "not_measured", "no alerts yet")
     else:
@@ -380,15 +496,22 @@ def _gate_results(m):
 
 @app.get("/api/exit-criteria")
 def exit_criteria():
-    gates = _gate_results(_metrics())
+    tenant = request.args.get("tenant") or None
+    m = _metrics(tenant)
+    gates = _gate_results(m, tenant)
     return jsonify(gates=gates, all_pass=all(g["status"] == "pass" for g in gates), fp_target=_fp_target())
 
 
 @app.post("/api/demo")
 def demo():
     """Load synthetic logs + planted attacks (lab only)."""
-    r = app.test_client().post("/api/events", json=generate.generate())
-    return r.get_json()
+    generated = generate.generate()
+    evs = generated if isinstance(generated, list) else [generated]
+    c = db()
+    made_ids = _store_events(c, evs)
+    c.commit()
+    _notify_new(c, made_ids)
+    return jsonify(events=len(evs), alerts_created=len(made_ids))
 
 
 @app.post("/api/autolabel")
