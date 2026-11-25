@@ -34,6 +34,28 @@ def test_handoff_changes_owner_and_keeps_history():
     assert hist[0]["note"] == "check the host" and hist[0]["at"]
 
 
+def test_alert_list_shows_latest_handoff_and_note():
+    a = one_alert()
+    to = other_analyst(a["owner"])
+    c.post(f"/api/alerts/{a['id']}/handoff", json={"to_owner": to, "note": "check the host"})
+    row = next(x for x in c.get("/api/alerts").get_json() if x["id"] == a["id"])
+    assert row["last_handoff"] == f"{a['owner']} -> {to}: check the host"
+
+
+def test_alert_list_marks_handoff_without_note():
+    a = one_alert()
+    to = other_analyst(a["owner"])
+    c.post(f"/api/alerts/{a['id']}/handoff", json={"to_owner": to})
+    row = next(x for x in c.get("/api/alerts").get_json() if x["id"] == a["id"])
+    assert row["last_handoff"] == f"{a['owner']} -> {to}: no note"
+
+
+def test_alert_without_handoff_has_no_last_handoff():
+    a = one_alert()
+    row = next(x for x in c.get("/api/alerts").get_json() if x["id"] == a["id"])
+    assert row["last_handoff"] is None
+
+
 def test_handoff_refuses_unknown_owner():
     a = one_alert()
     r = c.post(f"/api/alerts/{a['id']}/handoff", json={"to_owner": "nobody"})

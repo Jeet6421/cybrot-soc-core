@@ -55,7 +55,7 @@ async function load(){
   const p=new URLSearchParams();if($("#tn").value)p.set("tenant",$("#tn").value);if($("#st").value)p.set("status",$("#st").value);
   const ar=await api("/api/alerts?"+p);if(!ar.ok)return;const a=await ar.json();
   $("#t").innerHTML=a.map(x=>`<tr><td>${x.id}</td><td class="sev ${x.severity}">${x.severity}</td><td>${esc(x.rule)}</td><td>${esc(x.tenant)}</td>
-   <td>${esc(x.summary)}${x.detail?`<br><small>${esc(x.detail)}</small>`:""}${x.resolution?`<br><small>Note: ${esc(x.resolution)}</small>`:""}</td><td>${esc(x.owner)}</td><td><small>${esc(x.step)}</small></td><td>${x.status}</td><td>${x.verdict||"-"}</td>
+   <td>${esc(x.summary)}${x.detail?`<br><small>${esc(x.detail)}</small>`:""}${x.resolution?`<br><small>Note: ${esc(x.resolution)}</small>`:""}${x.last_handoff?`<br><small>Handoff: ${esc(x.last_handoff)}</small>`:""}</td><td>${esc(x.owner)}</td><td><small>${esc(x.step)}</small></td><td>${x.status}</td><td>${x.verdict||"-"}</td>
    <td>${x.status=="new"?`<button onclick="act('/api/alerts/${x.id}/ack')">Ack</button> `:""}
    <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'tp'})">TP</button>
    <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'fp'})">FP</button>
