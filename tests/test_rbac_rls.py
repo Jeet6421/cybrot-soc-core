@@ -12,7 +12,7 @@ from psycopg import errors
 import manage
 from support import Api, CITY, ORTHO, failed_logins
 
-HOSPITAL_TABLES = ("events", "alerts", "handoffs")
+HOSPITAL_TABLES = ("events", "alerts", "handoffs", "response_approvals")
 ADMIN_TABLES = ("users", "ingest_keys", "log_sources")
 
 
@@ -50,6 +50,9 @@ def data(world):
         world.client.post("/api/events", json=failed_logins(tenant), headers=world.ingest(tenant))
     alert = Api(world, ORTHO, "viewer").get(f"/api/alerts?tenant={ORTHO}").get_json()[0]
     Api(world, ORTHO, "l1").post(f"/api/alerts/{alert['id']}/handoff", json={"to_owner": "analyst2"})
+    approval = Api(world, ORTHO, "l1").post(f"/api/alerts/{alert['id']}/response-approvals", json={
+        "action": "isolate_host", "target": "ehr-01", "reason": "Test RLS visibility"})
+    assert approval.status_code == 201
     return True
 
 
@@ -86,13 +89,20 @@ def test_unset_context_sees_no_rows(runtime, data):
         assert runtime.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0, table
 
 
-def test_unset_context_cannot_write(runtime, data):
+def test_unset_context_cannot_write(runtime, data, world):
     with pytest.raises(errors.InsufficientPrivilege):
         with runtime.transaction():
             runtime.execute("INSERT INTO events(ts, tenant, type) VALUES ('2026-11-25T10:00:00', %s, 'x')", (CITY,))
     with pytest.raises(errors.InsufficientPrivilege):
         with runtime.transaction():
             runtime.execute("INSERT INTO alerts(tenant, rule) VALUES (%s, 'R')", (CITY,))
+    alert_id = Api(world, CITY, "viewer").get("/api/alerts").get_json()[0]["id"]
+    requester = actor_id(world, CITY, "analyst-l1")
+    with pytest.raises(errors.InsufficientPrivilege):
+        with runtime.transaction():
+            runtime.execute("INSERT INTO response_approvals(tenant, alert_id, action, target, reason, requested_by) "
+                            "VALUES (%s, %s, 'isolate_host', 'ehr-01', 'no context', %s)",
+                            (CITY, alert_id, requester))
     assert runtime.execute("UPDATE alerts SET status = 'closed'").rowcount == 0
 
 
@@ -103,7 +113,7 @@ def test_empty_context_is_the_same_as_unset(runtime, data):
 
 # ---- Hospital A's roles, looking at hospital B -----------------------------------------------------
 
-@pytest.mark.parametrize("role", ["hospital_admin", "l1", "viewer"])
+@pytest.mark.parametrize("role", ["hospital_admin", "l1", "l2", "viewer"])
 def test_hospital_role_sees_none_of_another_hospitals_rows(runtime, data, role):
     as_identity(runtime, CITY, role, 1)
     for table in HOSPITAL_TABLES:
@@ -176,6 +186,20 @@ def test_ingest_role_writes_its_own_hospital_only(runtime, data):
             runtime.execute("INSERT INTO events(ts, tenant, type) VALUES ('2026-11-25T10:00:00', %s, 'auth_fail')", (ORTHO,))
 
 
+def test_l2_cannot_approve_own_response_request_inside_postgres(runtime, world, data):
+    requester = actor_id(world, CITY, "analyst-l2")
+    alert_id = Api(world, CITY, "viewer").get("/api/alerts").get_json()[0]["id"]
+    as_identity(runtime, CITY, "l2", requester)
+    approval_id = runtime.execute(
+        "INSERT INTO response_approvals(tenant, alert_id, action, target, reason, requested_by) "
+        "VALUES (%s, %s, 'block_ip', '203.0.113.77', 'test self approval policy', %s) RETURNING id",
+        (CITY, alert_id, requester)).fetchone()[0]
+    changed = runtime.execute(
+        "UPDATE response_approvals SET status='approved', approved_by=%s, decided_at=now() WHERE id=%s",
+        (requester, approval_id)).rowcount
+    assert changed == 0
+
+
 def test_ingest_role_cannot_read_users_credentials_or_change_history(runtime, data):
     as_identity(runtime, CITY, "ingest", None)
     assert runtime.execute("SELECT count(*) FROM users").fetchone()[0] == 0
@@ -215,6 +239,7 @@ def test_break_glass_lets_the_vendor_read_one_hospital_and_only_while_valid(runt
         assert count(runtime, "events", CITY) >= 1
         assert runtime.execute("UPDATE alerts SET status = 'closed'").rowcount == 0  # read-only
         assert runtime.execute("SELECT count(*) FROM ingest_keys").fetchone()[0] == 0  # never credentials
+        assert runtime.execute("SELECT count(*) FROM response_approvals").fetchone()[0] == 0
         as_identity(runtime, ORTHO, "vendor_admin", vendor)
         assert count(runtime, "alerts", ORTHO) == 0  # the grant is for City only
     finally:
@@ -277,3 +302,4 @@ def test_lookups_work_before_any_identity_is_set(runtime, world, data):
     assert runtime.execute("SELECT count(*) FROM auth_ingest_key(%s)", ("not-a-key-hash",)).fetchone()[0] == 0
     row = runtime.execute("SELECT count(*) FROM auth_user_for_login(%s, %s)", (CITY, "admin")).fetchone()[0]
     assert row == 1
+
