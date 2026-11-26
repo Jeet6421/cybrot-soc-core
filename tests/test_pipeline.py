@@ -65,12 +65,12 @@ def test_wazuh_webhook_lands_in_queue():
     assert a["severity"] == "high" and a["source"] == "wazuh" and a["owner"]
 
 
-def test_real_wazuh_alert_has_detail_and_specific_step():
+def test_real_wazuh_alert_omits_raw_detail_but_keeps_specific_step():
     c.post("/api/reset")
     aid = c.post("/api/ingest/wazuh", json=wazuh_sample()).get_json()["alert_id"]
     a = next(x for x in c.get("/api/alerts").get_json() if x["id"] == aid)
     assert a["rule"] == "WAZUH:92213" and a["severity"] == "critical"
-    assert "__PSScriptPolicyTest_" in a["detail"]
+    assert "detail" not in a
     assert "PSScriptPolicyTest" in a["step"] and a["owner"]
 
 

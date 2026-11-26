@@ -185,4 +185,3 @@ def _log_source_id(world, tenant, name):
     """The owner looks the id up directly; the API tests above do not depend on this helper's result."""
     with psycopg.connect(world.owner_url) as owner:
         return owner.execute("SELECT id FROM log_sources WHERE tenant=%s AND name=%s", (tenant, name)).fetchone()[0]
-

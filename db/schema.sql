@@ -25,11 +25,32 @@ CREATE TABLE IF NOT EXISTS log_sources(id BIGSERIAL PRIMARY KEY, tenant TEXT NOT
 
 CREATE TABLE IF NOT EXISTS users(id BIGSERIAL PRIMARY KEY, tenant TEXT NOT NULL REFERENCES tenants(id),
   username TEXT NOT NULL,
+  email TEXT NOT NULL,
   role TEXT NOT NULL CHECK (role IN ('hospital_admin', 'l1', 'l2', 'viewer', 'vendor_admin')),
+  account_type TEXT NOT NULL DEFAULT 'hospital_staff'
+    CHECK (account_type IN ('hospital_staff', 'vendor_support', 'external_auditor', 'service_principal')),
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  token_version INTEGER NOT NULL DEFAULT 0 CHECK (token_version >= 0),
   password_hash TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled')),
   created TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS'),
   UNIQUE (tenant, username));
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS account_type TEXT NOT NULL DEFAULT 'hospital_staff';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ALTER COLUMN tenant DROP NOT NULL;
+UPDATE users SET email = 'legacy+' || id::text || '@invalid.local' WHERE email IS NULL;
+UPDATE users SET account_type = CASE WHEN role = 'vendor_admin' THEN 'vendor_support' ELSE 'hospital_staff' END;
+UPDATE users SET is_active = (status = 'active');
+UPDATE users SET tenant = NULL WHERE role = 'vendor_admin';
+ALTER TABLE users ALTER COLUMN email SET NOT NULL;
+ALTER TABLE users DROP CONSTRAINT IF EXISTS users_account_classification_check;
+ALTER TABLE users ADD CONSTRAINT users_account_classification_check CHECK (
+  (role = 'vendor_admin' AND account_type = 'vendor_support' AND tenant IS NULL)
+  OR (role IN ('hospital_admin', 'l1', 'l2', 'viewer')
+      AND account_type IN ('hospital_staff', 'external_auditor', 'service_principal') AND tenant IS NOT NULL));
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_uidx ON users(lower(email));
 
 -- Ingest keys are the "credentials" of the design doc. Each key is bound to one log source.
 CREATE TABLE IF NOT EXISTS ingest_keys(id BIGSERIAL PRIMARY KEY, tenant TEXT NOT NULL REFERENCES tenants(id),
@@ -39,7 +60,12 @@ ALTER TABLE ingest_keys ADD COLUMN IF NOT EXISTS log_source_id BIGINT REFERENCES
 
 CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,
   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_version INTEGER NOT NULL,
   created TIMESTAMPTZ NOT NULL DEFAULT now(), expires_at TIMESTAMPTZ NOT NULL);
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS token_version INTEGER;
+UPDATE sessions s SET token_version = u.token_version FROM users u
+  WHERE s.user_id = u.id AND s.token_version IS NULL;
+ALTER TABLE sessions ALTER COLUMN token_version SET NOT NULL;
 
 CREATE TABLE IF NOT EXISTS audit_log(id BIGSERIAL PRIMARY KEY, at TIMESTAMPTZ NOT NULL DEFAULT now(),
   tenant TEXT NOT NULL, actor_id BIGINT, action TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '');
@@ -128,18 +154,26 @@ $$;
 -- Lookups that must run before any tenant is known (login, session check, ingest key check).
 -- They return one narrow row and run as the owner, so they are the only reads that cross tenants.
 CREATE OR REPLACE FUNCTION auth_user_for_login(p_tenant text, p_username text)
-  RETURNS TABLE(user_id bigint, user_tenant text, user_role text, user_password_hash text, user_status text)
+  RETURNS TABLE(user_id bigint, user_tenant text, user_role text, user_account_type text,
+                user_password_hash text, user_status text, user_is_active boolean, user_token_version integer)
   LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
-  SELECT u.id, u.tenant, u.role, u.password_hash, u.status
-  FROM users u WHERE u.tenant = p_tenant AND u.username = p_username
+  SELECT u.id, u.tenant, u.role, u.account_type, u.password_hash, u.status, u.is_active, u.token_version
+  FROM users u
+  WHERE u.username = p_username AND (
+    (u.tenant = p_tenant AND u.role <> 'vendor_admin')
+    OR (p_tenant = 'platform' AND u.role = 'vendor_admin' AND u.tenant IS NULL))
 $$;
 
 CREATE OR REPLACE FUNCTION auth_session(p_token_hash text)
-  RETURNS TABLE(user_id bigint, user_tenant text, user_role text, user_name text, user_status text)
+  RETURNS TABLE(user_id bigint, user_tenant text, user_role text, user_name text, user_status text,
+                user_account_type text, user_is_active boolean, session_token_version integer,
+                user_token_version integer)
   LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
-  SELECT u.id, u.tenant, u.role, u.username, u.status
+  SELECT u.id, u.tenant, u.role, u.username, u.status, u.account_type, u.is_active,
+         s.token_version, u.token_version
   FROM sessions s JOIN users u ON u.id = s.user_id
   WHERE s.token_hash = p_token_hash AND s.expires_at > now()
+    AND s.token_version = u.token_version AND u.is_active
 $$;
 
 CREATE OR REPLACE FUNCTION auth_ingest_key(p_key_hash text)
@@ -299,4 +333,3 @@ GRANT SELECT ON break_glass_grants TO soc_app;
 GRANT SELECT, INSERT ON response_approvals TO soc_app;
 GRANT UPDATE (status, approved_by, decided_at, decision_note) ON response_approvals TO soc_app;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO soc_app;
-

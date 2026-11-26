@@ -36,15 +36,15 @@ def test_handoff_changes_owner_and_keeps_history():
     hist = c.get(f"/api/alerts/{a['id']}/handoffs").get_json()
     assert len(hist) == 1
     assert hist[0]["from_owner"] == a["owner"] and hist[0]["to_owner"] == to
-    assert hist[0]["note"] == "check the host" and hist[0]["at"]
+    assert "note" not in hist[0] and hist[0]["at"]
 
 
-def test_alert_list_shows_latest_handoff_and_note():
+def test_alert_list_shows_latest_handoff_without_free_form_note():
     a = one_alert()
     to = other_analyst(a["owner"])
     c.post(f"/api/alerts/{a['id']}/handoff", json={"to_owner": to, "note": "check the host"})
     row = next(x for x in c.get("/api/alerts").get_json() if x["id"] == a["id"])
-    assert row["last_handoff"] == f"{a['owner']} -> {to}: check the host"
+    assert row["last_handoff"] == f"{a['owner']} -> {to}"
 
 
 def test_alert_list_marks_handoff_without_note():
@@ -52,7 +52,7 @@ def test_alert_list_marks_handoff_without_note():
     to = other_analyst(a["owner"])
     c.post(f"/api/alerts/{a['id']}/handoff", json={"to_owner": to})
     row = next(x for x in c.get("/api/alerts").get_json() if x["id"] == a["id"])
-    assert row["last_handoff"] == f"{a['owner']} -> {to}: no note"
+    assert row["last_handoff"] == f"{a['owner']} -> {to}"
 
 
 def test_alert_without_handoff_has_no_last_handoff():
@@ -86,19 +86,19 @@ def test_closed_alert_cannot_be_handed_off():
     assert r.status_code == 409
 
 
-def test_verdict_note_is_kept_with_the_alert():
+def test_verdict_note_is_not_exposed_in_alert_telemetry():
     a = one_alert()
     c.post(f"/api/alerts/{a['id']}/verdict", json={"verdict": "fp", "note": "PowerShell policy test file"})
     after = next(x for x in c.get("/api/alerts").get_json() if x["id"] == a["id"])
-    assert after["verdict"] == "fp" and after["resolution"] == "PowerShell policy test file"
+    assert after["verdict"] == "fp" and "resolution" not in after
 
 
-def test_verdict_without_note_keeps_earlier_note():
+def test_repeated_verdict_does_not_expose_resolution_note():
     a = one_alert()
     c.post(f"/api/alerts/{a['id']}/verdict", json={"verdict": "tp", "note": "confirmed"})
     c.post(f"/api/alerts/{a['id']}/verdict", json={"verdict": "tp"})
     after = next(x for x in c.get("/api/alerts").get_json() if x["id"] == a["id"])
-    assert after["resolution"] == "confirmed"
+    assert after["status"] == "closed" and "resolution" not in after
 
 
 def test_analysts_endpoint_lists_owners():

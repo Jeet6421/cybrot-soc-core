@@ -302,4 +302,3 @@ def test_lookups_work_before_any_identity_is_set(runtime, world, data):
     assert runtime.execute("SELECT count(*) FROM auth_ingest_key(%s)", ("not-a-key-hash",)).fetchone()[0] == 0
     row = runtime.execute("SELECT count(*) FROM auth_user_for_login(%s, %s)", (CITY, "admin")).fetchone()[0]
     assert row == 1
-

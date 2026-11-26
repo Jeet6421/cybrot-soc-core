@@ -9,7 +9,7 @@ Usage (the hospital's ingest key sends events; a session of a hospital user read
 
 Get a session with POST /api/login {"tenant", "username", "password"}; the token in the reply is the session.
 
-Exit code 0 when every simulation passes, 1 otherwise. Standard library only.
+API reads omit simulation IDs and raw auth payload. Exit code 0 when every simulation passes, 1 otherwise. Standard library only.
 """
 import argparse, json, os, secrets, sys, urllib.request
 from datetime import datetime, timedelta, timezone
@@ -64,17 +64,17 @@ def run(post, get, now=None):
     tag = secrets.token_hex(2)
     results = []
     for name, rule, aid, events in scenarios(now, tag):
-        post("/api/events", events)
+        receipt = post("/api/events", events)
         alerts = get(f"/api/alerts?tenant={TENANT}")
-        hit = any(a["id"] > before and a["rule"] == rule and a.get("attack_id") == aid for a in alerts)
+        hit = receipt.get("alerts_created", 0) > 0 and any(
+            a["id"] > before and a["rule"] == rule for a in alerts)
         results.append({"scenario": name, "expected": rule, "passed": hit})
 
     # Negative control: a single failed login must not raise an alert.
-    post("/api/events", [{"ts": _base(now).strftime(FMT), "tenant": TENANT, "source": "sim",
-                          "type": "auth_fail", "user": "admin", "ip": NEGATIVE_IP, "host": "vpn-01"}])
-    alerts = get(f"/api/alerts?tenant={TENANT}")
-    noisy = any(a["id"] > before and NEGATIVE_IP in (a.get("summary") or "") for a in alerts)
-    results.append({"scenario": "Single failed login stays quiet", "expected": None, "passed": not noisy})
+    quiet_receipt = post("/api/events", [{"ts": _base(now).strftime(FMT), "tenant": TENANT, "source": "sim",
+                                         "type": "auth_fail", "user": "admin", "ip": NEGATIVE_IP, "host": "vpn-01"}])
+    results.append({"scenario": "Single failed login stays quiet", "expected": None,
+                    "passed": quiet_receipt.get("alerts_created", 0) == 0})
     return results
 
 

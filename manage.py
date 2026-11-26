@@ -2,7 +2,7 @@
 
 Typical first setup (inside the compose network; see README):
 
-    docker compose run --rm migrate python manage.py create-user platform vendor vendor_admin
+    docker compose run --rm migrate python manage.py create-user platform vendor vendor_admin --email vendor@example.com
     docker compose run --rm migrate python manage.py create-tenant city-hospital "City Hospital"
     docker compose run --rm migrate python manage.py create-user city-hospital admin hospital_admin
     docker compose run --rm migrate python manage.py create-log-source city-hospital ehr-feed --kind wazuh
@@ -30,22 +30,32 @@ def create_tenant(conn, tid, name):
     conn.execute("INSERT INTO tenants(id, name) VALUES (%s, %s)", (tid, (name or tid).strip()[:120]))
 
 
-def create_user(conn, tenant, username, role, password):
+def create_user(conn, tenant, username, role, password, email):
     if role not in auth.ROLES:
         raise ValueError(f"role must be one of: {', '.join(auth.ROLES)}")
     if (role == "vendor_admin") != (tenant == auth.PLATFORM_TENANT):
         raise ValueError("vendor_admin belongs to the 'platform' tenant; hospital roles belong to a hospital")
     if not auth.USERNAME_RE.fullmatch(username or ""):
         raise ValueError("username must be 3 to 40 lowercase letters, digits, dots, hyphens or underscores")
+    email = (email or "").strip().lower()
+    problem = auth.email_problem(email)
+    if problem:
+        raise ValueError(problem)
     problem = auth.password_problem(password)
     if problem:
         raise ValueError(problem)
     if not conn.execute("SELECT 1 FROM tenants WHERE id = %s", (tenant,)).fetchone():
         raise ValueError("tenant not found")
-    if conn.execute("SELECT 1 FROM users WHERE tenant = %s AND username = %s", (tenant, username)).fetchone():
+    if conn.execute("SELECT 1 FROM users WHERE lower(email) = %s", (email,)).fetchone():
+        raise ValueError("email already belongs to an account")
+    tenant_id = None if role == "vendor_admin" else tenant
+    account_type = "vendor_support" if role == "vendor_admin" else "hospital_staff"
+    if conn.execute("SELECT 1 FROM users WHERE tenant IS NOT DISTINCT FROM %s AND username = %s",
+                    (tenant_id, username)).fetchone():
         raise ValueError("user already exists in this tenant")
-    row = conn.execute("INSERT INTO users(tenant, username, role, password_hash) VALUES (%s, %s, %s, %s) RETURNING id",
-                       (tenant, username, role, auth.hash_password(password))).fetchone()
+    row = conn.execute("INSERT INTO users(tenant, username, email, role, account_type, password_hash) "
+                       "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                       (tenant_id, username, email, role, account_type, auth.hash_password(password))).fetchone()
     return row[0]
 
 
@@ -78,8 +88,8 @@ def grant_break_glass(conn, vendor_username, tenant, hours, reason, granted_by):
         raise ValueError("break-glass grants last between 1 minute and 24 hours")
     if not (reason or "").strip():
         raise ValueError("a break-glass grant needs a reason, such as a ticket number")
-    row = conn.execute("SELECT id FROM users WHERE tenant = %s AND username = %s AND role = 'vendor_admin'",
-                       (auth.PLATFORM_TENANT, vendor_username)).fetchone()
+    row = conn.execute("SELECT id FROM users WHERE tenant IS NULL AND username = %s AND role = 'vendor_admin'",
+                       (vendor_username,)).fetchone()
     if not row:
         raise ValueError("vendor admin not found")
     if not conn.execute("SELECT 1 FROM tenants WHERE id = %s", (tenant,)).fetchone():
@@ -103,6 +113,7 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("create-tenant"); p.add_argument("id"); p.add_argument("name", nargs="?", default="")
     p = sub.add_parser("create-user"); p.add_argument("tenant"); p.add_argument("username"); p.add_argument("role")
+    p.add_argument("--email", required=True)
     p = sub.add_parser("create-log-source"); p.add_argument("tenant"); p.add_argument("name")
     p.add_argument("--kind", default="")
     p = sub.add_parser("create-ingest-key"); p.add_argument("tenant"); p.add_argument("log_source")
@@ -120,7 +131,7 @@ def main(argv=None):
                 password = getpass.getpass(f"password for {args.username} (12+ characters): ")
                 if getpass.getpass("repeat password: ") != password:
                     raise ValueError("passwords do not match")
-                uid = create_user(conn, args.tenant, args.username, args.role, password)
+                uid = create_user(conn, args.tenant, args.username, args.role, password, args.email)
                 print(f"user {args.username} ({args.role}) created with id {uid}")
             elif args.cmd == "create-log-source":
                 sid = create_log_source(conn, args.tenant, args.name, args.kind)

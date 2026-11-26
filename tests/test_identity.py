@@ -6,6 +6,7 @@ import uuid
 
 import psycopg
 import pytest
+import app as soc
 
 import manage
 from support import Api, CITY, ORTHO, PASSWORD, failed_logins
@@ -29,7 +30,8 @@ def new_alert(world, tenant):
 
 def new_user(world, tenant, role, admin_role="hospital_admin"):
     username = f"u-{uuid.uuid4().hex[:8]}"
-    r = Api(world, tenant, admin_role).post("/api/users", json={"username": username, "role": role, "password": PASSWORD})
+    r = Api(world, tenant, admin_role).post("/api/users", json={"username": username, "email": f"{username}@example.test",
+                                                                 "role": role, "password": PASSWORD})
     assert r.status_code == 201, r.get_json()
     return username, r.get_json()["id"]
 
@@ -71,6 +73,95 @@ def test_disabled_user_loses_access_at_once(world):
     assert Api(world, CITY).post(f"/api/users/{uid}/disable").status_code == 200
     assert world.client.get("/api/metrics", headers=headers).status_code == 401
     assert login(world, CITY, username).status_code == 401
+    row = owner_rows(world, "SELECT is_active, status, token_version FROM users WHERE id=%s", (uid,))[0]
+    assert row == (False, "disabled", 1)
+
+
+def test_role_change_advances_token_version_and_invalidates_sessions(world):
+    username, uid = new_user(world, CITY, "l1")
+    token = login(world, CITY, username).get_json()["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    changed = Api(world, CITY).patch(f"/api/users/{uid}", json={"role": "viewer"})
+    assert changed.status_code == 200 and changed.get_json()["token_version_advanced"] is True
+    assert world.client.get("/api/me", headers=headers).status_code == 401
+    assert login(world, CITY, username).get_json()["role"] == "viewer"
+    assert owner_rows(world, "SELECT token_version FROM users WHERE id=%s", (uid,))[0][0] == 1
+
+
+def test_stale_token_version_is_rejected(world):
+    username, uid = new_user(world, CITY, "viewer")
+    token = login(world, CITY, username).get_json()["token"]
+    with psycopg.connect(world.owner_url) as owner:
+        owner.execute("UPDATE users SET token_version=token_version+1 WHERE id=%s", (uid,))
+    assert world.client.get("/api/me", headers={"Authorization": f"Bearer {token}"}).status_code == 401
+
+
+def test_account_classification_is_tenant_separated(world):
+    staff = owner_rows(world, "SELECT account_type, is_active, tenant FROM users WHERE tenant=%s AND username='admin'",
+                       (CITY,))[0]
+    vendor = owner_rows(world, "SELECT account_type, is_active, tenant FROM users WHERE role='vendor_admin'")[0]
+    assert staff == ("hospital_staff", True, CITY)
+    assert vendor == ("vendor_support", True, None)
+
+
+ROLE_MATRIX = [
+    ("GET", "/api/me", {"hospital_admin", "l1", "l2", "viewer", "vendor_admin"}),
+    ("GET", "/api/events", {"hospital_admin", "l1", "l2", "vendor_admin"}),
+    ("GET", "/api/alerts", {"hospital_admin", "l1", "l2", "viewer", "vendor_admin"}),
+    ("GET", "/api/credentials", {"hospital_admin"}),
+    ("GET", "/api/users", {"hospital_admin"}),
+    ("GET", "/api/settings", {"hospital_admin"}),
+    ("POST", "/api/alerts/<int:i>/ack", {"hospital_admin", "l1", "l2"}),
+    ("POST", "/api/alerts/<int:i>/verdict", {"hospital_admin", "l2"}),
+    ("POST", "/api/alerts/<int:i>/handoff", {"hospital_admin", "l1", "l2"}),
+    ("GET", "/api/alerts/<int:i>/handoffs", {"hospital_admin", "l1", "l2", "viewer", "vendor_admin"}),
+    ("POST", "/api/alerts/<int:i>/response-approvals", {"hospital_admin", "l1", "l2"}),
+    ("POST", "/api/response-approvals/<int:approval_id>/decision", {"hospital_admin", "l2"}),
+    ("GET", "/api/tenants", {"vendor_admin"}),
+]
+
+
+@pytest.mark.parametrize("role", ["hospital_admin", "l1", "l2", "viewer", "vendor_admin"])
+@pytest.mark.parametrize("method,route,allowed", ROLE_MATRIX)
+def test_deny_by_default_role_matrix(method, route, allowed, role):
+    identity = {"kind": "session", "role": role}
+    assert soc.endpoint_allows(method, route, identity) is (role in allowed)
+
+
+def test_unlisted_route_is_denied_by_default(world):
+    assert Api(world, CITY, "hospital_admin").get("/api/not-registered").status_code == 403
+
+
+def test_vendor_admin_is_denied_hospital_payload_without_break_glass(world):
+    alert_id = new_alert(world, CITY)
+    vendor = Api(world, "platform", "vendor_admin")
+    assert vendor.get(f"/api/events?tenant_id={CITY}").status_code == 403
+    assert vendor.get(f"/api/alerts?tenant_id={CITY}").status_code == 403
+    assert vendor.get("/api/credentials").status_code == 403
+    assert vendor.get(f"/api/alerts/{alert_id}/handoffs?tenant_id={CITY}").status_code == 403
+
+
+def test_telemetry_responses_omit_raw_identity_and_payload_fields(world):
+    Api(world, CITY).post("/api/events", json=[{
+        "ts": "2026-11-26T10:00:00", "tenant": CITY, "source": "auth", "type": "auth_fail",
+        "user": "patient-name", "ip": "203.0.113.77", "patient": "patient-name",
+        "detail": "password=do-not-return token=do-not-return", "attack_id": "test-only"}])
+    events = Api(world, CITY, "l1").get("/api/events").get_json()["events"]
+    assert events
+    for key in ("user", "ip", "patient", "detail", "attack_id"):
+        assert key not in events[0]
+    assert "do-not-return" not in str(events)
+    assert "203.0.113.77" not in str(events)
+    alert_id = new_alert(world, CITY)
+    with psycopg.connect(world.owner_url) as owner:
+        owner.execute("UPDATE alerts SET detail=%s, resolution=%s WHERE id=%s",
+                      ("password=hidden patient=person", "patient=person", alert_id))
+    alerts = Api(world, CITY, "viewer").get("/api/alerts").get_json()
+    alert = next(item for item in alerts if item["id"] == alert_id)
+    for key in ("detail", "resolution", "dkey", "attack_id"):
+        assert key not in alert
+    assert "patient=person" not in str(alert)
+    assert "203.0.113." not in str(alert)
 
 
 # ---- Scope: tenant_id can only narrow -------------------------------------------------------------
@@ -183,10 +274,23 @@ def test_hospital_admin_manages_their_own_users(world):
     assert {"admin", "analyst-l1", "viewer"} <= names
     username, uid = new_user(world, CITY, "l1")
     assert login(world, CITY, username).status_code == 200
-    assert admin.post("/api/users", json={"username": "vendor-like", "role": "vendor_admin", "password": PASSWORD}).status_code == 400
-    assert admin.post("/api/users", json={"username": "shortpw", "role": "l1", "password": "short"}).status_code == 400
-    assert admin.post("/api/users", json={"username": username, "role": "l1", "password": PASSWORD}).status_code == 409
+    assert admin.post("/api/users", json={"username": "vendor-like", "email": "vendor-like@example.test",
+                                           "role": "vendor_admin", "password": PASSWORD}).status_code == 400
+    assert admin.post("/api/users", json={"username": "shortpw", "email": "shortpw@example.test",
+                                           "role": "l1", "password": "short"}).status_code == 400
+    assert admin.post("/api/users", json={"username": username, "email": f"{username}@example.test",
+                                           "role": "l1", "password": PASSWORD}).status_code == 409
     assert admin.post("/api/users/%d/disable" % _own_id(world, CITY, "admin")).status_code == 400
+
+
+def test_email_identity_is_unique_across_hospitals(world):
+    email = f"shared-{uuid.uuid4().hex[:8]}@example.test"
+    first = Api(world, CITY).post("/api/users", json={"username": "unique-one", "email": email,
+                                                        "role": "l1", "password": PASSWORD})
+    second = Api(world, ORTHO).post("/api/users", json={"username": "unique-two", "email": email,
+                                                         "role": "l1", "password": PASSWORD})
+    assert first.status_code == 201
+    assert second.status_code == 409
 
 
 def _own_id(world, tenant, username):
@@ -223,7 +327,8 @@ def test_vendor_admin_has_no_routine_access_to_hospital_data(world):
     assert vendor.get("/api/alerts").status_code == 403  # no hospital named
     assert vendor.get(f"/api/alerts?tenant_id={CITY}").status_code == 403  # named, but no grant
     assert vendor.get(f"/api/metrics?tenant_id={CITY}").status_code == 403
-    assert vendor.post("/api/users", json={"username": "x-user", "role": "l1", "password": PASSWORD}).status_code == 403
+    assert vendor.post("/api/users", json={"username": "x-user", "email": "x-user@example.test",
+                                            "role": "l1", "password": PASSWORD}).status_code == 403
     assert vendor.get("/api/credentials").status_code == 403
 
 
@@ -272,4 +377,3 @@ def test_admin_changes_are_audited(world):
     rows = owner_rows(world, "SELECT count(*) FROM audit_log WHERE tenant=%s AND action='log_source.create' AND detail=%s",
                       (CITY, name))
     assert rows[0][0] == 1
-

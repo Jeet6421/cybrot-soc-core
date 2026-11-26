@@ -28,7 +28,55 @@ SESSION_HOURS = float(os.environ.get("SOC_SESSION_HOURS", "8"))
 PLAYBOOK_TIMEOUT = float(os.environ.get("PLAYBOOK_TIMEOUT", "3"))
 PUBLIC_ROUTES = {("POST", "/api/login")}
 HOSPITAL_READ = ("hospital_admin", "l1", "l2", "viewer")
+ROUTE_ROLES = {
+    ("POST", "/api/events"): {"ingest"},
+    ("GET", "/api/events"): {"hospital_admin", "l1", "l2", "vendor_admin"},
+    ("POST", "/api/ingest/wazuh"): {"ingest"},
+    ("GET", "/api/tenants"): {"vendor_admin"},
+    ("POST", "/api/tenants"): {"vendor_admin"},
+    ("GET", "/api/users"): {"hospital_admin"},
+    ("POST", "/api/users"): {"hospital_admin"},
+    ("PATCH", "/api/users/<int:uid>"): {"hospital_admin"},
+    ("POST", "/api/users/<int:uid>/disable"): {"hospital_admin"},
+    ("GET", "/api/log-sources"): set(HOSPITAL_READ),
+    ("POST", "/api/log-sources"): {"hospital_admin"},
+    ("POST", "/api/log-sources/<int:sid>/disable"): {"hospital_admin"},
+    ("GET", "/api/credentials"): {"hospital_admin"},
+    ("POST", "/api/credentials"): {"hospital_admin"},
+    ("POST", "/api/credentials/<int:kid>/revoke"): {"hospital_admin"},
+    ("POST", "/api/logout"): {"session"},
+    ("GET", "/api/me"): {"session"},
+    ("GET", "/api/settings"): {"hospital_admin"},
+    ("PUT", "/api/settings"): {"hospital_admin"},
+    ("GET", "/api/alerts"): set(HOSPITAL_READ) | {"vendor_admin"},
+    ("POST", "/api/alerts/<int:i>/ack"): {"hospital_admin", "l1", "l2"},
+    ("POST", "/api/alerts/<int:i>/verdict"): {"hospital_admin", "l2"},
+    ("GET", "/api/analysts"): set(HOSPITAL_READ),
+    ("POST", "/api/alerts/<int:i>/handoff"): {"hospital_admin", "l1", "l2"},
+    ("GET", "/api/alerts/<int:i>/handoffs"): set(HOSPITAL_READ) | {"vendor_admin"},
+    ("GET", "/api/alerts/<int:i>/response-approvals"): {"hospital_admin", "l1", "l2"},
+    ("POST", "/api/alerts/<int:i>/response-approvals"): {"hospital_admin", "l1", "l2"},
+    ("POST", "/api/response-approvals/<int:approval_id>/decision"): {"hospital_admin", "l2"},
+    ("GET", "/api/metrics"): set(HOSPITAL_READ) | {"vendor_admin"},
+    ("GET", "/api/exit-criteria"): set(HOSPITAL_READ) | {"vendor_admin"},
+    ("POST", "/api/demo"): {"vendor_admin"},
+    ("POST", "/api/autolabel"): {"vendor_admin"},
+    ("POST", "/api/reset"): {"vendor_admin"},
+}
+SAFE_ALERT_FIELDS = ("id", "created", "event_ts", "tenant", "rule", "rule_version", "severity",
+                     "summary", "owner", "step", "status", "ack_at", "verdict", "source",
+                     "last_handoff")
 app = Flask(__name__, static_folder="static")
+
+
+def endpoint_allows(method, route, identity):
+    allowed = ROUTE_ROLES.get((method, route))
+    if not allowed or not identity:
+        return False
+    if identity["kind"] == "ingest":
+        return "ingest" in allowed
+    return identity["kind"] == "session" and (
+        "session" in allowed or identity["role"] in allowed)
 
 GATE_NAMES = {
     "foundation": "Logs flow end to end",
@@ -164,9 +212,33 @@ def _playbook_url():
     return os.environ.get("PLAYBOOK_WEBHOOK", "").strip()
 
 
+def _redact_text(value):
+    """Mask credentials accidentally embedded in free text before telemetry leaves the service."""
+    if not isinstance(value, str):
+        return value
+    import re
+    value = re.sub(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/-]+=*", r"\1[REDACTED]", value)
+    value = re.sub(r"(?i)\b(password|passwd|token|secret|api[_-]?key|authorization)\b\s*[:=]\s*[^\s,;]+",
+                   r"\1=[REDACTED]", value)
+    value = re.sub(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", "[EMAIL]", value)
+    value = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "[IP]", value)
+    value = re.sub(r"(?i)\b(user|patient|account)(?:\s+(?:id|name))?\s*[:=]\s*[^\s,;]+",
+                   r"\1=[REDACTED]", value)
+    return re.sub(r"(?i)(-enc(?:odedcommand)?\s+)[A-Za-z0-9+/=]+", r"\1[REDACTED]", value)
+
+
+def _safe_alert(row):
+    result = {key: row[key] for key in SAFE_ALERT_FIELDS if key in row}
+    for key in ("summary", "step", "last_handoff"):
+        if key in result:
+            result[key] = _redact_text(result[key])
+    return result
+
+
 def _alert_payload(row):
-    keys = ("id", "created", "tenant", "rule", "rule_version", "severity", "summary", "owner", "step", "detail", "attack_id", "source")
-    return {"event": "alert.created", "alert": {k: row[k] for k in keys}}
+    keys = ("id", "created", "tenant", "rule", "rule_version", "severity", "summary", "owner", "step", "source")
+    return {"event": "alert.created", "alert": {k: _redact_text(row[k]) if k in ("summary", "step") else row[k]
+                                                    for k in keys}}
 
 
 def _playbook_secret():
@@ -256,13 +328,16 @@ def authenticate():
         set_context(key["key_tenant"], "ingest", None)
         return None
     sess = conn.execute("SELECT * FROM auth_session(%s)", (h,)).fetchone()
-    if not sess or sess["user_status"] != "active":
+    if (not sess or sess["user_status"] != "active" or not sess["user_is_active"]
+            or sess["session_token_version"] != sess["user_token_version"]):
         raise Refuse(401, "unauthorized")
     if _is_ingest_post():
         raise Refuse(403, "event ingest needs an ingest key, not a user session")
-    g.identity = {"kind": "session", "tenant": sess["user_tenant"], "role": sess["user_role"],
+    tenant = auth.PLATFORM_TENANT if sess["user_role"] == "vendor_admin" else sess["user_tenant"]
+    g.identity = {"kind": "session", "tenant": tenant, "role": sess["user_role"],
+                  "account_type": sess["user_account_type"], "token_version": sess["user_token_version"],
                   "actor_id": sess["user_id"], "name": sess["user_name"], "token_hash": h}
-    set_context(sess["user_tenant"], sess["user_role"], sess["user_id"])
+    set_context(tenant, sess["user_role"], sess["user_id"])
     return None
 
 
@@ -270,6 +345,20 @@ def authenticate():
 def gate_lab_endpoints():
     if not LAB_ENDPOINTS and request.path in LAB_PATHS:
         return jsonify(error="lab endpoint disabled (LAB_ENDPOINTS=0)"), 404
+    return None
+
+
+@app.before_request
+def enforce_endpoint_rbac():
+    """Deny API routes unless the method and matched route are explicitly in the role matrix."""
+    if not request.path.startswith("/api/") or request.method == "OPTIONS":
+        return None
+    if (request.method, request.path) in PUBLIC_ROUTES:
+        return None
+    key = (request.method, request.url_rule.rule if request.url_rule else request.path)
+    identity = g.get("identity")
+    if not endpoint_allows(key[0], key[1], identity):
+        raise Refuse(403, "endpoint is not authorized for this identity")
     return None
 
 
@@ -402,8 +491,7 @@ def list_events():
         raise Refuse(400, "limit must be between 1 and 500")
     if before_id is not None and before_id < 1:
         raise Refuse(400, "before_id must be positive")
-    query = ('SELECT id, ts, tenant, source, type, "user", host, ip, patient, detail, attack_id, '
-             'destination, data_classification, destination_approved, src_zone, dst_zone, '
+    query = ('SELECT id, ts, tenant, source, type, host, data_classification, '
              'boundary_violation, approved_change, log_source_id FROM events WHERE tenant=%s')
     params = [tenant]
     if request.args.get("type"):
@@ -416,7 +504,8 @@ def list_events():
         query += " AND id < %s"
         params.append(before_id)
     rows = db().execute(query + " ORDER BY id DESC LIMIT %s", [*params, limit]).fetchall()
-    events = [dict(row) for row in rows]
+    events = [{key: _redact_text(row[key]) if key in ("source", "type", "host", "data_classification") else row[key]
+               for key in row} for row in rows]
     return jsonify(events=events, next_before_id=events[-1]["id"] if len(events) == limit else None)
 
 
@@ -475,7 +564,8 @@ def create_tenant():
 @app.get("/api/users")
 def list_users():
     hospital_scope("hospital_admin")
-    rows = db().execute("SELECT id, username, role, status, created FROM users ORDER BY id").fetchall()
+    rows = db().execute("SELECT id, username, email, role, account_type, is_active, token_version, status, created "
+                        "FROM users ORDER BY id").fetchall()
     return jsonify([dict(r) for r in rows])
 
 
@@ -484,23 +574,50 @@ def create_user():
     tenant = hospital_scope("hospital_admin")
     body = _body(required=True)
     username = _text(body, "username").lower()
+    email = _text(body, "email").lower()
     role = body.get("role")
     password = body.get("password")
     if not auth.USERNAME_RE.fullmatch(username):
         raise Refuse(400, "username must be 3 to 40 lowercase letters, digits, dots, hyphens or underscores")
+    problem = auth.email_problem(email)
+    if problem:
+        raise Refuse(400, problem)
     if role not in auth.HOSPITAL_ROLES:
         raise Refuse(400, f"role must be one of: {', '.join(auth.HOSPITAL_ROLES)}")
     problem = auth.password_problem(password)
     if problem:
         raise Refuse(400, problem)
     c = db()
-    if c.execute("SELECT 1 FROM users WHERE username=%s", (username,)).fetchone():
-        raise Refuse(409, "username already exists in this hospital")
-    row = c.execute("INSERT INTO users(tenant, username, role, password_hash) VALUES(%s, %s, %s, %s) RETURNING id",
-                    (tenant, username, role, auth.hash_password(password))).fetchone()
+    if c.execute("SELECT 1 FROM users WHERE username=%s OR lower(email)=%s", (username, email)).fetchone():
+        raise Refuse(409, "username or email already belongs to an account")
+    row = c.execute("INSERT INTO users(tenant, username, email, role, account_type, is_active, password_hash) "
+                    "VALUES(%s, %s, %s, %s, 'hospital_staff', TRUE, %s) "
+                    "ON CONFLICT DO NOTHING RETURNING id",
+                    (tenant, username, email, role, auth.hash_password(password))).fetchone()
+    if not row:
+        raise Refuse(409, "username or email already belongs to an account")
     audit("user.create", f"{username} ({role})")
     commit()
-    return jsonify(id=row["id"], username=username, role=role), 201
+    return jsonify(id=row["id"], username=username, email=email, role=role,
+                   account_type="hospital_staff"), 201
+
+
+@app.patch("/api/users/<int:uid>")
+def change_user_role(uid):
+    hospital_scope("hospital_admin")
+    body = _body(required=True)
+    role = body.get("role")
+    if role not in auth.HOSPITAL_ROLES:
+        raise Refuse(400, f"role must be one of: {', '.join(auth.HOSPITAL_ROLES)}")
+    row = db().execute("SELECT username, role FROM users WHERE id=%s AND is_active", (uid,)).fetchone()
+    if not row:
+        raise Refuse(404, "user not found or inactive")
+    if row["role"] == role:
+        return jsonify(id=uid, role=role, token_version_advanced=False)
+    db().execute("UPDATE users SET role=%s, token_version=token_version+1 WHERE id=%s", (role, uid))
+    audit("user.role.change", f"{row['username']}: {row['role']} -> {role}")
+    commit()
+    return jsonify(id=uid, role=role, token_version_advanced=True)
 
 
 @app.post("/api/users/<int:uid>/disable")
@@ -509,7 +626,8 @@ def disable_user(uid):
     if uid == g.identity["actor_id"]:
         raise Refuse(400, "you cannot disable your own account")
     c = db()
-    row = c.execute("UPDATE users SET status='disabled' WHERE id=%s AND status='active' RETURNING username", (uid,)).fetchone()
+    row = c.execute("UPDATE users SET status='disabled', is_active=FALSE, token_version=token_version+1 "
+                    "WHERE id=%s AND status='active' AND is_active RETURNING username", (uid,)).fetchone()
     if not row:
         raise Refuse(404, "user not found or already disabled")
     audit("user.disable", row["username"])
@@ -609,16 +727,19 @@ def login():
     c = db()
     row = c.execute("SELECT * FROM auth_user_for_login(%s, %s)", (tenant, username)).fetchone()
     stored = row["user_password_hash"] if row else auth.DUMMY_HASH
-    if not auth.verify_password(password, stored) or not row or row["user_status"] != "active":
+    if (not auth.verify_password(password, stored) or not row or row["user_status"] != "active"
+            or not row["user_is_active"]):
         print(f"login refused for tenant {tenant}", file=sys.stderr, flush=True)
         raise Refuse(401, "invalid tenant, username or password")
     token = auth.new_token()
-    set_context(row["user_tenant"], row["user_role"], row["user_id"])
-    c.execute("INSERT INTO sessions(token_hash, user_id, expires_at) VALUES (%s, %s, now() + make_interval(secs => %s))",
-              (auth.token_hash(token), row["user_id"], SESSION_HOURS * 3600.0))
+    context_tenant = auth.PLATFORM_TENANT if row["user_role"] == "vendor_admin" else row["user_tenant"]
+    set_context(context_tenant, row["user_role"], row["user_id"])
+    c.execute("INSERT INTO sessions(token_hash, user_id, token_version, expires_at) "
+              "VALUES (%s, %s, %s, now() + make_interval(secs => %s))",
+              (auth.token_hash(token), row["user_id"], row["user_token_version"], SESSION_HOURS * 3600.0))
     audit("login")
     commit()
-    return jsonify(token=token, tenant=row["user_tenant"], role=row["user_role"], username=username,
+    return jsonify(token=token, tenant=context_tenant, role=row["user_role"], username=username,
                    expires_in_hours=SESSION_HOURS)
 
 
@@ -669,8 +790,9 @@ def update_hospital_settings():
 @app.get("/api/alerts")
 def alerts():
     tenant = hospital_scope(*HOSPITAL_READ, "vendor_admin")
-    # last_handoff: the latest handoff as "from -> to: note", so the dashboard can show it (v0.7.1).
-    q = ("SELECT alerts.*, (SELECT from_owner || ' -> ' || to_owner || ': ' || COALESCE(NULLIF(note, ''), 'no note') "
+    # Keep alert responses to a telemetry allowlist; free-form detail and resolution can carry secrets or PHI.
+    q = ("SELECT id, created, event_ts, tenant, rule, rule_version, severity, summary, owner, step, status, ack_at, "
+         "verdict, source, (SELECT from_owner || ' -> ' || to_owner "
          "FROM handoffs h WHERE h.alert_id = alerts.id ORDER BY h.id DESC LIMIT 1) AS last_handoff "
          "FROM alerts WHERE tenant=%s")
     args = [tenant]
@@ -679,7 +801,7 @@ def alerts():
             q += f" AND {f}=%s"
             args.append(request.args[f])
     rows = db().execute(q + " ORDER BY id DESC LIMIT 200", args).fetchall()
-    return jsonify([dict(r) for r in rows])
+    return jsonify([_safe_alert(r) for r in rows])
 
 
 @app.post("/api/alerts/<int:i>/ack")
@@ -742,7 +864,7 @@ def handoff(i):
 def handoffs(i):
     hospital_scope(*HOSPITAL_READ, "vendor_admin")
     _alert_or_404(i)
-    rows = db().execute("SELECT at, from_owner, to_owner, note FROM handoffs WHERE alert_id=%s ORDER BY id", (i,)).fetchall()
+    rows = db().execute("SELECT at, from_owner, to_owner FROM handoffs WHERE alert_id=%s ORDER BY id", (i,)).fetchall()
     return jsonify([dict(r) for r in rows])
 
 
@@ -757,7 +879,8 @@ def list_response_approvals(i):
         "SELECT id, alert_id, action, target, reason, status, requested_by, requested_at, "
         "approved_by, decided_at, decision_note FROM response_approvals "
         "WHERE alert_id=%s ORDER BY id DESC", (i,)).fetchall()
-    return jsonify([dict(row) for row in rows])
+    return jsonify([{key: _redact_text(value) if key in ("target", "reason", "decision_note") else value
+                     for key, value in row.items()} for row in rows])
 
 
 @app.post("/api/alerts/<int:i>/response-approvals")
@@ -793,7 +916,7 @@ def request_response_approval(i):
         raise Refuse(409, "a matching response approval is already pending")
     audit("response_approval.request", f"approval {row['id']}: {action} for alert {i}")
     commit()
-    return jsonify(id=row["id"], alert_id=i, action=action, target=target, status=row["status"],
+    return jsonify(id=row["id"], alert_id=i, action=action, target=_redact_text(target), status=row["status"],
                    execution="not_performed"), 201
 
 
@@ -821,7 +944,8 @@ def decide_response_approval(approval_id):
         (decision, g.identity["actor_id"], decided_at, note, approval_id))
     audit("response_approval.decision", f"approval {approval_id}: {decision}")
     commit()
-    return jsonify(id=approval_id, alert_id=row["alert_id"], action=row["action"], target=row["target"],
+    return jsonify(id=approval_id, alert_id=row["alert_id"], action=row["action"],
+                   target=_redact_text(row["target"]),
                    status=decision, execution="not_performed")
 
 
@@ -970,4 +1094,3 @@ def home():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
