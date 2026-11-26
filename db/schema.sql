@@ -73,6 +73,29 @@ ALTER TABLE sessions ALTER COLUMN token_version SET NOT NULL;
 CREATE TABLE IF NOT EXISTS audit_log(id BIGSERIAL PRIMARY KEY, at TIMESTAMPTZ NOT NULL DEFAULT now(),
   tenant TEXT NOT NULL, actor_id BIGINT, action TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '');
 
+-- Append-only, tenant-scoped evidence for authenticated actions. Free-form clinical or credential
+-- content must never be placed in metadata; app.py applies a strict metadata allowlist before insert.
+CREATE TABLE IF NOT EXISTS audit_events(
+  audit_id BIGSERIAL PRIMARY KEY,
+  occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  actor_id BIGINT,
+  actor_role TEXT NOT NULL,
+  auth_context TEXT NOT NULL CHECK (auth_context IN ('session', 'break_glass', 'ingest_key', 'system')),
+  break_glass_grant_id UUID,
+  action TEXT NOT NULL,
+  resource_type TEXT NOT NULL,
+  resource_id TEXT,
+  resource_classification TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (outcome IN ('allow', 'deny', 'error')),
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata) = 'object'),
+  request_id TEXT NOT NULL,
+  source_ip TEXT,
+  device_id TEXT
+);
+CREATE INDEX IF NOT EXISTS audit_events_tenant_time_idx ON audit_events(tenant_id, occurred_at DESC, audit_id DESC);
+CREATE INDEX IF NOT EXISTS audit_events_request_id_idx ON audit_events(request_id);
+
 -- Break-glass: a time-limited grant that lets one vendor admin read one hospital's data. Created by a
 -- database administrator (manage.py grant-break-glass), never through the API.
 CREATE TABLE IF NOT EXISTS break_glass_grants(id BIGSERIAL PRIMARY KEY, actor_id BIGINT NOT NULL REFERENCES users(id),
@@ -100,6 +123,21 @@ CREATE TABLE IF NOT EXISTS alerts(id BIGSERIAL PRIMARY KEY, created TEXT, event_
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS detail TEXT;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS resolution TEXT;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS rule_version TEXT;
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS acknowledged_by BIGINT;
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ;
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS verdict_by BIGINT;
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS verdict_at TIMESTAMPTZ;
+DO $
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'alerts_acknowledged_by_tenant_fk') THEN
+    ALTER TABLE alerts ADD CONSTRAINT alerts_acknowledged_by_tenant_fk
+      FOREIGN KEY (acknowledged_by, tenant) REFERENCES users(id, tenant);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'alerts_verdict_by_tenant_fk') THEN
+    ALTER TABLE alerts ADD CONSTRAINT alerts_verdict_by_tenant_fk
+      FOREIGN KEY (verdict_by, tenant) REFERENCES users(id, tenant);
+  END IF;
+END $;
 CREATE UNIQUE INDEX IF NOT EXISTS users_id_tenant_uidx ON users(id, tenant);
 CREATE UNIQUE INDEX IF NOT EXISTS alerts_id_tenant_uidx ON alerts(id, tenant);
 CREATE INDEX IF NOT EXISTS alerts_tenant_id_idx ON alerts(tenant, id);
@@ -316,6 +354,31 @@ CREATE POLICY sessions_own ON sessions FOR ALL
   WITH CHECK (user_id = app_actor_id());
 
 -- Audit rows are written by the app and read by hospital admins. The app cannot change or delete them.
+CREATE OR REPLACE FUNCTION reject_audit_event_mutation() RETURNS trigger
+LANGUAGE plpgsql AS $
+BEGIN
+  RAISE EXCEPTION 'audit_events is append-only' USING ERRCODE = '55000';
+END $;
+DROP TRIGGER IF EXISTS audit_events_no_update_delete ON audit_events;
+CREATE TRIGGER audit_events_no_update_delete
+  BEFORE UPDATE OR DELETE ON audit_events
+  FOR EACH ROW EXECUTE FUNCTION reject_audit_event_mutation();
+DROP TRIGGER IF EXISTS audit_events_no_truncate ON audit_events;
+CREATE TRIGGER audit_events_no_truncate
+  BEFORE TRUNCATE ON audit_events
+  FOR EACH STATEMENT EXECUTE FUNCTION reject_audit_event_mutation();
+
+ALTER TABLE audit_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_events FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS audit_events_read ON audit_events;
+CREATE POLICY audit_events_read ON audit_events FOR SELECT
+  USING (tenant_id = app_tenant() AND app_role() = 'hospital_admin');
+DROP POLICY IF EXISTS audit_events_insert ON audit_events;
+CREATE POLICY audit_events_insert ON audit_events FOR INSERT
+  WITH CHECK (tenant_id = app_tenant()
+    AND actor_id IS NOT DISTINCT FROM app_actor_id()
+    AND actor_role = app_role());
+
 ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_log FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS audit_read ON audit_log;
@@ -337,6 +400,9 @@ GRANT SELECT, INSERT ON tenants TO soc_app;
 GRANT UPDATE (name) ON tenants TO soc_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON users, log_sources, ingest_keys, events, alerts, handoffs, sessions TO soc_app;
 GRANT SELECT, INSERT ON audit_log TO soc_app;
+REVOKE ALL ON audit_events FROM PUBLIC;
+REVOKE UPDATE, DELETE, TRUNCATE ON audit_events FROM soc_app;
+GRANT SELECT, INSERT ON audit_events TO soc_app;
 GRANT SELECT ON break_glass_grants TO soc_app;
 GRANT SELECT, INSERT ON response_approvals TO soc_app;
 GRANT UPDATE (status, approved_by, decided_at, decision_note) ON response_approvals TO soc_app;
