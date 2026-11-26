@@ -1,9 +1,23 @@
 import os, sys
+
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
-import app as soc
 import attack_sim, load_test
 
-c = soc.app.test_client()
+import app as soc
+from support import Api
+
+c = None
+
+
+@pytest.fixture(autouse=True)
+def _api(world):
+    global c
+    c = Api(world)
+
+
+# post() sends events and alerts as the City ingest key; get() reads as the City hospital admin.
 post = lambda p, b: c.post(p, json=b).get_json()
 get = lambda p: c.get(p).get_json()
 
@@ -24,8 +38,7 @@ def test_repeat_run_passes_after_alert_list_moves_on():
     c.post("/api/reset")
     assert all(r["passed"] for r in attack_sim.run(post, get))
     for i in range(250):  # push the first run's alerts out of the newest-200 window
-        c.post(f"/api/ingest/wazuh?tenant={attack_sim.TENANT}",
-               json={"rule": {"id": "5501", "level": 7, "description": "filler"},
+        c.post("/api/ingest/wazuh", json={"rule": {"id": "5501", "level": 7, "description": "filler"},
                                           "agent": {"name": f"filler-{i}"}, "timestamp": "2026-11-20T10:00:00"})
     results = attack_sim.run(post, get)
     assert all(r["passed"] for r in results), results
@@ -66,7 +79,7 @@ def test_review_fails_when_false_positives_exceed_target(monkeypatch):
     attack_sim.run(post, get)
     post("/api/autolabel", {})
     first = get("/api/alerts")[0]["id"]
-    post(f"/api/alerts/{first}/verdict", {"verdict": "fp"})  # 1 fp out of 3 labeled = 33%
+    c.post(f"/api/alerts/{first}/verdict", json={"verdict": "fp"})  # 1 fp out of 3 labeled = 33%
     assert gates()["review"] == "fail"
 
 
@@ -75,7 +88,7 @@ def test_weekly_false_positive_rate():
     attack_sim.run(post, get)
     post("/api/autolabel", {})
     first = get("/api/alerts")[0]["id"]
-    post(f"/api/alerts/{first}/verdict", {"verdict": "fp"})
+    c.post(f"/api/alerts/{first}/verdict", json={"verdict": "fp"})
     weeks = get("/api/metrics")["false_positive_rate_by_week"]
     assert len(weeks) >= 1
     assert sum(w["tp"] for w in weeks) == 2 and sum(w["fp"] for w in weeks) == 1

@@ -1,16 +1,25 @@
-import app as soc
+import pytest
 
-c = soc.app.test_client()
+import app as soc
+from support import Api, CITY
+
+c = None
 
 ENC = "powershell.exe -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA"
+
+
+@pytest.fixture(autouse=True)
+def _api(world):
+    global c
+    c = Api(world)
 
 
 def one_alert():
     """Reset, then raise exactly one alert. Returns the alert row."""
     c.post("/api/reset")
-    c.post("/api/events", json=[{"ts": "2026-11-20T11:00:00", "tenant": "city-hospital", "source": "t",
+    c.post("/api/events", json=[{"ts": "2026-11-20T11:00:00", "tenant": CITY, "source": "t",
                                  "type": "process_start", "user": "u", "host": "ws-1", "detail": ENC}])
-    return c.get("/api/alerts?tenant=city-hospital").get_json()[0]
+    return c.get(f"/api/alerts?tenant={CITY}").get_json()[0]
 
 
 def other_analyst(owner):
@@ -100,4 +109,5 @@ def test_reset_clears_handoff_history():
     a = one_alert()
     c.post(f"/api/alerts/{a['id']}/handoff", json={"to_owner": other_analyst(a["owner"])})
     c.post("/api/reset")
-    assert c.get("/api/alerts/1/handoffs").get_json() == []
+    # The alert is gone with the reset, so its history is gone too.
+    assert c.get(f"/api/alerts/{a['id']}/handoffs").status_code == 404

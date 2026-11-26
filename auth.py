@@ -2,7 +2,7 @@
 
 Standard library first. The one extra dependency is `cryptography`, used only for authenticated encryption
 (Fernet: AES-128-CBC with HMAC-SHA256). Nothing here logs or returns a secret except where the caller asks."""
-import base64, hashlib, hmac, secrets, struct, time
+import base64, hashlib, hmac, re, secrets, struct, time
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -36,14 +36,27 @@ def hash_password(password):
     return f"scrypt${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}${_b64(salt)}${_b64(digest)}"
 
 
+def _decode_hash_component(value, hex_length):
+    if len(value) == hex_length:
+        try:
+            return bytes.fromhex(value)
+        except ValueError:
+            pass
+    return _unb64(value)
+
+
 def verify_password(password, stored):
     """True when the password matches the stored hash. Never raises on a malformed hash."""
     try:
         scheme, n, r, p, salt_b, digest_b = stored.split("$")
         if scheme != "scrypt":
             return False
-        candidate = _scrypt(password, _unb64(salt_b), int(n), int(r), int(p))
-        return hmac.compare_digest(candidate, _unb64(digest_b))
+        # PR #16 stored salt and digest as hex; the main branch's MFA helpers use base64.
+        # Accept both encodings so existing accounts remain able to sign in after the merge.
+        salt = _decode_hash_component(salt_b, 32)
+        expected = _decode_hash_component(digest_b, 64)
+        candidate = _scrypt(password, salt, int(n), int(r), int(p))
+        return hmac.compare_digest(candidate, expected)
     except (ValueError, TypeError):
         return False
 
@@ -122,3 +135,24 @@ def token_hash(token):
     """Only this hash is stored. A database leak does not reveal usable tokens."""
     return hashlib.sha256(token.encode()).hexdigest()
 
+
+
+# Identity constants and helpers used by the tenant/RBAC API in PR #16.
+TENANT_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
+USERNAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{2,39}")
+PLATFORM_TENANT = "platform"
+HOSPITAL_ROLES = ("hospital_admin", "l1", "l2", "viewer")
+ROLES = HOSPITAL_ROLES + ("vendor_admin",)
+
+
+def password_problem(password):
+    """None when the password is acceptable, otherwise the reason."""
+    if not isinstance(password, str) or len(password) < MIN_PASSWORD_LENGTH:
+        return f"password must be at least {MIN_PASSWORD_LENGTH} characters"
+    if len(password) > 256:
+        return "password must be at most 256 characters"
+    return None
+
+
+# Compatibility name used by the tenant/RBAC API in PR #16.
+new_token = new_session_token

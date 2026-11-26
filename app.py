@@ -1,23 +1,33 @@
-"""Cybrot SOC Core - prototype: ingest -> detect -> triage queue (owner + response step) -> metrics -> exit criteria."""
-import hashlib, hmac, json, os, re, secrets, sys, threading, time, urllib.error, urllib.request
+"""Cybrot SOC Core - prototype: ingest -> detect -> triage queue -> metrics -> exit criteria.
+
+Who may call /api/:
+- A logged-in user (a session token). The role decides what they may do. Their hospital is the tenant.
+- An ingest key, for POST /api/events and POST /api/ingest/* only. The key is bound to one hospital and one log source.
+Nothing else is accepted. There is no shared operator token.
+
+The tenant always comes from the caller's identity. A tenant_id in the query can only narrow within that scope;
+anything else is refused with 403 before a query runs. PostgreSQL row-level security enforces the same rule
+underneath: every transaction carries the identity in transaction-local settings (see db/schema.sql).
+"""
+import json, os, secrets, sys, threading, time, urllib.error, urllib.request
 from datetime import datetime, timezone
+
 import psycopg
 from flask import Flask, g, request, jsonify, send_from_directory
-import detect, generate
 
-# PostgreSQL connection string. Set DATABASE_URL in every real deployment. The default is for local development only.
-DEFAULT_DATABASE_URL = "postgresql://soc:soc@localhost:5432/soc"
+import auth, detect, generate
+
+# Runtime connection, as the soc_app role (never the owner). Read at call time.
 ANALYSTS = os.environ.get("ANALYSTS", "analyst1,analyst2,analyst3").split(",")
-# Lab-only endpoints (synthetic data, demo load, reset). Set LAB_ENDPOINTS=0 in any
-# environment where real logs or real analysts' work could be in the database.
+# Lab-only endpoints (synthetic data, demo load, reset). They need the owner role, so they use LAB_DATABASE_URL.
+# Set LAB_ENDPOINTS=0 in any environment where real logs or real analysts' work could be in the database.
 LAB_ENDPOINTS = os.environ.get("LAB_ENDPOINTS", "1") == "1"
 LAB_PATHS = {"/api/demo", "/api/autolabel", "/api/reset"}
-# Operator token for every /api/ call (Authorization: Bearer <token>). Required for any shared deployment.
-# Hospital ingest keys (below) can only send events; they cannot read or change anything.
-API_TOKEN = os.environ.get("SOC_API_TOKEN", "")
+SESSION_HOURS = float(os.environ.get("SOC_SESSION_HOURS", "8"))
 # Playbook hook (v0.7): every new alert is POSTed as JSON to this URL, e.g. a Shuffle webhook. Empty = off.
 PLAYBOOK_TIMEOUT = float(os.environ.get("PLAYBOOK_TIMEOUT", "3"))
-TENANT_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
+PUBLIC_ROUTES = {("POST", "/api/login")}
+HOSPITAL_READ = ("hospital_admin", "l1", "l2", "viewer")
 app = Flask(__name__, static_folder="static")
 
 GATE_NAMES = {
@@ -26,41 +36,6 @@ GATE_NAMES = {
     "response": "Every alert has an owner and a response step",
     "review": "False-positive rate within the agreed target",
 }
-
-# "user" is a reserved word in PostgreSQL, so the column is quoted wherever it appears.
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS events(id BIGSERIAL PRIMARY KEY, ts TEXT, tenant TEXT, source TEXT, type TEXT,
-  "user" TEXT, host TEXT, ip TEXT, patient TEXT, detail TEXT, attack_id TEXT,
-  destination TEXT, data_classification TEXT, destination_approved BOOLEAN,
-  src_zone TEXT, dst_zone TEXT, boundary_violation BOOLEAN, approved_change BOOLEAN);
-CREATE INDEX IF NOT EXISTS ev_idx ON events(tenant, type, ts);
-CREATE INDEX IF NOT EXISTS ev_host_type_idx ON events(tenant, host, type, ts);
-ALTER TABLE events ADD COLUMN IF NOT EXISTS destination TEXT;
-ALTER TABLE events ADD COLUMN IF NOT EXISTS data_classification TEXT;
-ALTER TABLE events ADD COLUMN IF NOT EXISTS destination_approved BOOLEAN;
-ALTER TABLE events ADD COLUMN IF NOT EXISTS src_zone TEXT;
-ALTER TABLE events ADD COLUMN IF NOT EXISTS dst_zone TEXT;
-ALTER TABLE events ADD COLUMN IF NOT EXISTS boundary_violation BOOLEAN;
-ALTER TABLE events ADD COLUMN IF NOT EXISTS approved_change BOOLEAN;
-CREATE TABLE IF NOT EXISTS alerts(id BIGSERIAL PRIMARY KEY, created TEXT, event_ts TEXT, tenant TEXT, rule TEXT,
-  rule_version TEXT, severity TEXT, summary TEXT, dkey TEXT, owner TEXT, step TEXT, status TEXT DEFAULT 'new',
-  ack_at TEXT, verdict TEXT, attack_id TEXT, source TEXT DEFAULT 'builtin', detail TEXT);
-ALTER TABLE alerts ADD COLUMN IF NOT EXISTS detail TEXT;
-ALTER TABLE alerts ADD COLUMN IF NOT EXISTS resolution TEXT;
-ALTER TABLE alerts ADD COLUMN IF NOT EXISTS rule_version TEXT;
-CREATE TABLE IF NOT EXISTS handoffs(id BIGSERIAL PRIMARY KEY, alert_id BIGINT, at TEXT, from_owner TEXT,
-  to_owner TEXT, note TEXT);
-ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS tenant TEXT;
-CREATE INDEX IF NOT EXISTS ho_idx ON handoffs(alert_id);
-CREATE TABLE IF NOT EXISTS tenants(id TEXT PRIMARY KEY, name TEXT NOT NULL,
-  created TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS'));
-INSERT INTO tenants(id, name) VALUES ('default', 'Default (lab)') ON CONFLICT DO NOTHING;
-CREATE TABLE IF NOT EXISTS ingest_keys(id BIGSERIAL PRIMARY KEY, tenant TEXT NOT NULL REFERENCES tenants(id),
-  label TEXT NOT NULL DEFAULT '', key_hash TEXT NOT NULL UNIQUE,
-  created TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS'), revoked_at TEXT);
-"""
-
-_schema_ready = set()  # database URLs whose schema has been checked in this process
 
 
 class Row(dict):
@@ -80,22 +55,57 @@ def _row_factory(cursor):
     return make
 
 
-def connect():
-    """Open a new connection and make sure the schema exists. Read the URL at call time."""
-    url = os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
-    c = psycopg.connect(url, row_factory=_row_factory)
-    if url not in _schema_ready:
-        c.execute(SCHEMA)
-        c.commit()
-        _schema_ready.add(url)
-    return c
+class Refuse(Exception):
+    """Stop the request with an HTTP status and a message. Raised before any query that would touch other data."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+@app.errorhandler(Refuse)
+def _refused(e):
+    return jsonify(error=e.message), e.status
+
+
+def connect(url=None):
+    """A new connection as the runtime role. Raises if DATABASE_URL is not set."""
+    url = url or os.environ.get("DATABASE_URL", "")
+    if not url:
+        raise RuntimeError("DATABASE_URL is required (the soc_app runtime connection string)")
+    return psycopg.connect(url, row_factory=_row_factory)
+
+
+def _bind(conn, tenant, role, actor_id):
+    """Set the identity for the current transaction only. COMMIT or ROLLBACK clears it, so a pooled
+    connection can never carry one request's identity into the next one."""
+    conn.execute("SELECT set_config('app.tenant_id', %s, true), set_config('app.role', %s, true), "
+                 "set_config('app.actor_id', %s, true)",
+                 (tenant or "", role or "", "" if actor_id is None else str(actor_id)))
 
 
 def db():
-    """One connection per request. It is closed when the request ends (see _close_db)."""
+    """One connection per request, closed when the request ends (see _close_db)."""
     if "db" not in g:
         g.db = connect()
+        ctx = g.get("ctx")
+        if ctx:
+            _bind(g.db, ctx["tenant"], ctx["role"], ctx["actor_id"])
     return g.db
+
+
+def set_context(tenant, role, actor_id):
+    g.ctx = {"tenant": tenant, "role": role, "actor_id": actor_id}
+    _bind(db(), tenant, role, actor_id)
+
+
+def commit():
+    """Commit, then bind the identity again: the settings end with each transaction."""
+    c = db()
+    c.commit()
+    ctx = g.get("ctx")
+    _bind(c, ctx["tenant"] if ctx else None, ctx["role"] if ctx else None, ctx["actor_id"] if ctx else None)
 
 
 @app.teardown_appcontext
@@ -103,6 +113,15 @@ def _close_db(exc):
     c = g.pop("db", None)
     if c is not None:
         c.close()
+
+
+@app.after_request
+def _commit_break_glass_audit(response):
+    # A successful break-glass read must persist its audit row. Normal read-only requests
+    # stay uncommitted; this commits the audit and the authorized read in the same transaction.
+    if g.get("break_glass_read") and response.status_code < 400:
+        commit()
+    return response
 
 
 def now():
@@ -118,13 +137,20 @@ def _fp_target():
         return None
 
 
+def audit(action, detail=""):
+    """One row in the audit log, for the identity that is currently bound."""
+    ctx = g.ctx
+    db().execute("INSERT INTO audit_log(tenant, actor_id, action, detail) VALUES (%s, %s, %s, %s)",
+                 (ctx["tenant"], ctx["actor_id"], action, detail[:300]))
+
+
 def raise_alert(c, tenant, rule, sev, summary, key, event_ts, attack_id=None, source="builtin",
                 detail="", step=None):
     dup = c.execute("SELECT 1 FROM alerts WHERE rule=%s AND tenant=%s AND dkey=%s AND event_ts>=%s",
                     (rule, tenant, key, detect._ago(event_ts, 10))).fetchone() if event_ts else None
     if dup:
         return None
-    n = c.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+    n = c.execute("SELECT COUNT(*) FROM alerts WHERE tenant=%s", (tenant,)).fetchone()[0]
     owner = ANALYSTS[n % len(ANALYSTS)]
     step = step or detect.PLAYBOOK.get(rule, "Review the alert details and decide: escalate, fix, or close as benign.")
     cur = c.execute("INSERT INTO alerts(created,event_ts,tenant,rule,rule_version,severity,summary,dkey,owner,step,attack_id,source,detail) "
@@ -149,6 +175,7 @@ def _playbook_secret():
 
 def sign(secret, timestamp, body):
     """HMAC-SHA256 over '<timestamp>.<raw body>'. The receiver recomputes it and compares (see docs/SHUFFLE.md)."""
+    import hashlib, hmac
     mac = hmac.new(secret.encode(), f"{timestamp}.".encode() + body, hashlib.sha256)
     return "sha256=" + mac.hexdigest()
 
@@ -195,46 +222,47 @@ def _notify_new(c, ids):
         _dispatch(url, _alert_payload(row))
 
 
-def _supplied_token():
-    supplied = (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
-    if not supplied and request.path.startswith("/api/ingest/"):
-        supplied = request.args.get("token", "")
-    return supplied
+# ---- Identity ---------------------------------------------------------------------------------
+
+def _token_from_request():
+    token = (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+    if not token and request.path.startswith("/api/ingest/"):
+        token = request.args.get("token", "")  # Wazuh's integration cannot send headers
+    return token
 
 
-def _is_ingest_request():
+def _is_ingest_post():
     return request.method == "POST" and (request.path == "/api/events" or request.path.startswith("/api/ingest/"))
 
 
-def _key_tenant(token):
-    """The hospital an active ingest key belongs to, or None. Only the SHA-256 hash of a key is stored."""
-    if not token:
-        return None
-    h = hashlib.sha256(token.encode()).hexdigest()
-    row = db().execute("SELECT tenant FROM ingest_keys WHERE key_hash=%s AND revoked_at IS NULL", (h,)).fetchone()
-    return row["tenant"] if row else None
-
-
 @app.before_request
-def gate_api():
-    """Who may call /api/:
-    - A hospital ingest key can only POST events or Wazuh alerts. Its tenant comes from the key, never from the request.
-    - Everything else needs SOC_API_TOKEN, when that is set.
-    - With SOC_API_TOKEN unset (lab only), the API is open.
-    Wazuh's built-in integration cannot send headers, so /api/ingest/* also accepts ?token=."""
-    g.tenant_lock = None
-    if not request.path.startswith("/api/"):
+def authenticate():
+    """Resolve the caller once per request. Sets g.identity and the transaction context, or stops the request."""
+    g.ctx = None
+    g.identity = None
+    if not request.path.startswith("/api/") or (request.method, request.path) in PUBLIC_ROUTES:
         return None
-    supplied = _supplied_token()
-    if _is_ingest_request():
-        tenant = _key_tenant(supplied)
-        if tenant:
-            g.tenant_lock = tenant
-            return None
-    if not API_TOKEN:
+    token = _token_from_request()
+    if not token:
+        raise Refuse(401, "unauthorized")
+    h = auth.token_hash(token)
+    conn = db()
+    key = conn.execute("SELECT * FROM auth_ingest_key(%s)", (h,)).fetchone()
+    if key:
+        if not _is_ingest_post():
+            raise Refuse(403, "an ingest key can only send events; it cannot call this endpoint")
+        g.identity = {"kind": "ingest", "tenant": key["key_tenant"], "role": "ingest", "actor_id": None,
+                      "name": f"ingest-key-{key['key_id']}", "log_source_id": key["key_log_source_id"]}
+        set_context(key["key_tenant"], "ingest", None)
         return None
-    if not hmac.compare_digest(supplied, API_TOKEN):
-        return jsonify(error="unauthorized"), 401
+    sess = conn.execute("SELECT * FROM auth_session(%s)", (h,)).fetchone()
+    if not sess or sess["user_status"] != "active":
+        raise Refuse(401, "unauthorized")
+    if _is_ingest_post():
+        raise Refuse(403, "event ingest needs an ingest key, not a user session")
+    g.identity = {"kind": "session", "tenant": sess["user_tenant"], "role": sess["user_role"],
+                  "actor_id": sess["user_id"], "name": sess["user_name"], "token_hash": h}
+    set_context(sess["user_tenant"], sess["user_role"], sess["user_id"])
     return None
 
 
@@ -242,7 +270,83 @@ def gate_api():
 def gate_lab_endpoints():
     if not LAB_ENDPOINTS and request.path in LAB_PATHS:
         return jsonify(error="lab endpoint disabled (LAB_ENDPOINTS=0)"), 404
+    return None
 
+
+def _require_ingest():
+    ident = g.identity
+    if ident["kind"] != "ingest":
+        raise Refuse(403, "this endpoint takes an ingest key")
+    return ident
+
+
+def _require_vendor():
+    ident = g.identity
+    if ident["kind"] != "session" or ident["role"] != "vendor_admin":
+        raise Refuse(403, "vendor_admin only")
+    return ident
+
+
+def _break_glass_active(tenant):
+    row = db().execute("SELECT break_glass_active(%s) AS ok", (tenant,)).fetchone()
+    return bool(row["ok"])
+
+
+def hospital_scope(*allowed):
+    """The one hospital this request may work on. Refuses before any query when the caller is out of scope.
+
+    - A hospital user works on their own hospital. A tenant_id in the request must equal it; otherwise 403.
+    - A vendor admin reaches hospital data only where 'vendor_admin' is in `allowed` (reads), only with a
+      tenant_id, and only with an active break-glass grant. Every such read is audited.
+    """
+    ident = g.identity
+    wanted = request.args.get("tenant_id") or request.args.get("tenant") or None
+    if ident["kind"] != "session":
+        raise Refuse(403, "ingest keys cannot read or change hospital data")
+    if ident["role"] == "vendor_admin":
+        if "vendor_admin" not in allowed:
+            raise Refuse(403, "vendor_admin has no routine access to this")
+        if not wanted:
+            raise Refuse(403, "name the hospital (tenant_id) to request break-glass access")
+        if not _break_glass_active(wanted):
+            raise Refuse(403, "no active break-glass grant for this hospital")
+        set_context(wanted, "vendor_admin", ident["actor_id"])
+        audit("break_glass.read", request.path)
+        g.break_glass_read = True
+        return wanted
+    if wanted and wanted != ident["tenant"]:
+        raise Refuse(403, "tenant_id does not match your session")
+    if ident["role"] not in allowed:
+        raise Refuse(403, "your role cannot do this")
+    return ident["tenant"]
+
+
+def _body(required=False):
+    body = request.get_json(force=True, silent=True)
+    if body is None or not isinstance(body, dict):
+        if required:
+            raise Refuse(400, "send a JSON object")
+        return {}
+    return body
+
+
+def _text(body, key, limit=None):
+    """A request field as stripped text. Anything that is not a string counts as missing."""
+    value = body.get(key)
+    if not isinstance(value, str):
+        value = ""
+    value = value.strip()
+    return value[:limit] if limit else value
+
+
+def _alert_or_404(i):
+    row = db().execute("SELECT id, owner, status, tenant FROM alerts WHERE id=%s", (i,)).fetchone()
+    if not row:
+        raise Refuse(404, "alert not found")  # also what another hospital's alert returns
+    return row
+
+
+# ---- Events ingest ------------------------------------------------------------------------------
 
 def _store_events(c, evs):
     """Store events and run the detection rules. Returns the new alert ids. The caller commits."""
@@ -252,12 +356,12 @@ def _store_events(c, evs):
         for k in ("user", "host", "ip", "patient", "detail", "source"):
             e.setdefault(k, "")
         for k in ("destination", "data_classification", "destination_approved", "src_zone", "dst_zone",
-                  "boundary_violation", "approved_change"):
+                  "boundary_violation", "approved_change", "log_source_id"):
             e.setdefault(k, None)
         c.execute('INSERT INTO events(ts,tenant,source,type,"user",host,ip,patient,detail,attack_id, '
-                  'destination,data_classification,destination_approved,src_zone,dst_zone,boundary_violation,approved_change) '
+                  'destination,data_classification,destination_approved,src_zone,dst_zone,boundary_violation,approved_change,log_source_id) '
                   "VALUES(%(ts)s,%(tenant)s,%(source)s,%(type)s,%(user)s,%(host)s,%(ip)s,%(patient)s,%(detail)s,%(attack_id)s, "
-                  "%(destination)s,%(data_classification)s,%(destination_approved)s,%(src_zone)s,%(dst_zone)s,%(boundary_violation)s,%(approved_change)s)", e)
+                  "%(destination)s,%(data_classification)s,%(destination_approved)s,%(src_zone)s,%(dst_zone)s,%(boundary_violation)s,%(approved_change)s,%(log_source_id)s)", e)
         hit = detect.evaluate(c, e)
         if hit:
             i = raise_alert(c, e["tenant"], *hit[:3], hit[3], e["ts"], e["attack_id"])
@@ -268,107 +372,253 @@ def _store_events(c, evs):
 
 @app.post("/api/events")
 def ingest():
+    ident = _require_ingest()
     body = request.get_json(force=True)
     evs = body if isinstance(body, list) else [body]
-    lock = g.get("tenant_lock")
-    if lock:
-        # An ingest key is bound to one hospital. Events for any other hospital are refused, not moved.
-        if any(e.get("tenant") not in (None, "", lock) for e in evs):
-            return jsonify(error="event tenant does not match this ingest key"), 403
-        for e in evs:
-            e["tenant"] = lock
-    c = db()
-    made_ids = _store_events(c, evs)
-    c.commit()
-    _notify_new(c, made_ids)
+    for e in evs:
+        if not isinstance(e, dict):
+            raise Refuse(400, "each event must be a JSON object")
+        # An ingest key is bound to one hospital and one log source. Events for any other hospital are refused.
+        if e.get("tenant") not in (None, "", ident["tenant"]):
+            raise Refuse(403, "event tenant does not match this ingest key")
+        e["tenant"] = ident["tenant"]
+        e["log_source_id"] = ident["log_source_id"]
+    made_ids = _store_events(db(), evs)
+    commit()
+    _notify_new(db(), made_ids)
     return jsonify(events=len(evs), alerts_created=len(made_ids))
 
 
 @app.post("/api/ingest/wazuh")
 def ingest_wazuh():
     """Accepts a Wazuh integration (webhook) alert and drops it in the same triage queue."""
+    ident = _require_ingest()
     a = request.get_json(force=True)
     rule = a.get("rule") or {}
     rid = str(rule.get("id", "0"))
     lvl = int(rule.get("level", 3))
     sev = "critical" if lvl >= 12 else "high" if lvl >= 10 else "medium" if lvl >= 7 else "low"
     agent = (a.get("agent") or {}).get("name", "unknown")
-    # A hospital ingest key decides the tenant. Without a key, the query or the agent group is used (operator only).
-    tenant = g.get("tenant_lock") or request.args.get("tenant") or (a.get("agent") or {}).get("group", "default")
     detail = detect.wazuh_detail(a)
     # Same rule on the same host but a different file/process is a different alert.
     key = f"{agent}|{detail}" if detail else agent
     c = db()
-    i = raise_alert(c, tenant, f"WAZUH:{rid}", sev, f"{rule.get('description', 'Wazuh alert')} ({agent})",
+    i = raise_alert(c, ident["tenant"], f"WAZUH:{rid}", sev, f"{rule.get('description', 'Wazuh alert')} ({agent})",
                     key, a.get("timestamp", now())[:19], None, "wazuh",
                     detail=detail, step=detect.wazuh_step(rid, lvl))
-    c.commit()
-    _notify_new(c, [i] if i else [])
+    commit()
+    _notify_new(db(), [i] if i else [])
     return jsonify(alert_id=i)
 
 
+# ---- Vendor: tenants ------------------------------------------------------------------------------
+
 @app.get("/api/tenants")
 def list_tenants():
+    _require_vendor()
     rows = db().execute("SELECT id, name, created FROM tenants ORDER BY id").fetchall()
     return jsonify([dict(r) for r in rows])
 
 
 @app.post("/api/tenants")
 def create_tenant():
-    body = request.get_json(force=True) or {}
-    tid = (body.get("id") or "").strip()
-    if not TENANT_ID_RE.fullmatch(tid):
-        return jsonify(error="id must be 2 to 63 lowercase letters, digits or hyphens, starting with a letter or digit"), 400
-    name = (body.get("name") or tid).strip()[:120]
+    _require_vendor()
+    body = _body(required=True)
+    tid = _text(body, "id")
+    if not auth.TENANT_ID_RE.fullmatch(tid):
+        raise Refuse(400, "id must be 2 to 63 lowercase letters, digits or hyphens, starting with a letter or digit")
+    if tid == auth.PLATFORM_TENANT:
+        raise Refuse(400, "'platform' is reserved for the vendor")
+    name = _text(body, "name", 120) or tid
     c = db()
     if c.execute("SELECT 1 FROM tenants WHERE id=%s", (tid,)).fetchone():
-        return jsonify(error="tenant already exists"), 409
+        raise Refuse(409, "tenant already exists")
     c.execute("INSERT INTO tenants(id, name) VALUES(%s, %s)", (tid, name))
-    c.commit()
+    audit("tenant.create", tid)
+    commit()
     return jsonify(id=tid, name=name), 201
 
 
-@app.get("/api/tenants/<tid>/keys")
-def list_keys(tid):
-    """Key metadata only. The key itself is shown once, when it is created."""
-    rows = db().execute("SELECT id, label, created, revoked_at FROM ingest_keys WHERE tenant=%s ORDER BY id", (tid,)).fetchall()
+# ---- Hospital admin: users, log sources, credentials ----------------------------------------
+
+@app.get("/api/users")
+def list_users():
+    hospital_scope("hospital_admin")
+    rows = db().execute("SELECT id, username, role, status, created FROM users ORDER BY id").fetchall()
     return jsonify([dict(r) for r in rows])
 
 
-@app.post("/api/tenants/<tid>/keys")
-def create_key(tid):
+@app.post("/api/users")
+def create_user():
+    tenant = hospital_scope("hospital_admin")
+    body = _body(required=True)
+    username = _text(body, "username").lower()
+    role = body.get("role")
+    password = body.get("password")
+    if not auth.USERNAME_RE.fullmatch(username):
+        raise Refuse(400, "username must be 3 to 40 lowercase letters, digits, dots, hyphens or underscores")
+    if role not in auth.HOSPITAL_ROLES:
+        raise Refuse(400, f"role must be one of: {', '.join(auth.HOSPITAL_ROLES)}")
+    problem = auth.password_problem(password)
+    if problem:
+        raise Refuse(400, problem)
     c = db()
-    if not c.execute("SELECT 1 FROM tenants WHERE id=%s", (tid,)).fetchone():
-        return jsonify(error="tenant not found"), 404
-    body = request.get_json(force=True, silent=True) or {}
-    label = (body.get("label") or "").strip()[:80]
-    key = secrets.token_urlsafe(32)
-    cur = c.execute("INSERT INTO ingest_keys(tenant, label, key_hash) VALUES(%s, %s, %s) RETURNING id",
-                    (tid, label, hashlib.sha256(key.encode()).hexdigest()))
-    kid = cur.fetchone()["id"]
-    c.commit()
-    return jsonify(id=kid, tenant=tid, label=label, key=key,
-                   note="Store this key now. It is not shown again."), 201
+    if c.execute("SELECT 1 FROM users WHERE username=%s", (username,)).fetchone():
+        raise Refuse(409, "username already exists in this hospital")
+    row = c.execute("INSERT INTO users(tenant, username, role, password_hash) VALUES(%s, %s, %s, %s) RETURNING id",
+                    (tenant, username, role, auth.hash_password(password))).fetchone()
+    audit("user.create", f"{username} ({role})")
+    commit()
+    return jsonify(id=row["id"], username=username, role=role), 201
 
 
-@app.post("/api/keys/<int:kid>/revoke")
-def revoke_key(kid):
+@app.post("/api/users/<int:uid>/disable")
+def disable_user(uid):
+    hospital_scope("hospital_admin")
+    if uid == g.identity["actor_id"]:
+        raise Refuse(400, "you cannot disable your own account")
     c = db()
-    cur = c.execute("UPDATE ingest_keys SET revoked_at=COALESCE(revoked_at, %s) WHERE id=%s RETURNING id", (now(), kid))
-    if not cur.fetchone():
-        return jsonify(error="key not found"), 404
-    c.commit()
+    row = c.execute("UPDATE users SET status='disabled' WHERE id=%s AND status='active' RETURNING username", (uid,)).fetchone()
+    if not row:
+        raise Refuse(404, "user not found or already disabled")
+    audit("user.disable", row["username"])
+    commit()
     return jsonify(ok=True)
 
 
+@app.get("/api/log-sources")
+def list_log_sources():
+    hospital_scope(*HOSPITAL_READ)
+    rows = db().execute("SELECT id, name, kind, created, disabled_at FROM log_sources ORDER BY id").fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/log-sources")
+def create_log_source():
+    hospital_scope("hospital_admin")
+    body = _body(required=True)
+    name = _text(body, "name")
+    if not name or len(name) > 80:
+        raise Refuse(400, "name must be 1 to 80 characters")
+    kind = _text(body, "kind", 40)
+    c = db()
+    if c.execute("SELECT 1 FROM log_sources WHERE name=%s", (name,)).fetchone():
+        raise Refuse(409, "log source already exists in this hospital")
+    row = c.execute("INSERT INTO log_sources(tenant, name, kind) VALUES(%s, %s, %s) RETURNING id",
+                    (g.identity["tenant"], name, kind)).fetchone()
+    audit("log_source.create", name)
+    commit()
+    return jsonify(id=row["id"], name=name, kind=kind), 201
+
+
+@app.post("/api/log-sources/<int:sid>/disable")
+def disable_log_source(sid):
+    hospital_scope("hospital_admin")
+    c = db()
+    row = c.execute("UPDATE log_sources SET disabled_at=%s WHERE id=%s AND disabled_at IS NULL RETURNING name",
+                    (now(), sid)).fetchone()
+    if not row:
+        raise Refuse(404, "log source not found or already disabled")
+    audit("log_source.disable", row["name"])
+    commit()
+    return jsonify(ok=True)
+
+
+@app.get("/api/credentials")
+def list_credentials():
+    """Ingest keys for this hospital. Metadata only: the key itself is shown once, when it is created."""
+    hospital_scope("hospital_admin")
+    rows = db().execute("SELECT id, label, log_source_id, created, revoked_at FROM ingest_keys ORDER BY id").fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/credentials")
+def create_credential():
+    tenant = hospital_scope("hospital_admin")
+    body = _body(required=True)
+    sid = body.get("log_source_id")
+    if not isinstance(sid, int):
+        raise Refuse(400, "log_source_id must be a number")
+    label = _text(body, "label", 80)
+    c = db()
+    # The log source is looked up under this hospital's identity, so another hospital's source is not found.
+    if not c.execute("SELECT 1 FROM log_sources WHERE id=%s AND disabled_at IS NULL", (sid,)).fetchone():
+        raise Refuse(404, "log source not found")
+    key = secrets.token_urlsafe(32)
+    row = c.execute("INSERT INTO ingest_keys(tenant, label, key_hash, log_source_id) VALUES(%s, %s, %s, %s) RETURNING id",
+                    (tenant, label, auth.token_hash(key), sid)).fetchone()
+    audit("credential.create", f"key {row['id']} for log source {sid}")
+    commit()
+    return jsonify(id=row["id"], log_source_id=sid, label=label, key=key,
+                   note="Store this key now. It is not shown again."), 201
+
+
+@app.post("/api/credentials/<int:kid>/revoke")
+def revoke_credential(kid):
+    hospital_scope("hospital_admin")
+    c = db()
+    row = c.execute("UPDATE ingest_keys SET revoked_at=COALESCE(revoked_at, %s) WHERE id=%s RETURNING id", (now(), kid)).fetchone()
+    if not row:
+        raise Refuse(404, "credential not found")
+    audit("credential.revoke", f"key {kid}")
+    commit()
+    return jsonify(ok=True)
+
+
+# ---- Sessions ------------------------------------------------------------------------------------
+
+@app.post("/api/login")
+def login():
+    body = _body(required=True)
+    tenant = _text(body, "tenant")
+    username = _text(body, "username").lower()
+    password = body.get("password") if isinstance(body.get("password"), str) else ""
+    if not (tenant and username and password):
+        raise Refuse(400, "tenant, username and password are required")
+    c = db()
+    row = c.execute("SELECT * FROM auth_user_for_login(%s, %s)", (tenant, username)).fetchone()
+    stored = row["user_password_hash"] if row else auth.DUMMY_HASH
+    if not auth.verify_password(password, stored) or not row or row["user_status"] != "active":
+        print(f"login refused for tenant {tenant}", file=sys.stderr, flush=True)
+        raise Refuse(401, "invalid tenant, username or password")
+    token = auth.new_token()
+    set_context(row["user_tenant"], row["user_role"], row["user_id"])
+    c.execute("INSERT INTO sessions(token_hash, user_id, expires_at) VALUES (%s, %s, now() + make_interval(secs => %s))",
+              (auth.token_hash(token), row["user_id"], SESSION_HOURS * 3600.0))
+    audit("login")
+    commit()
+    return jsonify(token=token, tenant=row["user_tenant"], role=row["user_role"], username=username,
+                   expires_in_hours=SESSION_HOURS)
+
+
+@app.post("/api/logout")
+def logout():
+    if g.identity["kind"] != "session":
+        raise Refuse(403, "not a user session")
+    c = db()
+    c.execute("DELETE FROM sessions WHERE token_hash=%s", (g.identity["token_hash"],))
+    audit("logout")
+    commit()
+    return jsonify(ok=True)
+
+
+@app.get("/api/me")
+def me():
+    ident = g.identity
+    return jsonify(kind=ident["kind"], username=ident.get("name"), tenant=ident["tenant"], role=ident["role"])
+
+
+# ---- Triage --------------------------------------------------------------------------------------
+
 @app.get("/api/alerts")
 def alerts():
+    tenant = hospital_scope(*HOSPITAL_READ, "vendor_admin")
     # last_handoff: the latest handoff as "from -> to: note", so the dashboard can show it (v0.7.1).
     q = ("SELECT alerts.*, (SELECT from_owner || ' -> ' || to_owner || ': ' || COALESCE(NULLIF(note, ''), 'no note') "
          "FROM handoffs h WHERE h.alert_id = alerts.id ORDER BY h.id DESC LIMIT 1) AS last_handoff "
-         "FROM alerts WHERE 1=1")
-    args = []
-    for f in ("tenant", "status", "owner"):
+         "FROM alerts WHERE tenant=%s")
+    args = [tenant]
+    for f in ("status", "owner"):
         if request.args.get(f):
             q += f" AND {f}=%s"
             args.append(request.args[f])
@@ -378,62 +628,72 @@ def alerts():
 
 @app.post("/api/alerts/<int:i>/ack")
 def ack(i):
+    hospital_scope("hospital_admin", "l1", "l2")
+    _alert_or_404(i)
     c = db()
     c.execute("UPDATE alerts SET status='ack', ack_at=%s WHERE id=%s AND status='new'", (now(), i))
-    c.commit()
+    commit()
     return jsonify(ok=True)
 
 
 @app.post("/api/alerts/<int:i>/verdict")
 def verdict(i):
-    body = request.get_json(force=True) or {}
+    hospital_scope("hospital_admin", "l2")
+    body = _body(required=True)
     v = body.get("verdict")
     if v not in ("tp", "fp", "unclear"):
-        return jsonify(error="verdict must be tp, fp or unclear"), 400
-    note = (body.get("note") or "").strip()[:500]  # optional closing note, kept with the alert
+        raise Refuse(400, "verdict must be tp, fp or unclear")
+    note = _text(body, "note", 500)  # optional closing note, kept with the alert
+    _alert_or_404(i)
     c = db()
     c.execute("UPDATE alerts SET verdict=%s, status='closed', ack_at=COALESCE(ack_at,%s), "
               "resolution=COALESCE(NULLIF(%s,''), resolution) WHERE id=%s", (v, now(), note, i))
-    c.commit()
+    audit("alert.verdict", f"alert {i}: {v}")
+    commit()
     return jsonify(ok=True)
 
 
 @app.get("/api/analysts")
 def analysts():
+    hospital_scope(*HOSPITAL_READ)
     return jsonify(analysts=ANALYSTS)
 
 
 @app.post("/api/alerts/<int:i>/handoff")
 def handoff(i):
     """Pass an open alert to another analyst. The owner changes and the handoff is kept in history."""
-    body = request.get_json(force=True) or {}
-    to = (body.get("to_owner") or "").strip()
-    note = (body.get("note") or "").strip()[:500]
+    hospital_scope("hospital_admin", "l1", "l2")
+    body = _body(required=True)
+    to = _text(body, "to_owner")
+    note = _text(body, "note", 500)
     if to not in ANALYSTS:
-        return jsonify(error=f"to_owner must be one of: {', '.join(ANALYSTS)}"), 400
-    c = db()
-    row = c.execute("SELECT owner, status, tenant FROM alerts WHERE id=%s", (i,)).fetchone()
-    if not row:
-        return jsonify(error="alert not found"), 404
+        raise Refuse(400, f"to_owner must be one of: {', '.join(ANALYSTS)}")
+    row = _alert_or_404(i)
     if row["status"] == "closed":
-        return jsonify(error="alert is closed"), 409
+        raise Refuse(409, "alert is closed")
     if to == row["owner"]:
-        return jsonify(error=f"alert is already owned by {to}"), 400
+        raise Refuse(400, f"alert is already owned by {to}")
+    c = db()
     c.execute("INSERT INTO handoffs(alert_id,at,from_owner,to_owner,note,tenant) VALUES(%s,%s,%s,%s,%s,%s)",
               (i, now(), row["owner"], to, note, row["tenant"]))
     c.execute("UPDATE alerts SET owner=%s WHERE id=%s", (to, i))
-    c.commit()
+    audit("alert.handoff", f"alert {i} to {to}")
+    commit()
     return jsonify(ok=True, from_owner=row["owner"], to_owner=to)
 
 
 @app.get("/api/alerts/<int:i>/handoffs")
 def handoffs(i):
+    hospital_scope(*HOSPITAL_READ, "vendor_admin")
+    _alert_or_404(i)
     rows = db().execute("SELECT at, from_owner, to_owner, note FROM handoffs WHERE alert_id=%s ORDER BY id", (i,)).fetchall()
     return jsonify([dict(r) for r in rows])
 
 
+# ---- Metrics and exit criteria -----------------------------------------------------------------
+
 def _metrics(tenant=None):
-    """Counts for one hospital (tenant given) or for all of them (tenant None)."""
+    """Counts for one hospital (tenant given) or for all of them (tenant None). Row-level security applies too."""
     c = db()
     p = {"t": tenant}
     scope = "(%(t)s::text IS NULL OR tenant = %(t)s)"  # NULL means no filter
@@ -469,7 +729,7 @@ def _metrics(tenant=None):
 
 @app.get("/api/metrics")
 def metrics():
-    return jsonify(_metrics(request.args.get("tenant") or None))
+    return jsonify(_metrics(hospital_scope(*HOSPITAL_READ, "vendor_admin")))
 
 
 def _gate_results(m, tenant=None):
@@ -512,38 +772,59 @@ def _gate_results(m, tenant=None):
 
 @app.get("/api/exit-criteria")
 def exit_criteria():
-    tenant = request.args.get("tenant") or None
+    tenant = hospital_scope(*HOSPITAL_READ, "vendor_admin")
     m = _metrics(tenant)
     gates = _gate_results(m, tenant)
     return jsonify(gates=gates, all_pass=all(g["status"] == "pass" for g in gates), fp_target=_fp_target())
 
 
+# ---- Lab-only endpoints (owner role, vendor admin only) ---------------------------------------------
+
+def _lab_connection():
+    url = os.environ.get("LAB_DATABASE_URL", "")
+    if not url:
+        raise Refuse(503, "lab endpoints need LAB_DATABASE_URL (the owner role); they are not available here")
+    return connect(url)
+
+
 @app.post("/api/demo")
 def demo():
     """Load synthetic logs + planted attacks (lab only)."""
+    _require_vendor()
     generated = generate.generate()
     evs = generated if isinstance(generated, list) else [generated]
-    c = db()
-    made_ids = _store_events(c, evs)
-    c.commit()
-    _notify_new(c, made_ids)
+    c = _lab_connection()
+    try:
+        made_ids = _store_events(c, evs)
+        c.commit()
+        _notify_new(c, made_ids)
+    finally:
+        c.close()
     return jsonify(events=len(evs), alerts_created=len(made_ids))
 
 
 @app.post("/api/autolabel")
 def autolabel():
     """Lab shortcut: label alerts from planted ground truth. Real triage uses manual verdicts."""
-    c = db()
-    c.execute("UPDATE alerts SET verdict=CASE WHEN attack_id IS NOT NULL THEN 'tp' ELSE 'fp' END WHERE verdict IS NULL AND source='builtin'")
-    c.commit()
+    _require_vendor()
+    c = _lab_connection()
+    try:
+        c.execute("UPDATE alerts SET verdict=CASE WHEN attack_id IS NOT NULL THEN 'tp' ELSE 'fp' END WHERE verdict IS NULL AND source='builtin'")
+        c.commit()
+    finally:
+        c.close()
     return jsonify(ok=True)
 
 
 @app.post("/api/reset")
 def reset():
-    c = db()
-    c.execute("TRUNCATE events, alerts, handoffs RESTART IDENTITY")
-    c.commit()
+    _require_vendor()
+    c = _lab_connection()
+    try:
+        c.execute("TRUNCATE events, alerts, handoffs RESTART IDENTITY")
+        c.commit()
+    finally:
+        c.close()
     return jsonify(ok=True)
 
 

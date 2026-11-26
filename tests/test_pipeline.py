@@ -1,10 +1,21 @@
 import json, os
-import psycopg
-import app as soc
 
-c = soc.app.test_client()
+import psycopg
+import pytest
+
+import app as soc
+import migrate
+from support import APP_PASSWORD, Api, CITY, ORTHO
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "wazuh_92213_psscriptpolicy.json")
+
+c = None
+
+
+@pytest.fixture(autouse=True)
+def _api(world):
+    global c
+    c = Api(world)
 
 
 def wazuh_sample():
@@ -15,9 +26,12 @@ def wazuh_sample():
 def test_demo_detects_all_planted_attacks():
     c.post("/api/reset")
     assert c.post("/api/demo").get_json()["alerts_created"] > 0
-    m = c.get("/api/metrics").get_json()
-    assert m["planted_attacks"] == 3 and m["detection_rate"] == 1.0
-    rules = {a["rule"] for a in c.get("/api/alerts").get_json()}
+    city = c.get("/api/metrics").get_json()  # City: one planted attack (bruteforce)
+    assert city["planted_attacks"] == 1 and city["detection_rate"] == 1.0
+    ortho = Api(c.world, ORTHO).get("/api/metrics").get_json()  # Ortho: bulk access + suspicious process
+    assert ortho["planted_attacks"] == 2 and ortho["detection_rate"] == 1.0
+    rules = {a["rule"] for a in c.get("/api/alerts").get_json()} | \
+        {a["rule"] for a in Api(c.world, ORTHO).get("/api/alerts").get_json()}
     assert {"FAILED_LOGIN_BURST", "BULK_RECORD_ACCESS", "SUSPICIOUS_PROCESS"} <= rules
 
 
@@ -28,7 +42,7 @@ def test_every_alert_has_owner_and_step():
 
 def test_lone_failed_login_does_not_alert():
     c.post("/api/reset")
-    c.post("/api/events", json=[dict(ts="2026-11-18T11:00:00", tenant="t1", source="auth", type="auth_fail", user="dr.1", ip="10.0.0.5")])
+    c.post("/api/events", json=[dict(ts="2026-11-18T11:00:00", tenant=CITY, source="auth", type="auth_fail", user="dr.1", ip="10.0.0.5")])
     assert c.get("/api/metrics").get_json()["alerts"] == 0
 
 
@@ -44,16 +58,16 @@ def test_ack_verdict_and_fp_rate():
 
 def test_wazuh_webhook_lands_in_queue():
     c.post("/api/reset")
-    r = c.post("/api/ingest/wazuh?tenant=city-hospital", json={"rule": {"id": "5712", "level": 10, "description": "sshd brute force"},
-                                                              "agent": {"name": "ehr-01"}, "timestamp": "2026-11-18T11:00:00.000+0000"})
+    r = c.post("/api/ingest/wazuh", json={"rule": {"id": "5712", "level": 10, "description": "sshd brute force"},
+                                          "agent": {"name": "ehr-01"}, "timestamp": "2026-11-18T11:00:00.000+0000"})
     assert r.get_json()["alert_id"]
-    a = c.get("/api/alerts?tenant=city-hospital").get_json()[0]
+    a = c.get("/api/alerts").get_json()[0]
     assert a["severity"] == "high" and a["source"] == "wazuh" and a["owner"]
 
 
 def test_real_wazuh_alert_has_detail_and_specific_step():
     c.post("/api/reset")
-    aid = c.post("/api/ingest/wazuh?tenant=city-hospital", json=wazuh_sample()).get_json()["alert_id"]
+    aid = c.post("/api/ingest/wazuh", json=wazuh_sample()).get_json()["alert_id"]
     a = next(x for x in c.get("/api/alerts").get_json() if x["id"] == aid)
     assert a["rule"] == "WAZUH:92213" and a["severity"] == "critical"
     assert "__PSScriptPolicyTest_" in a["detail"]
@@ -63,66 +77,53 @@ def test_real_wazuh_alert_has_detail_and_specific_step():
 def test_same_file_is_deduped_but_a_different_file_alerts():
     c.post("/api/reset")
     body = wazuh_sample()
-    assert c.post("/api/ingest/wazuh?tenant=city-hospital", json=body).get_json()["alert_id"]
-    assert c.post("/api/ingest/wazuh?tenant=city-hospital", json=body).get_json()["alert_id"] is None
+    assert c.post("/api/ingest/wazuh", json=body).get_json()["alert_id"]
+    assert c.post("/api/ingest/wazuh", json=body).get_json()["alert_id"] is None
     body["data"]["win"]["eventdata"]["targetFilename"] = "C:\\Users\\win10\\Downloads\\invoice.exe"
-    assert c.post("/api/ingest/wazuh?tenant=city-hospital", json=body).get_json()["alert_id"]
+    assert c.post("/api/ingest/wazuh", json=body).get_json()["alert_id"]
     assert len(c.get("/api/alerts").get_json()) == 2
 
 
-def test_lab_endpoints_can_be_disabled():
-    soc.LAB_ENDPOINTS = False
-    try:
-        assert c.post("/api/reset").status_code == 404
-        assert c.post("/api/demo").status_code == 404
-        assert c.get("/api/metrics").status_code == 200
-    finally:
-        soc.LAB_ENDPOINTS = True
+def test_lab_endpoints_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(soc, "LAB_ENDPOINTS", False)
+    assert c.post("/api/reset").status_code == 404
+    assert c.post("/api/demo").status_code == 404
+    assert c.get("/api/metrics").status_code == 200
 
 
-def test_old_database_gets_new_columns(scratch_db, monkeypatch):
-    # Old event and alert tables must gain the pilot-rule fields in place.
+def test_old_database_gets_new_columns(scratch_db):
+    # Old event and alert tables must gain the pilot-rule and identity fields in place.
     with psycopg.connect(scratch_db) as old:
         old.execute("""CREATE TABLE alerts(id BIGSERIAL PRIMARY KEY, created TEXT, event_ts TEXT, tenant TEXT, rule TEXT,
           severity TEXT, summary TEXT, dkey TEXT, owner TEXT, step TEXT, status TEXT DEFAULT 'new',
           ack_at TEXT, verdict TEXT, attack_id TEXT, source TEXT DEFAULT 'builtin')""")
         old.execute('''CREATE TABLE events(id BIGSERIAL PRIMARY KEY, ts TEXT, tenant TEXT, source TEXT, type TEXT,
           "user" TEXT, host TEXT, ip TEXT, patient TEXT, detail TEXT, attack_id TEXT)''')
-    monkeypatch.setenv("DATABASE_URL", scratch_db)
-    conn = soc.connect()
-    try:
-        cols = {r["column_name"] for r in conn.execute(
+    migrate.migrate(scratch_db, APP_PASSWORD)
+    with psycopg.connect(scratch_db) as conn:
+        cols = {r[0] for r in conn.execute(
             "SELECT column_name FROM information_schema.columns WHERE table_name='alerts'").fetchall()}
-    finally:
-        conn.close()
-    assert {"detail", "resolution", "rule_version"} <= cols
-    conn = soc.connect()
-    try:
-        event_cols = {r["column_name"] for r in conn.execute(
+        event_cols = {r[0] for r in conn.execute(
             "SELECT column_name FROM information_schema.columns WHERE table_name='events'").fetchall()}
-    finally:
-        conn.close()
+    assert {"detail", "resolution", "rule_version"} <= cols
     assert {"destination", "data_classification", "destination_approved", "src_zone", "dst_zone",
-            "boundary_violation", "approved_change"} <= event_cols
+            "boundary_violation", "approved_change", "log_source_id"} <= event_cols
 
 
-def test_api_token_gates_api_but_not_dashboard():
-    soc.API_TOKEN = "s3cret"
-    try:
-        assert c.get("/api/metrics").status_code == 401
-        assert c.get("/api/metrics", headers={"Authorization": "Bearer wrong"}).status_code == 401
-        assert c.get("/api/metrics", headers={"Authorization": "Bearer s3cret"}).status_code == 200
-        assert c.get("/").status_code == 200
-    finally:
-        soc.API_TOKEN = ""
+def test_every_api_call_needs_a_session_or_an_ingest_key(world):
+    assert world.client.get("/api/metrics").status_code == 401
+    assert world.client.get("/api/metrics", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert world.client.get("/api/metrics", headers=world.session(CITY, "viewer")).status_code == 200
+    assert world.client.get("/").status_code == 200  # the dashboard page itself is public
 
 
-def test_wazuh_ingest_accepts_query_token_when_gated():
+def test_wazuh_ingest_accepts_key_in_query_only_on_ingest_paths(world):
     c.post("/api/reset")
-    soc.API_TOKEN = "s3cret"
-    try:
-        assert c.post("/api/ingest/wazuh?tenant=city-hospital", json=wazuh_sample()).status_code == 401
-        r = c.post("/api/ingest/wazuh?tenant=city-hospital&token=s3cret", json=wazuh_sample())
-        assert r.status_code == 200 and r.get_json()["alert_id"]
-    finally:
-        soc.API_TOKEN = ""
+    assert world.client.post("/api/ingest/wazuh", json=wazuh_sample()).status_code == 401
+    r = world.client.post(f"/api/ingest/wazuh?token={world.ingest_token(CITY)}", json=wazuh_sample())
+    assert r.status_code == 200 and r.get_json()["alert_id"]
+    # A user session is not an ingest key, even in the query string.
+    token = world.session(CITY, "hospital_admin")["Authorization"].split()[1]
+    assert world.client.post(f"/api/ingest/wazuh?token={token}", json=wazuh_sample()).status_code == 403
+    # Query-string keys are not accepted outside ingest.
+    assert world.client.get(f"/api/metrics?token={world.ingest_token(CITY)}").status_code == 401

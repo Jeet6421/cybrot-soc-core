@@ -4,7 +4,8 @@ Compares the stored event count before and after the run. Run it against an inst
 or the count will include that traffic. Standard library only.
 
 Usage:
-    python scripts/load_test.py http://localhost:5000 --events 5000 --batch 500 --token "$SOC_API_TOKEN"
+    python scripts/load_test.py http://localhost:5000 --events 5000 --batch 500 \
+        --ingest-key "$INGEST_KEY" --session "$SOC_SESSION"
 
 Exit code 0 when every event sent was stored, 1 otherwise.
 """
@@ -44,8 +45,10 @@ def run(post, get, n=1000, batch=250, now=None):
             "seconds": round(seconds, 2), "events_per_second": round(sent / seconds, 1) if seconds else None}
 
 
-def http_client(base_url, token):
-    def call(method, path, body=None):
+def http_client(base_url, ingest_key, session_token):
+    """post() sends events with the hospital's ingest key. get() reads with a user session (a logged-in token).
+    Keys can only send events, and sessions cannot send events, so each call uses the one it is allowed."""
+    def call(method, path, body=None, token=None):
         headers = {"Content-Type": "application/json"}
         if token:
             headers["Authorization"] = "Bearer " + token
@@ -53,7 +56,7 @@ def http_client(base_url, token):
         req = urllib.request.Request(base_url.rstrip("/") + path, data=data, headers=headers, method=method)
         with urllib.request.urlopen(req, timeout=120) as resp:
             return json.loads(resp.read() or b"null")
-    return (lambda p, b: call("POST", p, b)), (lambda p: call("GET", p))
+    return (lambda p, b: call("POST", p, b, ingest_key)), (lambda p: call("GET", p, None, session_token))
 
 
 def main(argv=None):
@@ -61,9 +64,10 @@ def main(argv=None):
     ap.add_argument("base_url", nargs="?", default="http://localhost:5000")
     ap.add_argument("--events", type=int, default=1000)
     ap.add_argument("--batch", type=int, default=250)
-    ap.add_argument("--token", default=os.environ.get("SOC_API_TOKEN", ""))
+    ap.add_argument("--ingest-key", default=os.environ.get("SOC_INGEST_KEY", ""), help="hospital ingest key (sends events)")
+    ap.add_argument("--session", default=os.environ.get("SOC_SESSION", ""), help="user session token (reads metrics)")
     args = ap.parse_args(argv)
-    post, get = http_client(args.base_url, args.token)
+    post, get = http_client(args.base_url, args.ingest_key, args.session)
     r = run(post, get, args.events, args.batch)
     print(f"sent {r['sent']}, stored {r['stored']}, lost {r['lost']}")
     print(f"time {r['seconds']} s, {r['events_per_second']} events/s")

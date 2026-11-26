@@ -4,46 +4,101 @@
 :root{--bg:#f6f8fa;--card:#fff;--tx:#1b2733;--mut:#667;--bd:#d8e0e6;--ac:#1f7a8c}
 @media(prefers-color-scheme:dark){:root{--bg:#10161c;--card:#18212a;--tx:#e6edf3;--mut:#9aa7b3;--bd:#2b3743}}
 body{margin:0;font:14px system-ui,sans-serif;background:var(--bg);color:var(--tx);padding:16px}
-h1{font-size:18px;margin:0 0 12px}.row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+h1{font-size:18px;margin:0 0 12px}.row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:10px 14px;min-width:120px}
 .card b{display:block;font-size:20px}.card span{color:var(--mut);font-size:12px}
-button,select{background:var(--card);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;cursor:pointer}
-button.p{background:var(--ac);color:#fff;border-color:var(--ac)}
+button,select,input{background:var(--card);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;font:inherit}
+button{cursor:pointer}button.p{background:var(--ac);color:#fff;border-color:var(--ac)}
 .wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;background:var(--card)}
 th,td{padding:6px 8px;border-bottom:1px solid var(--bd);text-align:left;vertical-align:top}
 th{font-size:12px;color:var(--mut)}.sev{font-weight:600}.critical{color:#c0392b}.high{color:#d35400}.medium{color:#b7950b}.low{color:var(--mut)}
 small{color:var(--mut)}
 .gate b{font-size:14px}.gate.pass b{color:#1e8449}.gate.fail b{color:#c0392b}
+#login{max-width:340px;margin:40px auto}#login input{width:100%;box-sizing:border-box;margin:4px 0 10px}
+#login .err{color:#c0392b;min-height:1.2em}
+.hidden{display:none}
 </style></head><body>
-<h1>Cybrot SOC Core <small>- prototype, test data only</small></h1>
+<div id="login" class="hidden card">
+  <h1>Sign in to Cybrot SOC Core</h1>
+  <form onsubmit="signIn(event)">
+    <label>Hospital (tenant id)<input id="li-tenant" autocomplete="organization" required></label>
+    <label>Username<input id="li-user" autocomplete="username" required></label>
+    <label>Password<input id="li-pass" type="password" autocomplete="current-password" required></label>
+    <button class="p" type="submit">Sign in</button>
+    <div class="err" id="li-err"></div>
+  </form>
+  <small>Test data only. Accounts are created by a hospital admin; the vendor admin uses the platform tenant.</small>
+</div>
+<main id="app" class="hidden">
 <div class="row">
-<button class="p" onclick="act('/api/demo')">Load demo data</button>
-<button onclick="act('/api/autolabel')">Auto-label (lab)</button>
-<button onclick="if(confirm('Delete all events and alerts?'))act('/api/reset')">Reset</button>
-<select id="tn" onchange="load()"><option value="">All hospitals</option><option>city-hospital</option><option>ortho-clinic</option></select>
+<h1 style="margin:0">Cybrot SOC Core <small>- prototype, test data only</small></h1>
+<span id="who" style="margin-left:auto"></span>
+<button onclick="signOut()">Sign out</button>
+</div>
+<div class="row">
+<button class="p" onclick="act('/api/demo')">Load demo data (vendor, lab)</button>
+<button onclick="act('/api/autolabel')">Auto-label (vendor, lab)</button>
+<button onclick="if(confirm('Delete all events and alerts?'))act('/api/reset')">Reset (vendor, lab)</button>
 <select id="st" onchange="load()"><option value="">All status</option><option>new</option><option>ack</option><option>closed</option></select>
 </div>
 <div class="row" id="m"></div>
 <div class="row" id="g"></div>
-<div class="wrap"><table><thead><tr><th>#</th><th>Sev</th><th>Rule</th><th>Hospital</th><th>Summary</th><th>Owner</th><th>Response step</th><th>Status</th><th>Verdict</th><th></th></tr></thead><tbody id="t"></tbody></table></div>
+<div class="wrap"><table><thead><tr><th>#</th><th>Sev</th><th>Rule</th><th>Summary</th><th>Owner</th><th>Response step</th><th>Status</th><th>Verdict</th><th></th></tr></thead><tbody id="t"></tbody></table></div>
+</main>
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-let TOKEN=sessionStorage.getItem("soc_token")||"", locked=false;
+let TOKEN=sessionStorage.getItem("soc_token")||"", ME=null, ANALYSTS=[], timer=null;
+
+// Every call carries the session token. A 401 means the session ended: show the sign-in form again.
 async function api(u,opts={}){
   const h={"Content-Type":"application/json"};
   if(TOKEN)h.Authorization="Bearer "+TOKEN;
   const r=await fetch(u,{...opts,headers:h});
-  if(r.status===401&&!locked){
-    const t=prompt("API token for this SOC Core instance (cancel to lock)");
-    if(!t){locked=true;$("#m").innerHTML='<div class="card"><b>Locked</b><span>reload the page to enter the API token</span></div>';return r}
-    TOKEN=t;sessionStorage.setItem("soc_token",t);return api(u,opts);
-  }
+  if(r.status===401&&TOKEN){ showLogin("Your session ended. Sign in again."); }
   return r;
 }
-async function act(u,b){await api(u,{method:"POST",body:JSON.stringify(b||{})});load()}
+function showLogin(msg){
+  TOKEN="";ME=null;try{sessionStorage.removeItem("soc_token")}catch(e){}
+  clearInterval(timer);$("#app").classList.add("hidden");$("#login").classList.remove("hidden");
+  $("#li-err").textContent=msg||"";
+}
+function showApp(){$("#login").classList.add("hidden");$("#app").classList.remove("hidden");}
+async function signIn(e){
+  e.preventDefault();
+  const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({tenant:$("#li-tenant").value.trim(),username:$("#li-user").value.trim(),password:$("#li-pass").value})});
+  if(!r.ok){$("#li-err").textContent="Sign-in failed: check the hospital, username and password.";return}
+  const j=await r.json();TOKEN=j.token;
+  try{sessionStorage.setItem("soc_token",TOKEN)}catch(e){}
+  $("#li-pass").value="";
+  await start();
+}
+async function signOut(){
+  if(TOKEN){await fetch("/api/logout",{method:"POST",headers:{Authorization:"Bearer "+TOKEN}})}
+  showLogin("Signed out.");
+}
+async function start(){
+  const me=await api("/api/me");
+  if(!me.ok){showLogin("");return}
+  ME=await me.json();
+  $("#who").textContent=`${ME.username} · ${ME.tenant} · ${ME.role}`;
+  showApp();
+  const an=await api("/api/analysts");ANALYSTS=an.ok?(await an.json()).analysts:[];
+  await load();clearInterval(timer);timer=setInterval(load,5000);
+}
+async function act(u,b){
+  const r=await api(u,{method:"POST",body:JSON.stringify(b||{})});
+  if(!r.ok){alert("Not allowed: "+((await r.json().catch(()=>({}))).error||r.status))}
+  load();
+}
 async function load(){
-  const mr=await api("/api/metrics");if(!mr.ok)return;const m=await mr.json();
+  const mr=await api("/api/metrics");
+  if(!mr.ok){
+    $("#m").innerHTML=`<div class="card"><b>No hospital data</b><span>${esc((await mr.json().catch(()=>({}))).error||"your role has no metrics view")}</span></div>`;
+    $("#g").innerHTML="";$("#t").innerHTML="";return;
+  }
+  const m=await mr.json();
   const pct=x=>x==null?"-":Math.round(x*100)+"%";
   const cards=[["Events",m.events],["Alerts",m.alerts],["Unacknowledged",m.unacknowledged],["Unlabeled",m.unlabeled],
    ["False-positive rate",pct(m.false_positive_rate)],["Attacks detected",m.detected_attacks+" / "+m.planted_attacks],
@@ -52,24 +107,23 @@ async function load(){
   const gr=await api("/api/exit-criteria");
   if(gr.ok){const g=await gr.json();
     $("#g").innerHTML=g.gates.map(x=>`<div class="card gate ${x.status}"><b>${esc(x.name)}</b><span>${x.status.replace("_"," ")}: ${esc(x.detail)}</span></div>`).join("");}
-  const p=new URLSearchParams();if($("#tn").value)p.set("tenant",$("#tn").value);if($("#st").value)p.set("status",$("#st").value);
+  const p=new URLSearchParams();if($("#st").value)p.set("status",$("#st").value);
   const ar=await api("/api/alerts?"+p);if(!ar.ok)return;const a=await ar.json();
-  $("#t").innerHTML=a.map(x=>`<tr><td>${x.id}</td><td class="sev ${x.severity}">${x.severity}</td><td>${esc(x.rule)}</td><td>${esc(x.tenant)}</td>
+  const can=ME&&["hospital_admin","l1","l2"].includes(ME.role), isL2=ME&&["hospital_admin","l2"].includes(ME.role);
+  $("#t").innerHTML=a.map(x=>`<tr><td>${x.id}</td><td class="sev ${x.severity}">${x.severity}</td><td>${esc(x.rule)}</td>
    <td>${esc(x.summary)}${x.detail?`<br><small>${esc(x.detail)}</small>`:""}${x.resolution?`<br><small>Note: ${esc(x.resolution)}</small>`:""}${x.last_handoff?`<br><small>Handoff: ${esc(x.last_handoff)}</small>`:""}</td><td>${esc(x.owner)}</td><td><small>${esc(x.step)}</small></td><td>${x.status}</td><td>${x.verdict||"-"}</td>
-   <td>${x.status=="new"?`<button onclick="act('/api/alerts/${x.id}/ack')">Ack</button> `:""}
-   <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'tp'})">TP</button>
+   <td>${can&&x.status=="new"?`<button onclick="act('/api/alerts/${x.id}/ack')">Ack</button> `:""}
+   ${isL2?`<button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'tp'})">TP</button>
    <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'fp'})">FP</button>
-   <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'unclear'})">?</button>
-   ${x.status!="closed"?`<button onclick="handoff(${x.id})">Hand off</button>`:""}</td></tr>`).join("");
+   <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'unclear'})">?</button>`:""}
+   ${can&&x.status!="closed"?`<button onclick="handoff(${x.id})">Hand off</button>`:""}</td></tr>`).join("");
 }
 async function handoff(id){
   const to=prompt("Hand off to (one of: "+ANALYSTS.join(", ")+")");if(!to)return;
   const note=prompt("Handoff note: what the next owner should do")||"";
   const r=await api(`/api/alerts/${id}/handoff`,{method:"POST",body:JSON.stringify({to_owner:to.trim(),note})});
-  if(!r.ok){alert("Handoff refused: "+((await r.json()).error||r.status))}
+  if(!r.ok){alert("Handoff refused: "+((await r.json().catch(()=>({}))).error||r.status))}
   load();
 }
-let ANALYSTS=[];
-api("/api/analysts").then(r=>r.ok?r.json():{analysts:[]}).then(j=>{ANALYSTS=j.analysts||[]});
-load();setInterval(load,5000);
+if(TOKEN){start()}else{showLogin("")}
 </script></body></html>

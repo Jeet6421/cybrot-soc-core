@@ -1,13 +1,23 @@
-import app as soc
+import os
+
+import psycopg
+import pytest
+
+from support import Api, CITY
+
+c = None
 
 
-c = soc.app.test_client()
+@pytest.fixture(autouse=True)
+def _api(world):
+    global c
+    c = Api(world)
 
 
 def event(type_, **kwargs):
     return {
         "ts": "2026-11-20T10:00:00",
-        "tenant": "city-hospital",
+        "tenant": CITY,
         "source": "synthetic",
         "type": type_,
         **kwargs,
@@ -19,7 +29,7 @@ def reset():
 
 
 def alerts():
-    return c.get("/api/alerts?tenant=city-hospital").get_json()
+    return c.get(f"/api/alerts?tenant={CITY}").get_json()
 
 
 def test_hc_end_001_detects_50_distinct_file_changes_in_five_minutes():
@@ -116,11 +126,13 @@ def test_rule_events_persist_normalized_clinical_context():
                     destination="unknown.example", destination_approved=False)
     c.post("/api/events", json=payload)
 
-    with soc.connect() as conn:
-        row = conn.execute(
-            "SELECT destination, data_classification, destination_approved FROM events WHERE type='data_transfer'"
+    # Read as the owner: the runtime role only sees rows of the hospital its identity names.
+    with psycopg.connect(os.environ["MIGRATE_DATABASE_URL"]) as owner:
+        row = owner.execute(
+            "SELECT destination, data_classification, destination_approved FROM events WHERE type='data_transfer' "
+            "ORDER BY id DESC LIMIT 1"
         ).fetchone()
 
-    assert row["destination"] == "unknown.example"
-    assert row["data_classification"] == "patient_data"
-    assert row["destination_approved"] is False
+    assert row[0] == "unknown.example"
+    assert row[1] == "patient_data"
+    assert row[2] is False

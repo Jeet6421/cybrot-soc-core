@@ -4,8 +4,10 @@ Posts three known attack patterns and checks that each one raises the expected a
 single failed login stays quiet. Lab use only: events are tagged with attack_id so the detection gate can
 measure them. Do not run against an instance that holds real data.
 
-Usage:
-    python scripts/attack_sim.py http://localhost:5000 --token "$SOC_API_TOKEN"
+Usage (the hospital's ingest key sends events; a session of a hospital user reads the results):
+    python scripts/attack_sim.py http://localhost:5000 --ingest-key "$INGEST_KEY" --session "$SOC_SESSION"
+
+Get a session with POST /api/login {"tenant", "username", "password"}; the token in the reply is the session.
 
 Exit code 0 when every simulation passes, 1 otherwise. Standard library only.
 """
@@ -76,8 +78,10 @@ def run(post, get, now=None):
     return results
 
 
-def http_client(base_url, token):
-    def call(method, path, body=None):
+def http_client(base_url, ingest_key, session_token):
+    """post() sends events with the hospital's ingest key. get() reads with a user session (a logged-in token).
+    Keys can only send events, and sessions cannot send events, so each call uses the one it is allowed."""
+    def call(method, path, body=None, token=None):
         headers = {"Content-Type": "application/json"}
         if token:
             headers["Authorization"] = "Bearer " + token
@@ -85,15 +89,16 @@ def http_client(base_url, token):
         req = urllib.request.Request(base_url.rstrip("/") + path, data=data, headers=headers, method=method)
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read() or b"null")
-    return (lambda p, b: call("POST", p, b)), (lambda p: call("GET", p))
+    return (lambda p, b: call("POST", p, b, ingest_key)), (lambda p: call("GET", p, None, session_token))
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Run scripted attack simulations against SOC Core.")
     ap.add_argument("base_url", nargs="?", default="http://localhost:5000")
-    ap.add_argument("--token", default=os.environ.get("SOC_API_TOKEN", ""))
+    ap.add_argument("--ingest-key", default=os.environ.get("SOC_INGEST_KEY", ""), help="hospital ingest key (sends events)")
+    ap.add_argument("--session", default=os.environ.get("SOC_SESSION", ""), help="user session token (reads alerts)")
     args = ap.parse_args(argv)
-    post, get = http_client(args.base_url, args.token)
+    post, get = http_client(args.base_url, args.ingest_key, args.session)
     results = run(post, get)
     for r in results:
         print(f"{'PASS' if r['passed'] else 'FAIL'}  {r['scenario']}")

@@ -8,4 +8,4 @@
    The Windows tuning rule (100200) is untested: run `wazuh-logtest` on
    `tests/fixtures/wazuh_92213_psscriptpolicy.json`'s event and confirm it is suppressed before relying on it.
 5. Add `ossec_integration.xml` to `ossec.conf`, restart the manager. Alerts level 7+ now appear in SOC Core's queue.
-6. Use one agent group per hospital and set `?tenant=` per hook (one integration block per hospital) for now.
+6. Use one ingest key per hospital (or per Wazuh manager) and put it in the integration URL as `?token=<ingest key>`. The key decides the hospital; `tenant` in the URL is ignored.
