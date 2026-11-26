@@ -36,11 +36,13 @@ def hash_password(password):
     return f"scrypt${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}${_b64(salt)}${_b64(digest)}"
 
 
-def _decode_hash_component(value):
-    try:
-        return bytes.fromhex(value)
-    except ValueError:
-        return _unb64(value)
+def _decode_hash_component(value, hex_length):
+    if len(value) == hex_length:
+        try:
+            return bytes.fromhex(value)
+        except ValueError:
+            pass
+    return _unb64(value)
 
 
 def verify_password(password, stored):
@@ -51,8 +53,8 @@ def verify_password(password, stored):
             return False
         # PR #16 stored salt and digest as hex; the main branch's MFA helpers use base64.
         # Accept both encodings so existing accounts remain able to sign in after the merge.
-        salt = _decode_hash_component(salt_b)
-        expected = _decode_hash_component(digest_b)
+        salt = _decode_hash_component(salt_b, 32)
+        expected = _decode_hash_component(digest_b, 64)
         candidate = _scrypt(password, salt, int(n), int(r), int(p))
         return hmac.compare_digest(candidate, expected)
     except (ValueError, TypeError):
