@@ -9,7 +9,7 @@ The tenant always comes from the caller's identity. A tenant_id in the query can
 anything else is refused with 403 before a query runs. PostgreSQL row-level security enforces the same rule
 underneath: every transaction carries the identity in transaction-local settings (see db/schema.sql).
 """
-import json, os, secrets, sys, threading, time, urllib.error, urllib.request
+import json, os, secrets, sys, threading, time, urllib.error, urllib.request, uuid
 from datetime import datetime, timezone
 
 import psycopg
@@ -193,10 +193,54 @@ def _fp_target():
 
 
 def audit(action, detail=""):
-    """One row in the audit log, for the identity that is currently bound."""
+    """One row in the legacy audit log, for the identity that is currently bound."""
     ctx = g.ctx
     db().execute("INSERT INTO audit_log(tenant, actor_id, action, detail) VALUES (%s, %s, %s, %s)",
                  (ctx["tenant"], ctx["actor_id"], action, detail[:300]))
+
+
+_AUDIT_VERDICTS = {"tp", "fp", "unclear"}
+_AUDIT_STATUSES = {"new", "ack", "closed"}
+
+
+def redact_audit_metadata(metadata):
+    """Keep only known, non-sensitive audit facts; free text, secrets, and PHI are dropped."""
+    if not isinstance(metadata, dict):
+        return {}
+    safe = {}
+    verdict = metadata.get("verdict")
+    if verdict in _AUDIT_VERDICTS:
+        safe["verdict"] = verdict
+    status = metadata.get("status")
+    if status in _AUDIT_STATUSES:
+        safe["status"] = status
+    return safe
+
+
+def _session_audit_actor():
+    identity = g.get("identity")
+    if not identity or identity.get("kind") != "session" or identity.get("actor_id") is None:
+        raise Refuse(401, "an authenticated user session is required")
+    return identity
+
+
+def record_audit_event(db_session, *, tenant_id, actor_id, actor_role, action, resource_type,
+                       resource_id, resource_classification, outcome="allow", auth_context="session",
+                       break_glass_grant_id=None, metadata=None, source_ip=None, device_id=None):
+    """Append one redacted audit event using the caller's transaction."""
+    if outcome not in ("allow", "deny", "error"):
+        raise ValueError("invalid audit outcome")
+    if auth_context not in ("session", "break_glass", "ingest_key", "system"):
+        raise ValueError("invalid audit authentication context")
+    safe_metadata = json.dumps(redact_audit_metadata(metadata), sort_keys=True, separators=(",", ":"))
+    db_session.execute(
+        "INSERT INTO audit_events(tenant_id, actor_id, actor_role, auth_context, break_glass_grant_id, "
+        "action, resource_type, resource_id, resource_classification, outcome, metadata, request_id, "
+        "source_ip, device_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)",
+        (tenant_id, actor_id, actor_role, auth_context, break_glass_grant_id, action, resource_type,
+         str(resource_id) if resource_id is not None else None, resource_classification, outcome,
+         safe_metadata, uuid.uuid4().hex, source_ip, device_id))
 
 
 def raise_alert(c, tenant, rule, sev, summary, key, event_ts, attack_id=None, source="builtin",
@@ -834,9 +878,16 @@ def alert_detail(i):
 @app.post("/api/alerts/<int:i>/ack")
 def ack(i):
     hospital_scope("hospital_admin", "l1", "l2")
+    actor = _session_audit_actor()
     _alert_or_404(i)
     c = db()
-    c.execute("UPDATE alerts SET status='ack', ack_at=%s WHERE id=%s AND status='new'", (now(), i))
+    c.execute("UPDATE alerts SET status='ack', ack_at=%s, acknowledged_by=%s, acknowledged_at=now() "
+              "WHERE id=%s AND status='new'", (now(), actor["actor_id"], i))
+    record_audit_event(
+        c, tenant_id=g.ctx["tenant"], actor_id=actor["actor_id"], actor_role=actor["role"],
+        action="alert.ack", resource_type="alert", resource_id=i, resource_classification="telemetry",
+        metadata={"status": "ack"}, source_ip=request.remote_addr,
+        device_id=request.headers.get("X-Device-ID"))
     commit()
     return jsonify(ok=True)
 
@@ -844,6 +895,7 @@ def ack(i):
 @app.post("/api/alerts/<int:i>/verdict")
 def verdict(i):
     hospital_scope("hospital_admin", "l2")
+    actor = _session_audit_actor()
     body = _body(required=True)
     v = body.get("verdict")
     if v not in ("tp", "fp", "unclear"):
@@ -852,7 +904,14 @@ def verdict(i):
     _alert_or_404(i)
     c = db()
     c.execute("UPDATE alerts SET verdict=%s, status='closed', ack_at=COALESCE(ack_at,%s), "
-              "resolution=COALESCE(NULLIF(%s,''), resolution) WHERE id=%s", (v, now(), note, i))
+              "acknowledged_by=COALESCE(acknowledged_by,%s), acknowledged_at=COALESCE(acknowledged_at,now()), "
+              "verdict_by=%s, verdict_at=now(), resolution=COALESCE(NULLIF(%s,''), resolution) WHERE id=%s",
+              (v, now(), actor["actor_id"], actor["actor_id"], note, i))
+    record_audit_event(
+        c, tenant_id=g.ctx["tenant"], actor_id=actor["actor_id"], actor_role=actor["role"],
+        action="alert.verdict", resource_type="alert", resource_id=i, resource_classification="telemetry",
+        metadata={"verdict": v}, source_ip=request.remote_addr,
+        device_id=request.headers.get("X-Device-ID"))
     audit("alert.verdict", f"alert {i}: {v}")
     commit()
     return jsonify(ok=True)
