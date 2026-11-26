@@ -124,7 +124,12 @@ def test_hospital_cannot_select_update_or_delete_another_tenant(runtime, world, 
     update_column = "status" if table == "response_approvals" else "tenant"
     assert runtime.execute(
         f"UPDATE {table} SET {update_column} = {update_column} WHERE tenant = %s", (ORTHO,)).rowcount == 0
-    assert runtime.execute(f"DELETE FROM {table} WHERE tenant = %s", (ORTHO,)).rowcount == 0
+    if table == "response_approvals":
+        # soc_app deliberately has no DELETE grant for approval records.
+        with pytest.raises(errors.InsufficientPrivilege):
+            runtime.execute(f"DELETE FROM {table} WHERE tenant = %s", (ORTHO,))
+    else:
+        assert runtime.execute(f"DELETE FROM {table} WHERE tenant = %s", (ORTHO,)).rowcount == 0
 
 
 def test_tenant_leading_indexes_exist(runtime):
