@@ -587,12 +587,11 @@ def ingest():
     made_ids = _store_events(c, evs)
     _record_current_audit(
         c, action="event.ingest", resource_type="event_batch", resource_id=None,
-        resource_classification="telemetry", auth_context="ingest_key",
-        metadata={"record_count": len(evs), "alerts_created": len(made_ids)})
+        resource_classification="telemetry", metadata={"record_count": len(evs), "alerts_created": len(made_ids)})
     for alert_id in made_ids:
         _record_current_audit(
             c, action="alert.create", resource_type="alert", resource_id=alert_id,
-            resource_classification="telemetry", auth_context="ingest_key", metadata={"status": "new"})
+            resource_classification="telemetry", metadata={"status": "new"})
     commit()
     _notify_new(db(), made_ids)
     return jsonify(events=len(evs), alerts_created=len(made_ids))
