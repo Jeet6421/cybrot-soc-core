@@ -584,7 +584,6 @@ def _grant_or_404(c, grant_id):
 
 @app.get("/api/break-glass/grants")
 def list_break_glass_grants():
-    ident = g.identity
     c = db()
     rows = c.execute(
         "SELECT * FROM break_glass_grants ORDER BY requested_at DESC, grant_id DESC LIMIT 200"

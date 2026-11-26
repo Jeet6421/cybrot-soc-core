@@ -8,8 +8,8 @@ import psycopg
 import pytest
 import app as soc
 
-import manage
-from support import Api, CITY, ORTHO, PASSWORD, failed_logins
+from support import (Api, CITY, ORTHO, PASSWORD, active_break_glass, approve_break_glass, failed_logins,
+                     request_break_glass, revoke_break_glass)
 
 
 def login(world, tenant, username, password=PASSWORD):
@@ -428,41 +428,112 @@ def test_vendor_admin_has_no_routine_access_to_hospital_data(world):
     assert vendor.get("/api/credentials").status_code == 403
 
 
-def test_break_glass_is_read_only_audited_and_time_limited(world):
-    alert_id = new_alert(world, CITY)
+def test_vendor_is_denied_until_the_hospital_approves(world):
+    r = request_break_glass(world, CITY, "alerts:read")
+    assert r.status_code == 201
+    gid = r.get_json()["grant_id"]
     vendor = Api(world, "platform", "vendor_admin")
-    with psycopg.connect(world.owner_url) as owner:
-        manage.grant_break_glass(owner, "vendor", CITY, 1, "INC-TEST-1", "test")
-        owner.commit()
+    try:
+        assert vendor.get(f"/api/alerts?tenant_id={CITY}").status_code == 403  # requested, not approved
+        assert approve_break_glass(world, CITY, gid).status_code == 200
+        assert vendor.get(f"/api/alerts?tenant_id={CITY}").status_code == 200
+    finally:
+        revoke_break_glass(world, CITY)
+
+
+def test_approved_grant_reads_only_its_scope_and_is_audited(world):
+    alert_id = new_alert(world, CITY)
+    gid = active_break_glass(world, CITY, "alerts:read")
+    try:
+        vendor = Api(world, "platform", "vendor_admin")
+        assert vendor.get(f"/api/alerts?tenant_id={CITY}").status_code == 200
+        assert vendor.get(f"/api/alerts/{alert_id}?tenant_id={CITY}").status_code == 200
+        assert vendor.post(f"/api/alerts/{alert_id}/ack").status_code == 403  # read-only, even with a grant
+        assert vendor.get(f"/api/events?tenant_id={CITY}").status_code == 403  # events:read was not granted
+        assert vendor.get(f"/api/alerts?tenant_id={ORTHO}").status_code == 403  # the grant is for City only
+        audited = owner_rows(world, "SELECT count(*) FROM audit_events WHERE break_glass_grant_id = %s "
+                                    "AND auth_context = 'break_glass'", (gid,))
+        assert audited[0][0] >= 1
+        activation = owner_rows(world, "SELECT count(*) FROM alerts WHERE tenant = %s AND rule = 'VENDOR_BREAK_GLASS_ACTIVATED' "
+                                       "AND dkey = %s", (CITY, "break-glass:" + gid))
+        assert activation[0][0] == 1
+    finally:
+        revoke_break_glass(world, CITY)
+
+
+def test_revoke_cuts_access_immediately(world):
+    gid = active_break_glass(world, CITY, "alerts:read")
+    vendor = Api(world, "platform", "vendor_admin")
     assert vendor.get(f"/api/alerts?tenant_id={CITY}").status_code == 200
-    assert vendor.post(f"/api/alerts/{alert_id}/ack").status_code == 403  # read-only, even with a grant
-    assert vendor.get(f"/api/alerts?tenant_id={ORTHO}").status_code == 403  # the grant is for City only
-    audited = owner_rows(world, "SELECT count(*) FROM audit_log WHERE tenant=%s AND action='break_glass.read'", (CITY,))
-    assert audited[0][0] >= 1
-
-    with psycopg.connect(world.owner_url) as owner:
-        owner.execute("UPDATE break_glass_grants SET revoked_at = now() WHERE tenant=%s", (CITY,))
-        owner.commit()
+    admin = Api(world, CITY, "hospital_admin")
+    assert admin.post(f"/api/break-glass/grants/{gid}/revoke").status_code == 200
     assert vendor.get(f"/api/alerts?tenant_id={CITY}").status_code == 403
+    assert admin.post(f"/api/break-glass/grants/{gid}/revoke").status_code == 409
 
 
-def test_expired_break_glass_grant_is_refused(world):
-    with psycopg.connect(world.owner_url) as owner:
-        manage.grant_break_glass(owner, "vendor", ORTHO, 1, "INC-TEST-2", "test")
-        owner.execute("UPDATE break_glass_grants SET expires_at = now() - interval '1 minute' WHERE tenant=%s", (ORTHO,))
-        owner.commit()
-    assert Api(world, "platform", "vendor_admin").get(f"/api/alerts?tenant_id={ORTHO}").status_code == 403
+def test_expired_grant_is_refused_immediately(world):
+    gid = active_break_glass(world, ORTHO, "alerts:read")
+    try:
+        vendor = Api(world, "platform", "vendor_admin")
+        assert vendor.get(f"/api/alerts?tenant_id={ORTHO}").status_code == 200
+        with psycopg.connect(world.owner_url) as owner:
+            owner.execute("UPDATE break_glass_grants SET expires_at = now() - interval '1 second' WHERE grant_id = %s",
+                          (gid,))
+            owner.commit()
+        assert vendor.get(f"/api/alerts?tenant_id={ORTHO}").status_code == 403
+    finally:
+        revoke_break_glass(world, ORTHO)
 
 
-def test_grant_validation_refuses_bad_input(world):
-    with psycopg.connect(world.owner_url) as owner:
-        with pytest.raises(ValueError):
-            manage.grant_break_glass(owner, "vendor", CITY, 48, "too long", "test")
-        with pytest.raises(ValueError):
-            manage.grant_break_glass(owner, "vendor", CITY, 1, "  ", "test")
-        with pytest.raises(ValueError):
-            manage.grant_break_glass(owner, "admin", CITY, 1, "not a vendor", "test")
-        owner.rollback()
+def test_grant_request_is_validated_and_bounded(world):
+    vendor = Api(world, "platform", "vendor_admin")
+    base = {"tenant_id": CITY, "ticket_id": "INC-V", "reason": "check", "scope": "alerts:read"}
+    for bad in ({"ticket_id": ""}, {"reason": " "}, {"scope": "response:write"},
+                {"ttl_minutes": 61}, {"ttl_minutes": 0}, {"ttl_minutes": True}):
+        assert vendor.post("/api/break-glass/grants", json={**base, **bad}).status_code == 400, bad
+    assert vendor.post("/api/break-glass/grants", json={**base, "tenant_id": "no-such-hospital"}).status_code == 404
+    assert vendor.post("/api/break-glass/grants", json={**base, "tenant_id": "platform"}).status_code == 404
+    r = vendor.post("/api/break-glass/grants", json=base)
+    assert r.status_code == 201
+    try:
+        assert owner_rows(world, "SELECT requested_ttl_minutes FROM break_glass_grants WHERE grant_id=%s",
+                          (r.get_json()["grant_id"],))[0][0] == 30  # default TTL
+        assert Api(world, CITY, "hospital_admin").post("/api/break-glass/grants", json=base).status_code == 403
+    finally:
+        revoke_break_glass(world, CITY)
+
+
+def test_hospital_admin_cannot_approve_revoke_or_review_another_hospitals_grant(world):
+    gid = request_break_glass(world, CITY, "alerts:read").get_json()["grant_id"]
+    other = Api(world, ORTHO, "hospital_admin")
+    try:
+        assert other.post(f"/api/break-glass/grants/{gid}/approve").status_code == 404
+        assert owner_rows(world, "SELECT approved_at FROM break_glass_grants WHERE grant_id=%s", (gid,))[0][0] is None
+        assert approve_break_glass(world, CITY, gid).status_code == 200
+        assert other.post(f"/api/break-glass/grants/{gid}/revoke").status_code == 404
+        assert other.post(f"/api/break-glass/grants/{gid}/review").status_code == 404
+        assert Api(world, "platform", "vendor_admin").get(f"/api/alerts?tenant_id={CITY}").status_code == 200
+    finally:
+        revoke_break_glass(world, CITY)
+
+
+def test_vendor_cannot_approve_its_own_grant(world):
+    gid = request_break_glass(world, CITY, "alerts:read").get_json()["grant_id"]
+    try:
+        assert Api(world, "platform", "vendor_admin").post(f"/api/break-glass/grants/{gid}/approve").status_code == 403
+    finally:
+        revoke_break_glass(world, CITY)
+
+
+def test_post_session_review_is_required_once_the_grant_ends(world):
+    gid = active_break_glass(world, CITY, "alerts:read")
+    admin = Api(world, CITY, "hospital_admin")
+    assert admin.post(f"/api/break-glass/grants/{gid}/review").status_code == 409  # still active
+    assert admin.post(f"/api/break-glass/grants/{gid}/revoke").status_code == 200
+    assert admin.post(f"/api/break-glass/grants/{gid}/review").status_code == 200
+    assert admin.post(f"/api/break-glass/grants/{gid}/review").status_code == 409  # only once
+    row = owner_rows(world, "SELECT reviewed_by, reviewed_at FROM break_glass_grants WHERE grant_id=%s", (gid,))[0]
+    assert row[0] is not None and row[1] is not None
 
 
 # ---- Audit -----------------------------------------------------------------------------------------
