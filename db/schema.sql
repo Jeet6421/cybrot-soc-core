@@ -96,11 +96,63 @@ CREATE TABLE IF NOT EXISTS audit_events(
 CREATE INDEX IF NOT EXISTS audit_events_tenant_time_idx ON audit_events(tenant_id, occurred_at DESC, audit_id DESC);
 CREATE INDEX IF NOT EXISTS audit_events_request_id_idx ON audit_events(request_id);
 
--- Break-glass: a time-limited grant that lets one vendor admin read one hospital's data. Created by a
--- database administrator (manage.py grant-break-glass), never through the API.
-CREATE TABLE IF NOT EXISTS break_glass_grants(id BIGSERIAL PRIMARY KEY, actor_id BIGINT NOT NULL REFERENCES users(id),
-  tenant TEXT NOT NULL REFERENCES tenants(id), reason TEXT NOT NULL, granted_by TEXT NOT NULL,
-  created TIMESTAMPTZ NOT NULL DEFAULT now(), expires_at TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ);
+-- Break-glass grants are requested by an individual vendor actor and activated only by the
+-- target hospital's administrator. Legacy columns remain for migration compatibility.
+CREATE TABLE IF NOT EXISTS break_glass_grants(
+  id BIGSERIAL PRIMARY KEY,
+  actor_id BIGINT NOT NULL REFERENCES users(id),
+  tenant TEXT NOT NULL REFERENCES tenants(id),
+  reason TEXT NOT NULL,
+  granted_by TEXT NOT NULL,
+  created TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  revoked_at TIMESTAMPTZ,
+  grant_id UUID NOT NULL DEFAULT gen_random_uuid(),
+  vendor_actor_id BIGINT REFERENCES users(id),
+  tenant_id TEXT REFERENCES tenants(id),
+  ticket_id TEXT,
+  scope TEXT,
+  requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  approved_by BIGINT REFERENCES users(id),
+  approved_at TIMESTAMPTZ,
+  reviewed_by BIGINT REFERENCES users(id),
+  reviewed_at TIMESTAMPTZ,
+  requested_ttl_minutes INTEGER NOT NULL DEFAULT 30
+);
+ALTER TABLE break_glass_grants ADD COLUMN IF NOT EXISTS grant_id UUID DEFAULT gen_random_uuid();
+ALTER TABLE break_glass_grants ADD COLUMN IF NOT EXISTS vendor_actor_id BIGINT REFERENCES users(id);
+ALTER TABLE break_glass_grants ADD COLUMN IF NOT EXISTS tenant_id TEXT REFERENCES tenants(id);
+ALTER TABLE break_glass_grants ADD COLUMN IF NOT EXISTS ticket_id TEXT;
+ALTER TABLE break_glass_grants ADD COLUMN IF NOT EXISTS scope TEXT;
+ALTER TABLE break_glass_grants ADD COLUMN IF NOT EXISTS requested_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE break_glass_grants ADD COLUMN IF NOT EXISTS approved_by BIGINT REFERENCES users(id);
+ALTER TABLE break_glass_grants ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;
+ALTER TABLE break_glass_grants ADD COLUMN IF NOT EXISTS reviewed_by BIGINT REFERENCES users(id);
+ALTER TABLE break_glass_grants ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
+ALTER TABLE break_glass_grants ADD COLUMN IF NOT EXISTS requested_ttl_minutes INTEGER NOT NULL DEFAULT 30;
+UPDATE break_glass_grants SET vendor_actor_id=actor_id WHERE vendor_actor_id IS NULL;
+UPDATE break_glass_grants SET tenant_id=tenant WHERE tenant_id IS NULL;
+UPDATE break_glass_grants SET ticket_id='legacy-' || id::text WHERE ticket_id IS NULL;
+UPDATE break_glass_grants SET scope='events:read' WHERE scope IS NULL;
+UPDATE break_glass_grants SET requested_at=created WHERE requested_at IS NULL;
+-- Old administrator-seeded grants have no named hospital approval, so they must not activate.
+UPDATE break_glass_grants SET revoked_at=now()
+  WHERE approved_at IS NULL AND revoked_at IS NULL;
+ALTER TABLE break_glass_grants ALTER COLUMN grant_id SET NOT NULL;
+ALTER TABLE break_glass_grants ALTER COLUMN vendor_actor_id SET NOT NULL;
+ALTER TABLE break_glass_grants ALTER COLUMN tenant_id SET NOT NULL;
+ALTER TABLE break_glass_grants ALTER COLUMN ticket_id SET NOT NULL;
+ALTER TABLE break_glass_grants ALTER COLUMN scope SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS break_glass_grant_id_uidx ON break_glass_grants(grant_id);
+CREATE INDEX IF NOT EXISTS break_glass_tenant_vendor_expiry_idx
+  ON break_glass_grants(tenant_id, vendor_actor_id, expires_at DESC);
+DO $grant_scope_constraint$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='break_glass_scope_check') THEN
+    ALTER TABLE break_glass_grants ADD CONSTRAINT break_glass_scope_check
+      CHECK (scope IN ('events:read', 'alerts:read', 'handoffs:read', 'metrics:read'));
+  END IF;
+END $grant_scope_constraint$;
 
 CREATE TABLE IF NOT EXISTS events(id BIGSERIAL PRIMARY KEY, ts TEXT, tenant TEXT, source TEXT, type TEXT,
   "user" TEXT, host TEXT, ip TEXT, patient TEXT, detail TEXT, attack_id TEXT,
@@ -190,12 +242,12 @@ CREATE OR REPLACE FUNCTION app_actor_id() RETURNS bigint LANGUAGE sql STABLE
 -- Is there an unrevoked, unexpired break-glass grant for this actor and this hospital? SECURITY DEFINER so
 -- that the check does not depend on the caller's row access to break_glass_grants.
 CREATE OR REPLACE FUNCTION break_glass_active(p_tenant text) RETURNS boolean
-  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $
   SELECT p_tenant IS NOT NULL AND EXISTS (
     SELECT 1 FROM break_glass_grants g
-    WHERE g.tenant = p_tenant AND g.actor_id = app_actor_id()
-      AND g.revoked_at IS NULL AND g.expires_at > now())
-$$;
+    WHERE g.tenant_id = p_tenant AND g.vendor_actor_id = app_actor_id()
+      AND g.approved_at IS NOT NULL AND g.revoked_at IS NULL AND g.expires_at > now())
+$;
 
 -- Lookups that must run before any tenant is known (login, session check, ingest key check).
 -- They return one narrow row and run as the owner, so they are the only reads that cross tenants.
@@ -305,6 +357,11 @@ CREATE POLICY alerts_read ON alerts FOR SELECT
 DROP POLICY IF EXISTS alerts_ingest ON alerts;
 CREATE POLICY alerts_ingest ON alerts FOR INSERT
   WITH CHECK (tenant = app_tenant() AND app_role() = 'ingest');
+DROP POLICY IF EXISTS alerts_break_glass_activation ON alerts;
+CREATE POLICY alerts_break_glass_activation ON alerts FOR INSERT
+  WITH CHECK (tenant = app_tenant() AND app_role() = 'hospital_admin'
+      AND rule = 'VENDOR_BREAK_GLASS_ACTIVATED' AND severity = 'critical' AND source = 'security'
+      AND dkey LIKE 'break-glass:%');
 DROP POLICY IF EXISTS alerts_triage ON alerts;
 CREATE POLICY alerts_triage ON alerts FOR UPDATE
   USING (tenant = app_tenant() AND app_role() IN ('hospital_admin', 'l1', 'l2'))
@@ -392,7 +449,16 @@ ALTER TABLE break_glass_grants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE break_glass_grants FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS break_glass_read ON break_glass_grants;
 CREATE POLICY break_glass_read ON break_glass_grants FOR SELECT
-  USING (actor_id = app_actor_id() OR (tenant = app_tenant() AND app_role() = 'hospital_admin'));
+  USING ((vendor_actor_id = app_actor_id() AND app_role() = 'vendor_admin')
+      OR (tenant_id = app_tenant() AND app_role() = 'hospital_admin'));
+DROP POLICY IF EXISTS break_glass_request ON break_glass_grants;
+CREATE POLICY break_glass_request ON break_glass_grants FOR INSERT
+  WITH CHECK (vendor_actor_id = app_actor_id() AND app_role() = 'vendor_admin'
+      AND approved_by IS NULL AND approved_at IS NULL AND revoked_at IS NULL);
+DROP POLICY IF EXISTS break_glass_hospital_update ON break_glass_grants;
+CREATE POLICY break_glass_hospital_update ON break_glass_grants FOR UPDATE
+  USING (tenant_id = app_tenant() AND app_role() = 'hospital_admin')
+  WITH CHECK (tenant_id = app_tenant() AND app_role() = 'hospital_admin');
 
 -- 5. Grants. soc_app gets only what the app uses. No CREATE, no TRUNCATE, no DDL.
 GRANT USAGE ON SCHEMA public TO soc_app;
@@ -403,7 +469,9 @@ GRANT SELECT, INSERT ON audit_log TO soc_app;
 REVOKE ALL ON audit_events FROM PUBLIC;
 REVOKE UPDATE, DELETE, TRUNCATE ON audit_events FROM soc_app;
 GRANT SELECT, INSERT ON audit_events TO soc_app;
-GRANT SELECT ON break_glass_grants TO soc_app;
+GRANT SELECT, INSERT ON break_glass_grants TO soc_app;
+GRANT UPDATE (approved_by, approved_at, expires_at, revoked_at, reviewed_by, reviewed_at)
+  ON break_glass_grants TO soc_app;
 GRANT SELECT, INSERT ON response_approvals TO soc_app;
 GRANT UPDATE (status, approved_by, decided_at, decision_note) ON response_approvals TO soc_app;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO soc_app;
