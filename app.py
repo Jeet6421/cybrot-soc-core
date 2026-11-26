@@ -1707,7 +1707,7 @@ def reset():
     _require_vendor()
     c = _lab_connection()
     try:
-        c.execute("TRUNCATE events, alerts, handoffs, response_approvals RESTART IDENTITY")
+        c.execute("TRUNCATE events, alerts, handoffs, response_approvals, response_jobs RESTART IDENTITY")
         c.commit()
     finally:
         c.close()
