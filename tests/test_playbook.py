@@ -1,14 +1,23 @@
 import hmac, json, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import app as soc
+import pytest
 
-c = soc.app.test_client()
+import app as soc
+from support import Api, CITY
+
+c = None
+
+
+@pytest.fixture(autouse=True)
+def _api(world):
+    global c
+    c = Api(world)
 
 ENC = "powershell.exe -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA"
 
 
 def enc_event(host="ws-1"):
-    return {"ts": "2026-11-25T10:00:00", "tenant": "city-hospital", "source": "t",
+    return {"ts": "2026-11-25T10:00:00", "tenant": CITY, "source": "t",
             "type": "process_start", "user": "u", "host": host, "detail": ENC}
 
 
@@ -56,7 +65,7 @@ def test_wazuh_alert_is_sent(monkeypatch):
     c.post("/api/reset")
     monkeypatch.setenv("PLAYBOOK_WEBHOOK", "http://playbooks.invalid/hook")
     sent = capture(monkeypatch)
-    r = c.post("/api/ingest/wazuh?tenant=city-hospital",
+    r = c.post("/api/ingest/wazuh",
                json={"rule": {"id": "92213", "level": 12, "description": "Executable file dropped"},
                      "agent": {"name": "ws-9"}, "timestamp": "2026-11-25T10:00:00"})
     assert r.get_json()["alert_id"] is not None

@@ -1,5 +1,10 @@
 # SOC Core app + PostgreSQL. Run Wazuh separately (see wazuh/README.md) and point its webhook here.
 # Settings come from a .env file next to this file (see README). Never commit .env.
+#
+# Three roles, least privilege:
+#   db       the PostgreSQL server. The owner role 'soc' exists only for migrations and bootstrap.
+#   migrate  one-shot: applies the schema, row-level security and grants as the owner, then exits.
+#   soc-core the app. It connects as 'soc_app': no DDL, no superuser, no BYPASSRLS. It never sees the owner password.
 services:
   db:
     image: postgres:16
@@ -14,18 +19,29 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+  migrate:
+    build: .
+    restart: "no"
+    command: ["python", "migrate.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      MIGRATE_DATABASE_URL: "postgresql://soc:${POSTGRES_PASSWORD}@db:5432/soc"
+      SOC_APP_PASSWORD: "${SOC_APP_PASSWORD:?set SOC_APP_PASSWORD in .env (letters and digits only)}"
   soc-core:
     build: .
     ports: ["5000:5000"]
     restart: unless-stopped
     depends_on:
-      db:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
-      DATABASE_URL: "postgresql://soc:${POSTGRES_PASSWORD}@db:5432/soc"
+      DATABASE_URL: "postgresql://soc_app:${SOC_APP_PASSWORD}@db:5432/soc"
       ANALYSTS: "analyst1,analyst2,analyst3"
+      SOC_SESSION_HOURS: "${SOC_SESSION_HOURS:-8}"
       LAB_ENDPOINTS: "${LAB_ENDPOINTS:-1}"   # set to 0 before any real data goes in
-      SOC_API_TOKEN: "${SOC_API_TOKEN:-}"    # required on any shared deployment
+      LAB_DATABASE_URL: "${LAB_DATABASE_URL:-}"  # lab VM only: owner URL for demo/reset/autolabel. Never set it with real data.
       FP_TARGET: "${FP_TARGET:-}"            # agreed false-positive ceiling, e.g. 0.10; empty = not set
       PLAYBOOK_WEBHOOK: "${PLAYBOOK_WEBHOOK:-}"    # v0.7: POST each new alert here (e.g. Shuffle); empty = off
       PLAYBOOK_TIMEOUT: "${PLAYBOOK_TIMEOUT:-3}"   # seconds to wait for the playbook webhook
