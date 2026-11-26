@@ -129,9 +129,15 @@ def connect(url=None):
 def _bind(conn, tenant, role, actor_id):
     """Set the identity for the current transaction only. COMMIT or ROLLBACK clears it, so a pooled
     connection can never carry one request's identity into the next one."""
-    conn.execute("SELECT set_config('app.tenant_id', %s, true), set_config('app.role', %s, true), "
+    tenant_value = tenant or ""
+    role_value = role or ""
+    actor_value = "" if actor_id is None else str(actor_id)
+    conn.execute("SELECT set_config('app.current_tenant_id', %s, true), "
+                 "set_config('app.current_actor_id', %s, true), "
+                 "set_config('app.current_actor_role', %s, true), "
+                 "set_config('app.tenant_id', %s, true), set_config('app.role', %s, true), "
                  "set_config('app.actor_id', %s, true)",
-                 (tenant or "", role or "", "" if actor_id is None else str(actor_id)))
+                 (tenant_value, actor_value, role_value, tenant_value, role_value, actor_value))
 
 
 def db():

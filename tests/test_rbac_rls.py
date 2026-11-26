@@ -9,6 +9,7 @@ import psycopg
 import pytest
 from psycopg import errors
 
+import app as soc
 import manage
 from support import Api, CITY, ORTHO, failed_logins
 
@@ -59,9 +60,38 @@ def data(world):
 # ---- The runtime connection ------------------------------------------------------------------------
 
 def test_runtime_role_cannot_bypass_rls_or_administer(runtime):
-    row = runtime.execute("SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, rolinherit "
+    row = runtime.execute("SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, rolinherit, rolreplication "
                           "FROM pg_roles WHERE rolname = current_user").fetchone()
-    assert row == (False, False, False, False, False)
+    assert row == (False, False, False, False, False, False)
+
+
+def test_app_queries_connect_as_soc_app(world):
+    with soc.app.test_request_context("/api/me"):
+        current_user = soc.db().execute("SELECT current_user").fetchone()[0]
+        assert current_user == "soc_app"
+
+
+def test_app_context_settings_are_transaction_local(world):
+    with soc.app.test_request_context("/api/me"):
+        conn = soc.db()
+        soc.set_context(CITY, "l1", 42)
+        settings = conn.execute(
+            "SELECT current_setting('app.current_tenant_id', true) AS tenant_id, "
+            "current_setting('app.current_actor_id', true) AS actor_id, "
+            "current_setting('app.current_actor_role', true) AS actor_role, "
+            "current_setting('app.tenant_id', true) AS legacy_tenant_id, "
+            "current_setting('app.actor_id', true) AS legacy_actor_id, "
+            "current_setting('app.role', true) AS legacy_role").fetchone()
+        assert tuple(settings[i] for i in range(6)) == (CITY, "42", "l1", CITY, "42", "l1")
+        conn.commit()
+        cleared = conn.execute(
+            "SELECT current_setting('app.current_tenant_id', true) AS tenant_id, "
+            "current_setting('app.current_actor_id', true) AS actor_id, "
+            "current_setting('app.current_actor_role', true) AS actor_role, "
+            "current_setting('app.tenant_id', true) AS legacy_tenant_id, "
+            "current_setting('app.actor_id', true) AS legacy_actor_id, "
+            "current_setting('app.role', true) AS legacy_role").fetchone()
+        assert all(cleared[i] in (None, "") for i in range(6))
 
 
 def test_runtime_role_cannot_change_the_schema_or_truncate(runtime):
@@ -302,3 +332,4 @@ def test_lookups_work_before_any_identity_is_set(runtime, world, data):
     assert runtime.execute("SELECT count(*) FROM auth_ingest_key(%s)", ("not-a-key-hash",)).fetchone()[0] == 0
     row = runtime.execute("SELECT count(*) FROM auth_user_for_login(%s, %s)", (CITY, "admin")).fetchone()[0]
     assert row == 1
+
