@@ -139,7 +139,6 @@ def test_triage_handoff_verdict_and_approval_decision_are_audited(world):
     l1 = Api(world, CITY, "l1")
     l2 = Api(world, CITY, "l2")
 
-    alert = l1.get(f"/api/alerts/{alert_id}").get_json()
     new_owner = next(a["user_id"] for a in l1.get("/api/analysts").get_json()["analysts"]
                      if a["username"] == "analyst-l2")
     assert l1.post(f"/api/alerts/{alert_id}/ack").status_code == 200
@@ -161,7 +160,8 @@ def test_triage_handoff_verdict_and_approval_decision_are_audited(world):
 
     assert ack[9] == handoff[9] == verdict[9] == requested[9] == decided[9] == "allow"
     assert ack[10] == {"previous_status": "new", "status": "ack"}
-    assert handoff[10] == {"owner_from": alert["owner"], "owner_to": new_owner}
+    l1_actor = _owner_rows(world, "SELECT id FROM users WHERE tenant=%s AND username='analyst-l1'", (CITY,))[0][0]
+    assert handoff[10] == {"from_actor_id": l1_actor, "to_actor_id": new_owner}
     assert verdict[10] == {"previous_verdict": None, "new_verdict": "tp"}
     assert requested[10] == {"response_action": "isolate_host", "status": "pending"}
     assert decided[10] == {"response_action": "isolate_host", "decision": "approved"}

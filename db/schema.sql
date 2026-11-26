@@ -667,6 +667,8 @@ CREATE POLICY handoffs_write ON handoffs FOR INSERT
     AND from_user_id = app_actor_id() AND handoff_target_active(app_tenant(), to_user_id));
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON assets TO soc_app;
+-- The blanket sequence grant above runs before this table exists, so grant its sequence explicitly.
+GRANT USAGE, SELECT ON SEQUENCE assets_asset_id_seq TO soc_app;
 REVOKE ALL ON FUNCTION handoff_target_name(text, bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION handoff_target_active(text, bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION hospital_analysts(text) FROM PUBLIC;
