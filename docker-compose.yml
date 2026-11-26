@@ -43,8 +43,16 @@ services:
       LAB_ENDPOINTS: "${LAB_ENDPOINTS:-1}"   # set to 0 before any real data goes in
       LAB_DATABASE_URL: "${LAB_DATABASE_URL:-}"  # lab VM only: owner URL for demo/reset/autolabel. Never set it with real data.
       FP_TARGET: "${FP_TARGET:-}"            # agreed false-positive ceiling, e.g. 0.10; empty = not set
-      PLAYBOOK_WEBHOOK: "${PLAYBOOK_WEBHOOK:-}"    # v0.7: POST each new alert here (e.g. Shuffle); empty = off
-      PLAYBOOK_TIMEOUT: "${PLAYBOOK_TIMEOUT:-3}"   # seconds to wait for the playbook webhook
-      PLAYBOOK_SECRET: "${PLAYBOOK_SECRET:-}"      # v0.8: signs each playbook request (HMAC); set it with PLAYBOOK_WEBHOOK
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["python", "worker.py"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: "postgresql://soc_app:${SOC_APP_PASSWORD}@db:5432/soc"
+      WORKER_POLL_SECONDS: "${WORKER_POLL_SECONDS:-5}"   # idle wait between queue checks
+      WORKER_LEASE_SECONDS: "${WORKER_LEASE_SECONDS:-120}" # a crashed job is retried after this lease expires
 volumes:
   pg-data:

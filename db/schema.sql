@@ -592,6 +592,53 @@ BEGIN
   RETURN FOUND;
 END $$;
 
+-- ---- PR 10: durable response job queue (outbox) -------------------------------------------------------------
+-- An approved response becomes one row here. The worker (worker.py) claims rows with SKIP LOCKED and a lease.
+-- Only the worker's functions change a job's state after it is queued. Alerts, owners, status and handoffs are
+-- never written by the queue.
+CREATE TABLE IF NOT EXISTS response_jobs(
+  job_id BIGSERIAL PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  alert_id BIGINT NOT NULL,
+  action_type TEXT NOT NULL CHECK (action_type IN ('isolate_host', 'disable_account', 'block_ip')),
+  target_asset_id BIGINT,
+  target_host TEXT NOT NULL CHECK (length(btrim(target_host)) BETWEEN 1 AND 200),
+  idempotency_key TEXT NOT NULL CHECK (length(idempotency_key) BETWEEN 1 AND 120),
+  status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'succeeded', 'dead')),
+  requested_by BIGINT NOT NULL,
+  approved_by BIGINT NOT NULL,
+  approved_at TIMESTAMPTZ NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  max_attempts INTEGER NOT NULL DEFAULT 5 CHECK (max_attempts BETWEEN 1 AND 20),
+  next_run_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  locked_by TEXT,
+  lease_expires_at TIMESTAMPTZ,
+  result JSONB NOT NULL DEFAULT '{}'::jsonb,
+  errors JSONB NOT NULL DEFAULT '[]'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, idempotency_key),
+  FOREIGN KEY (alert_id, tenant_id) REFERENCES alerts(id, tenant),
+  FOREIGN KEY (requested_by, tenant_id) REFERENCES users(id, tenant),
+  FOREIGN KEY (approved_by, tenant_id) REFERENCES users(id, tenant),
+  CHECK ((status = 'running') = (locked_by IS NOT NULL AND lease_expires_at IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS response_jobs_due_idx ON response_jobs(next_run_at)
+  WHERE status IN ('queued', 'running');
+
+ALTER TABLE response_jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE response_jobs FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS response_jobs_read ON response_jobs;
+CREATE POLICY response_jobs_read ON response_jobs FOR SELECT
+  USING (tenant_id = app_tenant() AND app_role() IN ('hospital_admin', 'l1', 'l2', 'viewer'));
+DROP POLICY IF EXISTS response_jobs_enqueue ON response_jobs;
+CREATE POLICY response_jobs_enqueue ON response_jobs FOR INSERT
+  WITH CHECK (tenant_id = app_tenant() AND app_role() IN ('hospital_admin', 'l2')
+    AND status = 'queued' AND attempts = 0 AND approved_by = app_actor_id() AND requested_by <> approved_by);
+
+GRANT SELECT, INSERT ON response_jobs TO soc_app;
+GRANT USAGE, SELECT ON SEQUENCE response_jobs_job_id_seq TO soc_app;
+
 -- Row counts of everything a hospital holds. Used by the export hook and returned by the purge.
 CREATE OR REPLACE FUNCTION tenant_export_counts(p_tenant text) RETURNS jsonb
   LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
@@ -600,6 +647,7 @@ CREATE OR REPLACE FUNCTION tenant_export_counts(p_tenant text) RETURNS jsonb
     'alerts', (SELECT count(*) FROM alerts WHERE tenant = p_tenant),
     'handoffs', (SELECT count(*) FROM handoffs WHERE tenant = p_tenant),
     'response_approvals', (SELECT count(*) FROM response_approvals WHERE tenant = p_tenant),
+    'response_jobs', (SELECT count(*) FROM response_jobs WHERE tenant_id = p_tenant),
     'assets', (SELECT count(*) FROM assets WHERE tenant_id = p_tenant),
     'log_sources', (SELECT count(*) FROM log_sources WHERE tenant = p_tenant),
     'ingest_keys', (SELECT count(*) FROM ingest_keys WHERE tenant = p_tenant),
@@ -619,6 +667,7 @@ BEGIN
     RAISE EXCEPTION 'tenant must be archived before it is purged';
   END IF;
   before_counts := tenant_export_counts(p_tenant);
+  DELETE FROM response_jobs WHERE tenant_id = p_tenant;
   DELETE FROM response_approvals WHERE tenant = p_tenant;
   DELETE FROM handoffs WHERE tenant = p_tenant;
   DELETE FROM alerts WHERE tenant = p_tenant;
@@ -690,3 +739,82 @@ CREATE OR REPLACE FUNCTION tenant_exported(p_tenant text) RETURNS boolean
 $$;
 REVOKE ALL ON FUNCTION tenant_exported(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION tenant_exported(text) TO soc_app;
+
+
+-- Claim up to p_limit due jobs for one worker. A job is due when it is queued and its time has come, or when it is
+-- running under a lease that has expired (the worker crashed). A crashed job that has used its last attempt is
+-- dead-lettered instead of retried forever.
+CREATE OR REPLACE FUNCTION claim_response_jobs(p_worker text, p_limit integer, p_lease_seconds integer)
+  RETURNS SETOF response_jobs
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+BEGIN
+  IF p_worker IS NULL OR length(p_worker) NOT BETWEEN 1 AND 120 THEN
+    RAISE EXCEPTION 'worker id must be 1 to 120 characters' USING ERRCODE = '22023';
+  END IF;
+  IF p_limit NOT BETWEEN 1 AND 100 THEN
+    RAISE EXCEPTION 'limit must be 1 to 100' USING ERRCODE = '22023';
+  END IF;
+  IF p_lease_seconds NOT BETWEEN 5 AND 3600 THEN
+    RAISE EXCEPTION 'lease must be 5 to 3600 seconds' USING ERRCODE = '22023';
+  END IF;
+  UPDATE response_jobs SET status = 'dead', locked_by = NULL, lease_expires_at = NULL, updated_at = now(),
+    errors = errors || jsonb_build_array(jsonb_build_object('at', now(), 'error', 'lease expired after the last attempt'))
+  WHERE status = 'running' AND lease_expires_at < now() AND attempts >= max_attempts;
+  RETURN QUERY
+  UPDATE response_jobs j SET status = 'running', locked_by = p_worker,
+    lease_expires_at = now() + make_interval(secs => p_lease_seconds),
+    attempts = j.attempts + 1, updated_at = now()
+  WHERE j.job_id IN (
+    SELECT c.job_id FROM response_jobs c
+    WHERE (c.status = 'queued' AND c.next_run_at <= now())
+       OR (c.status = 'running' AND c.lease_expires_at < now())
+    ORDER BY c.next_run_at, c.job_id
+    LIMIT p_limit
+    FOR UPDATE SKIP LOCKED)
+  RETURNING j.*;
+END $$;
+
+-- Record one attempt's outcome. Only the worker that holds the job's lease may write it; if the lease was taken over,
+-- the call returns 'lost_lease' and changes nothing.
+-- outcome: succeeded | retry (back off, dead-letter when out of attempts) | dead (permanent) | defer (not run here;
+-- the attempt is not counted).
+CREATE OR REPLACE FUNCTION finish_response_job(p_job bigint, p_worker text, p_outcome text, p_result jsonb,
+    p_error text, p_retry_seconds integer)
+  RETURNS text LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE r response_jobs%ROWTYPE;
+  err jsonb := NULL;
+BEGIN
+  IF p_outcome NOT IN ('succeeded', 'retry', 'dead', 'defer') THEN
+    RAISE EXCEPTION 'unknown outcome' USING ERRCODE = '22023';
+  END IF;
+  SELECT * INTO r FROM response_jobs
+    WHERE job_id = p_job AND status = 'running' AND locked_by = p_worker AND lease_expires_at >= now()
+    FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN 'lost_lease';
+  END IF;
+  IF p_error IS NOT NULL THEN
+    err := jsonb_build_array(jsonb_build_object('at', now(), 'error', left(p_error, 300)));
+  END IF;
+  IF p_outcome = 'succeeded' THEN
+    UPDATE response_jobs SET status = 'succeeded', result = COALESCE(p_result, '{}'::jsonb), locked_by = NULL,
+      lease_expires_at = NULL, updated_at = now() WHERE job_id = p_job;
+  ELSIF p_outcome = 'retry' AND r.attempts < r.max_attempts THEN
+    UPDATE response_jobs SET status = 'queued', locked_by = NULL, lease_expires_at = NULL,
+      next_run_at = now() + make_interval(secs => GREATEST(p_retry_seconds, 1)),
+      errors = errors || COALESCE(err, '[]'::jsonb), updated_at = now() WHERE job_id = p_job;
+  ELSIF p_outcome = 'defer' THEN
+    UPDATE response_jobs SET status = 'queued', locked_by = NULL, lease_expires_at = NULL,
+      next_run_at = now() + make_interval(secs => GREATEST(p_retry_seconds, 1)),
+      attempts = GREATEST(attempts - 1, 0), updated_at = now() WHERE job_id = p_job;
+  ELSE
+    UPDATE response_jobs SET status = 'dead', locked_by = NULL, lease_expires_at = NULL,
+      errors = errors || COALESCE(err, '[]'::jsonb), updated_at = now() WHERE job_id = p_job;
+  END IF;
+  RETURN 'ok';
+END $$;
+
+REVOKE ALL ON FUNCTION claim_response_jobs(text, integer, integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION finish_response_job(bigint, text, text, jsonb, text, integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION claim_response_jobs(text, integer, integer) TO soc_app;
+GRANT EXECUTE ON FUNCTION finish_response_job(bigint, text, text, jsonb, text, integer) TO soc_app;

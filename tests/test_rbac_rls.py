@@ -70,7 +70,8 @@ def test_runtime_role_cannot_bypass_rls_or_administer(runtime):
     assert row == (False, False, False, False, False, False)
 
 
-TENANT_TABLES = ("users", "ingest_keys", "log_sources", "events", "alerts", "handoffs", "response_approvals")
+TENANT_TABLES = ("users", "ingest_keys", "log_sources", "events", "alerts", "handoffs", "response_approvals",
+                 "response_jobs")
 
 
 def test_every_tenant_table_has_rls_enabled_and_forced(runtime):
@@ -106,6 +107,9 @@ def test_spoofed_tenant_inserts_are_rejected(runtime, world, data):
         ("INSERT INTO response_approvals(tenant, alert_id, action, target, reason, requested_by) "
          "VALUES (%s, %s, 'isolate_host', 'ehr-01', 'spoofed tenant test', %s)",
          (ORTHO, ortho_alert, ortho_actor)),
+        ("INSERT INTO response_jobs(tenant_id, alert_id, action_type, target_host, idempotency_key, requested_by, "
+         "approved_by, approved_at) VALUES (%s, %s, 'isolate_host', 'ehr-01', 'rls-spoof', %s, %s, now())",
+         (ORTHO, ortho_alert, ortho_actor, ortho_actor)),
     )
     for sql, params in statements:
         with pytest.raises(errors.InsufficientPrivilege):
