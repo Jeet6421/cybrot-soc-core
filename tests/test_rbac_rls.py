@@ -106,6 +106,10 @@ def test_spoofed_tenant_inserts_are_rejected(runtime, world, data):
          "VALUES (%s, %s, 'isolate_host', 'ehr-01', 'spoofed tenant test', %s)",
          (ORTHO, ortho_alert, ortho_actor)),
     )
+    for sql, params in statements:
+        with pytest.raises(errors.InsufficientPrivilege):
+            with runtime.transaction():
+                runtime.execute(sql, params)
     as_identity(runtime, CITY, "hospital_admin", actor_id(world, CITY, "admin"))
     for sql, params in statements:
         with pytest.raises(errors.InsufficientPrivilege):
