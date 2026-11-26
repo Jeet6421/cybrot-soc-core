@@ -95,7 +95,7 @@ def test_user_creation_role_change_disable_and_denial_are_audited(world):
     assert denied.status_code == 403
     deny_event = _audit(world, "authorization.denied")[-1]
     viewer_actor = _owner_rows(
-        world, "SELECT id FROM users WHERE tenant=%s AND username='analyst-viewer'", (CITY,))[0][0]
+        world, "SELECT id FROM users WHERE tenant=%s AND username='viewer'", (CITY,))[0][0]
     assert deny_event[1:5] == (CITY, viewer_actor, "viewer", "session")
     assert deny_event[9] == "deny"
 
