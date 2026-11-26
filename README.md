@@ -156,9 +156,9 @@ The tenant of every request comes from the caller's identity. A `tenant_id` in t
 
 | Role | Can | Cannot |
 |---|---|---|
-| `hospital_admin` | Manage its hospital's users, log sources and ingest keys; read and triage alerts; hand off; close alerts; read audit | See another hospital |
-| `l1` | Read its alerts; acknowledge; hand off | Close alerts (verdict); manage users, keys or log sources |
-| `l2` | Everything `l1` can, plus final verdicts (`tp`, `fp`, `unclear`) that close alerts | Manage users, keys or log sources |
+| `hospital_admin` | Manage its hospital's users, log sources, ingest keys and display name; read events and triage alerts; hand off; close alerts; approve response requests; read audit | See another hospital |
+| `l1` | Read its events and alerts; acknowledge; hand off; request a response approval | Close alerts (verdict); approve response requests; manage users, keys, log sources or settings |
+| `l2` | Everything `l1` can, plus final verdicts (`tp`, `fp`, `unclear`) that close alerts and approve or reject response requests | Manage users, keys, log sources or settings |
 | `viewer` | Read its hospital's alerts, handoffs and metrics | Change anything |
 | `vendor_admin` (platform tenant) | Create and list tenants; read one hospital's events, alerts and handoffs with a time-limited **break-glass** grant (read-only, audited) | Routine access to hospital data, users, credentials |
 | ingest key | `POST /api/events` and `POST /api/ingest/*` for its own hospital and log source | Any read or change |
@@ -179,6 +179,7 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 
 ## Row-level security (how the database enforces it)
 - `db/schema.sql` turns on `ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY` on `tenants`, `users`, `log_sources`, `ingest_keys`, `events`, `alerts`, `handoffs`, `sessions`, `audit_log` and `break_glass_grants`.
+- `response_approvals` also has forced tenant isolation. Hospital admins can change only their own tenant's display name.
 - Every transaction carries the caller's tenant, role and user id in transaction-local settings (`set_config(..., true)`). They end at `COMMIT` or `ROLLBACK`, so a pooled connection never keeps one request's identity. Unset or empty means no rows and no writes.
 - Login, session and ingest-key checks run through narrow `SECURITY DEFINER` functions, because they must run before the tenant is known. They return one row each.
 - `soc_app` has only `SELECT`, `INSERT`, `UPDATE`, `DELETE` on the app tables (`INSERT`/`SELECT` on `audit_log`, `SELECT` on `break_glass_grants`). It cannot `TRUNCATE`, `CREATE`, or change policies.
@@ -195,6 +196,7 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 |---|---|---|
 | `POST /api/login`, `POST /api/logout`, `GET /api/me` | users | Sessions |
 | `POST /api/events` | ingest key | Ingest events; runs the built-in rules |
+| `GET /api/events` | `hospital_admin`, `l1`, `l2`; vendor with break-glass | Read tenant events; supports `limit`, `before_id`, `type` and `host` filters |
 | `POST /api/ingest/wazuh` | ingest key | Ingest a Wazuh integration alert |
 | `GET /api/alerts` | hospital roles; vendor with break-glass | Newest 200 alerts; filter with `status`, `owner` |
 | `POST /api/alerts/<id>/ack` | `hospital_admin`, `l1`, `l2` | Acknowledge an alert |
@@ -208,6 +210,9 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 | `GET/POST /api/log-sources`, `POST /api/log-sources/<id>/disable` | read: hospital roles; write: `hospital_admin` | Log sources |
 | `GET/POST /api/credentials`, `POST /api/credentials/<id>/revoke` | `hospital_admin` | Ingest keys |
 | `GET/POST /api/tenants` | `vendor_admin` | Hospitals |
+| `GET/PUT /api/settings` | `hospital_admin` | Read or update its hospital display name |
+| `GET/POST /api/alerts/<id>/response-approvals` | `hospital_admin`, `l1`, `l2` | List or request an allowlisted response action approval |
+| `POST /api/response-approvals/<id>/decision` | `hospital_admin`, `l2` | Approve or reject another user's request; no action is executed |
 | `POST /api/demo`, `/api/autolabel`, `/api/reset` | `vendor_admin`, lab only | Synthetic data; need `LAB_DATABASE_URL` |
 
 ## Changes
@@ -224,7 +229,7 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 **Deviations from the PR 1 spec, and what is not there yet**
 - The column is still called `tenant`, and the API also accepts `tenant_id`. `credentials` is the existing `ingest_keys` table, now bound to a log source.
 - `docs/MULTITENANT.md` uses other role names (Platform admin, Hospital admin, SOC analyst, Viewer). The roles above are the ones in the code; the design doc needs updating.
-- No response actions exist yet, so there is no L2 response-approval endpoint.
+- Response approvals record an allowlisted action request and an independent `hospital_admin` or `l2` decision. They do not execute isolation, account-disabling or IP-blocking actions.
 - The database lets `l1` update alerts (acknowledge, hand off). Only the API stops `l1` from giving a verdict. Column-level rules would move this into the database.
 - Alert owners are still names from `ANALYSTS`, not user accounts.
 - Lab endpoints use the owner role through `LAB_DATABASE_URL`, so the lab VM holds the owner URL. Never set it with real data.
@@ -313,3 +318,4 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 - Shuffle playbooks (v0.7 sends alerts to a webhook; Shuffle itself is not set up yet)
 - MISP and Sigma rule conversion
 - Hospital-facing portal, PDF reports, plan-based feature gating
+

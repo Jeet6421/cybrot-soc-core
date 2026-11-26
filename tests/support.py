@@ -34,6 +34,9 @@ class Api:
     def post(self, path, json=None, headers=None):
         return self.client.post(path, json=json, headers=headers or self._headers(path, "POST"))
 
+    def put(self, path, json=None, headers=None):
+        return self.client.put(path, json=json, headers=headers or self._headers(path, "PUT"))
+
 
 def failed_logins(tenant, ip=None, day="2026-11-25"):
     """Five failed logins from one IP within a minute: enough to raise FAILED_LOGIN_BURST.
@@ -42,3 +45,4 @@ def failed_logins(tenant, ip=None, day="2026-11-25"):
     ip = ip or f"100.{random.randint(64, 127)}.{random.randint(0, 255)}.{random.randint(1, 254)}"
     return [{"ts": f"{day}T10:00:0{i}", "tenant": tenant, "source": "auth", "type": "auth_fail",
              "user": "u", "ip": ip} for i in range(5)]
+

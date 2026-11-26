@@ -389,6 +389,37 @@ def ingest():
     return jsonify(events=len(evs), alerts_created=len(made_ids))
 
 
+@app.get("/api/events")
+def list_events():
+    """Read a tenant's event stream. Viewers and ingest keys cannot read event payloads."""
+    tenant = hospital_scope("hospital_admin", "l1", "l2", "vendor_admin")
+    try:
+        limit = int(request.args.get("limit", "100"))
+        before_id = int(request.args["before_id"]) if request.args.get("before_id") else None
+    except ValueError:
+        raise Refuse(400, "limit and before_id must be integers")
+    if not 1 <= limit <= 500:
+        raise Refuse(400, "limit must be between 1 and 500")
+    if before_id is not None and before_id < 1:
+        raise Refuse(400, "before_id must be positive")
+    query = ('SELECT id, ts, tenant, source, type, "user", host, ip, patient, detail, attack_id, '
+             'destination, data_classification, destination_approved, src_zone, dst_zone, '
+             'boundary_violation, approved_change, log_source_id FROM events WHERE tenant=%s')
+    params = [tenant]
+    if request.args.get("type"):
+        query += " AND type=%s"
+        params.append(request.args["type"])
+    if request.args.get("host"):
+        query += " AND host=%s"
+        params.append(request.args["host"])
+    if before_id is not None:
+        query += " AND id < %s"
+        params.append(before_id)
+    rows = db().execute(query + " ORDER BY id DESC LIMIT %s", [*params, limit]).fetchall()
+    events = [dict(row) for row in rows]
+    return jsonify(events=events, next_before_id=events[-1]["id"] if len(events) == limit else None)
+
+
 @app.post("/api/ingest/wazuh")
 def ingest_wazuh():
     """Accepts a Wazuh integration (webhook) alert and drops it in the same triage queue."""
@@ -608,6 +639,31 @@ def me():
     return jsonify(kind=ident["kind"], username=ident.get("name"), tenant=ident["tenant"], role=ident["role"])
 
 
+@app.get("/api/settings")
+def get_hospital_settings():
+    tenant = hospital_scope("hospital_admin")
+    row = db().execute("SELECT id, name, created FROM tenants WHERE id=%s", (tenant,)).fetchone()
+    if not row:
+        raise Refuse(404, "hospital not found")
+    return jsonify(tenant=row["id"], name=row["name"], created=row["created"])
+
+
+@app.put("/api/settings")
+def update_hospital_settings():
+    tenant = hospital_scope("hospital_admin")
+    body = _body(required=True)
+    raw_name = body.get("name")
+    name = raw_name.strip() if isinstance(raw_name, str) else ""
+    if not name or len(name) > 120:
+        raise Refuse(400, "name must be 1 to 120 characters")
+    row = db().execute("UPDATE tenants SET name=%s WHERE id=%s RETURNING id, name", (name, tenant)).fetchone()
+    if not row:
+        raise Refuse(404, "hospital not found")
+    audit("tenant.settings.update", f"name={name}")
+    commit()
+    return jsonify(tenant=row["id"], name=row["name"])
+
+
 # ---- Triage --------------------------------------------------------------------------------------
 
 @app.get("/api/alerts")
@@ -688,6 +744,85 @@ def handoffs(i):
     _alert_or_404(i)
     rows = db().execute("SELECT at, from_owner, to_owner, note FROM handoffs WHERE alert_id=%s ORDER BY id", (i,)).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+RESPONSE_ACTIONS = {"isolate_host", "disable_account", "block_ip"}
+
+
+@app.get("/api/alerts/<int:i>/response-approvals")
+def list_response_approvals(i):
+    hospital_scope("hospital_admin", "l1", "l2")
+    _alert_or_404(i)
+    rows = db().execute(
+        "SELECT id, alert_id, action, target, reason, status, requested_by, requested_at, "
+        "approved_by, decided_at, decision_note FROM response_approvals "
+        "WHERE alert_id=%s ORDER BY id DESC", (i,)).fetchall()
+    return jsonify([dict(row) for row in rows])
+
+
+@app.post("/api/alerts/<int:i>/response-approvals")
+def request_response_approval(i):
+    tenant = hospital_scope("hospital_admin", "l1", "l2")
+    body = _body(required=True)
+    action = body.get("action")
+    target_raw = body.get("target")
+    reason_raw = body.get("reason")
+    target = target_raw.strip() if isinstance(target_raw, str) else ""
+    reason = reason_raw.strip() if isinstance(reason_raw, str) else ""
+    if action not in RESPONSE_ACTIONS:
+        raise Refuse(400, f"action must be one of: {', '.join(sorted(RESPONSE_ACTIONS))}")
+    if not target or len(target) > 200:
+        raise Refuse(400, "target must be 1 to 200 characters")
+    if not reason or len(reason) > 500:
+        raise Refuse(400, "reason must be 1 to 500 characters")
+    alert = _alert_or_404(i)
+    if alert["status"] == "closed":
+        raise Refuse(409, "cannot request a response for a closed alert")
+    pending = db().execute(
+        "SELECT id FROM response_approvals WHERE alert_id=%s AND action=%s AND target=%s AND status='pending'",
+        (i, action, target)).fetchone()
+    if pending:
+        raise Refuse(409, "a matching response approval is already pending")
+    row = db().execute(
+        "INSERT INTO response_approvals(tenant, alert_id, action, target, reason, requested_by) "
+        "VALUES(%s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (alert_id, action, target) WHERE status='pending' DO NOTHING "
+        "RETURNING id, status",
+        (tenant, i, action, target, reason, g.identity["actor_id"])).fetchone()
+    if not row:
+        raise Refuse(409, "a matching response approval is already pending")
+    audit("response_approval.request", f"approval {row['id']}: {action} for alert {i}")
+    commit()
+    return jsonify(id=row["id"], alert_id=i, action=action, target=target, status=row["status"],
+                   execution="not_performed"), 201
+
+
+@app.post("/api/response-approvals/<int:approval_id>/decision")
+def decide_response_approval(approval_id):
+    tenant = hospital_scope("hospital_admin", "l2")
+    body = _body(required=True)
+    decision = body.get("decision")
+    if decision not in ("approved", "rejected"):
+        raise Refuse(400, "decision must be approved or rejected")
+    note = _text(body, "note", 500)
+    row = db().execute(
+        "SELECT id, alert_id, action, target, status, requested_by FROM response_approvals "
+        "WHERE id=%s AND tenant=%s", (approval_id, tenant)).fetchone()
+    if not row:
+        raise Refuse(404, "response approval not found")
+    if row["status"] != "pending":
+        raise Refuse(409, "response approval has already been decided")
+    if row["requested_by"] == g.identity["actor_id"]:
+        raise Refuse(409, "the requester cannot approve their own response")
+    decided_at = datetime.now(timezone.utc)
+    db().execute(
+        "UPDATE response_approvals SET status=%s, approved_by=%s, decided_at=%s, decision_note=%s "
+        "WHERE id=%s",
+        (decision, g.identity["actor_id"], decided_at, note, approval_id))
+    audit("response_approval.decision", f"approval {approval_id}: {decision}")
+    commit()
+    return jsonify(id=approval_id, alert_id=row["alert_id"], action=row["action"], target=row["target"],
+                   status=decision, execution="not_performed")
 
 
 # ---- Metrics and exit criteria -----------------------------------------------------------------
@@ -821,7 +956,7 @@ def reset():
     _require_vendor()
     c = _lab_connection()
     try:
-        c.execute("TRUNCATE events, alerts, handoffs RESTART IDENTITY")
+        c.execute("TRUNCATE events, alerts, handoffs, response_approvals RESTART IDENTITY")
         c.commit()
     finally:
         c.close()
@@ -835,3 +970,4 @@ def home():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
