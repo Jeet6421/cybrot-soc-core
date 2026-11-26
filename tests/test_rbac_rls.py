@@ -121,7 +121,9 @@ def test_spoofed_tenant_inserts_are_rejected(runtime, world, data):
 def test_hospital_cannot_select_update_or_delete_another_tenant(runtime, world, data, table):
     as_identity(runtime, CITY, "hospital_admin", actor_id(world, CITY, "admin"))
     assert runtime.execute(f"SELECT count(*) FROM {table} WHERE tenant = %s", (ORTHO,)).fetchone()[0] == 0
-    assert runtime.execute(f"UPDATE {table} SET tenant = tenant WHERE tenant = %s", (ORTHO,)).rowcount == 0
+    update_column = "status" if table == "response_approvals" else "tenant"
+    assert runtime.execute(
+        f"UPDATE {table} SET {update_column} = {update_column} WHERE tenant = %s", (ORTHO,)).rowcount == 0
     assert runtime.execute(f"DELETE FROM {table} WHERE tenant = %s", (ORTHO,)).rowcount == 0
 
 
