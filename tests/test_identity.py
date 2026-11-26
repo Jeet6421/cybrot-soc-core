@@ -52,6 +52,30 @@ def test_wrong_password_and_unknown_user_look_the_same(world):
     assert wrong.get_json() == unknown.get_json()
 
 
+def test_api_created_l1_and_l2_users_log_in_and_keep_role_permissions(world):
+    l1_name, _ = new_user(world, CITY, "l1")
+    l2_name, _ = new_user(world, CITY, "l2")
+    l1_login = login(world, CITY, l1_name)
+    l2_login = login(world, CITY, l2_name)
+    assert l1_login.status_code == l2_login.status_code == 200
+    l1_identity, l2_identity = l1_login.get_json(), l2_login.get_json()
+    assert (l1_identity["tenant"], l1_identity["role"], bool(l1_identity["token"])) == (CITY, "l1", True)
+    assert (l2_identity["tenant"], l2_identity["role"], bool(l2_identity["token"])) == (CITY, "l2", True)
+
+    alert_id = new_alert(world, CITY)
+    l1_headers = {"Authorization": f"Bearer {l1_identity['token']}"}
+    l2_headers = {"Authorization": f"Bearer {l2_identity['token']}"}
+    assert world.client.get("/api/alerts", headers=l1_headers).status_code == 200
+    assert world.client.get("/api/users", headers=l1_headers).status_code == 403
+    assert world.client.get("/api/credentials", headers=l1_headers).status_code == 403
+    request_body = {"action": "isolate_host", "target": "vpn-01", "reason": "Investigate failed login burst"}
+    created = world.client.post(f"/api/alerts/{alert_id}/response-approvals", json=request_body, headers=l1_headers)
+    assert created.status_code == 201
+    decided = world.client.post(f"/api/response-approvals/{created.get_json()['id']}/decision",
+                                json={"decision": "approved"}, headers=l2_headers)
+    assert decided.status_code == 200
+
+
 def test_me_reports_the_session_identity(world):
     r = Api(world, CITY, "l2").get("/api/me")
     assert r.get_json() == {"kind": "session", "username": "analyst-l2", "tenant": CITY, "role": "l2"}
@@ -108,6 +132,7 @@ ROLE_MATRIX = [
     ("GET", "/api/me", {"hospital_admin", "l1", "l2", "viewer", "vendor_admin"}),
     ("GET", "/api/events", {"hospital_admin", "l1", "l2", "vendor_admin"}),
     ("GET", "/api/alerts", {"hospital_admin", "l1", "l2", "viewer", "vendor_admin"}),
+    ("GET", "/api/alerts/<int:i>", {"hospital_admin", "l1", "l2", "viewer", "vendor_admin"}),
     ("GET", "/api/credentials", {"hospital_admin"}),
     ("GET", "/api/users", {"hospital_admin"}),
     ("GET", "/api/settings", {"hospital_admin"}),
@@ -137,6 +162,7 @@ def test_vendor_admin_is_denied_hospital_payload_without_break_glass(world):
     vendor = Api(world, "platform", "vendor_admin")
     assert vendor.get(f"/api/events?tenant_id={CITY}").status_code == 403
     assert vendor.get(f"/api/alerts?tenant_id={CITY}").status_code == 403
+    assert vendor.get(f"/api/alerts/{alert_id}?tenant_id={CITY}").status_code == 403
     assert vendor.get("/api/credentials").status_code == 403
     assert vendor.get(f"/api/alerts/{alert_id}/handoffs?tenant_id={CITY}").status_code == 403
 
@@ -162,6 +188,22 @@ def test_telemetry_responses_omit_raw_identity_and_payload_fields(world):
         assert key not in alert
     assert "patient=person" not in str(alert)
     assert "203.0.113." not in str(alert)
+
+
+def test_auth_fail_alert_detail_returns_safe_telemetry(world):
+    ip = "203.0.113.41"
+    posted = Api(world, CITY).post("/api/events", json=failed_logins(CITY, ip=ip))
+    assert posted.status_code == 200 and posted.get_json()["alerts_created"] == 1
+    alert_id = Api(world, CITY, "viewer").get("/api/alerts").get_json()[0]["id"]
+    detail = Api(world, CITY, "viewer").get(f"/api/alerts/{alert_id}")
+    assert detail.status_code == 200
+    body = detail.get_json()
+    assert body["id"] == alert_id and body["rule"] == "FAILED_LOGIN_BURST" and body["summary"]
+    for key in ("detail", "attack_id", "dkey", "resolution"):
+        assert key not in body
+    assert ip not in str(body)
+    assert Api(world, CITY, "l1").get(f"/api/alerts/{alert_id}").status_code == 200
+    assert Api(world, ORTHO, "l1").get(f"/api/alerts/{alert_id}").status_code == 404
 
 
 # ---- Scope: tenant_id can only narrow -------------------------------------------------------------
@@ -192,12 +234,18 @@ def test_hospital_admin_can_update_only_its_hospital_name_setting(world):
     assert admin.get("/api/settings").get_json()["name"] == "City Hospital"
     updated = admin.put("/api/settings", json={"name": "City Hospital Test"})
     assert updated.status_code == 200 and updated.get_json()["name"] == "City Hospital Test"
+    complete = admin.put("/api/settings", json={"tenant": CITY, "name": "City Hospital Complete"})
+    assert complete.status_code == 200 and complete.get_json()["name"] == "City Hospital Complete"
+    assert admin.put("/api/settings", json={}).status_code == 400
+    assert admin.put("/api/settings", json={"name": "  "}).status_code == 400
+    assert admin.put("/api/settings", json={"tenant": "", "name": "Invalid tenant"}).status_code == 400
+    assert admin.put("/api/settings", json={"tenant": ORTHO, "name": "Wrong hospital"}).status_code == 403
     assert ortho.get("/api/settings").get_json()["name"] == "Ortho Clinic"
     assert Api(world, CITY, "l1").put("/api/settings", json={"name": "Nope"}).status_code == 403
     assert admin.put(f"/api/settings?tenant_id={ORTHO}", json={"name": "Nope"}).status_code == 403
     rows = owner_rows(world, "SELECT count(*) FROM audit_log WHERE tenant=%s AND action='tenant.settings.update'",
                       (CITY,))
-    assert rows[0][0] == 1
+    assert rows[0][0] == 2
     assert admin.put("/api/settings", json={"name": "City Hospital"}).status_code == 200
 
 
@@ -256,6 +304,30 @@ def test_l2_approval_is_required_for_allowlisted_response_actions(world):
     assert Api(world, CITY, "viewer").get(f"/api/alerts/{alert_id}/response-approvals").status_code == 403
     assert l1.post(f"/api/alerts/{alert_id}/response-approvals",
                    json={**request_body, "action": "run_shell_command"}).status_code == 400
+
+
+def test_hospital_admin_can_decide_another_users_approval(world):
+    alert_id = new_alert(world, CITY)
+    l1 = Api(world, CITY, "l1")
+    admin = Api(world, CITY, "hospital_admin")
+    created = l1.post(f"/api/alerts/{alert_id}/response-approvals", json={
+        "action": "disable_account", "target": "test-user", "reason": "Confirm the account is compromised"})
+    assert created.status_code == 201
+    decided = admin.post(f"/api/response-approvals/{created.get_json()['id']}/decision",
+                         json={"decision": "rejected", "note": "No incident evidence"})
+    assert decided.status_code == 200 and decided.get_json()["status"] == "rejected"
+
+
+def test_hospital_admin_can_request_approval_for_l2_decision(world):
+    alert_id = new_alert(world, CITY)
+    admin = Api(world, CITY, "hospital_admin")
+    l2 = Api(world, CITY, "l2")
+    created = admin.post(f"/api/alerts/{alert_id}/response-approvals", json={
+        "action": "block_ip", "target": "198.51.100.10", "reason": "Confirm response with L2"})
+    assert created.status_code == 201
+    decided = l2.post(f"/api/response-approvals/{created.get_json()['id']}/decision",
+                      json={"decision": "approved", "note": "Reviewed by L2"})
+    assert decided.status_code == 200 and decided.get_json()["status"] == "approved"
 
 
 def test_response_requester_cannot_approve_own_request(world):

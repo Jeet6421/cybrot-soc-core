@@ -200,6 +200,7 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 | `GET /api/events` | `hospital_admin`, `l1`, `l2`; vendor with break-glass | Read tenant events; supports `limit`, `before_id`, `type` and `host` filters |
 | `POST /api/ingest/wazuh` | ingest key | Ingest a Wazuh integration alert |
 | `GET /api/alerts` | hospital roles; vendor with break-glass | Newest 200 alerts; filter with `status`, `owner` |
+| `GET /api/alerts/<id>` | hospital roles; vendor with break-glass | One tenant-scoped alert with telemetry-safe fields |
 | `POST /api/alerts/<id>/ack` | `hospital_admin`, `l1`, `l2` | Acknowledge an alert |
 | `POST /api/alerts/<id>/verdict` | `hospital_admin`, `l2` | Close with `tp`, `fp` or `unclear`, and an optional `note` |
 | `POST /api/alerts/<id>/handoff` | `hospital_admin`, `l1`, `l2` | Pass an open alert to another analyst: `to_owner`, `note` |

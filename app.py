@@ -49,6 +49,7 @@ ROUTE_ROLES = {
     ("GET", "/api/settings"): {"hospital_admin"},
     ("PUT", "/api/settings"): {"hospital_admin"},
     ("GET", "/api/alerts"): set(HOSPITAL_READ) | {"vendor_admin"},
+    ("GET", "/api/alerts/<int:i>"): set(HOSPITAL_READ) | {"vendor_admin"},
     ("POST", "/api/alerts/<int:i>/ack"): {"hospital_admin", "l1", "l2"},
     ("POST", "/api/alerts/<int:i>/verdict"): {"hospital_admin", "l2"},
     ("GET", "/api/analysts"): set(HOSPITAL_READ),
@@ -773,6 +774,12 @@ def get_hospital_settings():
 def update_hospital_settings():
     tenant = hospital_scope("hospital_admin")
     body = _body(required=True)
+    if "tenant" in body:
+        requested_tenant = body["tenant"]
+        if not isinstance(requested_tenant, str) or not requested_tenant.strip():
+            raise Refuse(400, "tenant must be a non-empty string when supplied")
+        if requested_tenant != tenant:
+            raise Refuse(403, "tenant does not match your session")
     raw_name = body.get("name")
     name = raw_name.strip() if isinstance(raw_name, str) else ""
     if not name or len(name) > 120:
@@ -802,6 +809,20 @@ def alerts():
             args.append(request.args[f])
     rows = db().execute(q + " ORDER BY id DESC LIMIT 200", args).fetchall()
     return jsonify([_safe_alert(r) for r in rows])
+
+
+@app.get("/api/alerts/<int:i>")
+def alert_detail(i):
+    """Return the safe telemetry view for one alert in the caller's hospital."""
+    tenant = hospital_scope(*HOSPITAL_READ, "vendor_admin")
+    row = db().execute(
+        "SELECT id, created, event_ts, tenant, rule, rule_version, severity, summary, owner, step, status, ack_at, "
+        "verdict, source, (SELECT from_owner || ' -> ' || to_owner "
+        "FROM handoffs h WHERE h.alert_id = alerts.id ORDER BY h.id DESC LIMIT 1) AS last_handoff "
+        "FROM alerts WHERE id=%s AND tenant=%s", (i, tenant)).fetchone()
+    if not row:
+        raise Refuse(404, "alert not found")
+    return jsonify(_safe_alert(row))
 
 
 @app.post("/api/alerts/<int:i>/ack")
