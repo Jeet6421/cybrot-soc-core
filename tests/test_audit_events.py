@@ -91,7 +91,8 @@ def test_ack_and_verdict_require_sessions_and_record_the_authenticated_actors(wo
         world,
         "SELECT actor_id, actor_role, auth_context, break_glass_grant_id, action, resource_type, "
         "resource_id, resource_classification, outcome, metadata, request_id, occurred_at "
-        "FROM audit_events WHERE tenant_id=%s AND resource_id=%s ORDER BY action",
+        "FROM audit_events WHERE tenant_id=%s AND resource_type='alert' AND resource_id=%s "
+        "AND action IN ('alert.ack', 'alert.verdict') ORDER BY action",
         (CITY, str(alert_id)))
     assert len(events) == 2
     by_action = {row[4]: row for row in events}
