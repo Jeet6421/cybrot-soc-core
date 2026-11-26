@@ -44,6 +44,7 @@ ROUTE_ROLES = {
     ("GET", "/api/credentials"): {"hospital_admin"},
     ("POST", "/api/credentials"): {"hospital_admin"},
     ("POST", "/api/credentials/<int:kid>/revoke"): {"hospital_admin"},
+    ("POST", "/api/credentials/<int:kid>/rotate"): {"hospital_admin"},
     ("POST", "/api/logout"): {"session"},
     ("GET", "/api/me"): {"session"},
     ("GET", "/api/settings"): {"hospital_admin"},
@@ -115,6 +116,18 @@ class Refuse(Exception):
 
 @app.errorhandler(Refuse)
 def _refused(e):
+    identity = g.get("identity")
+    context = g.get("ctx")
+    if e.status in (401, 403, 404) and identity and context and context.get("tenant"):
+        c = db()
+        c.rollback()
+        _bind(c, context["tenant"], context["role"], context["actor_id"])
+        route_args = request.view_args or {}
+        resource_id = next((value for value in route_args.values() if isinstance(value, int)), None)
+        _record_current_audit(
+            c, action="authorization.denied", resource_type="api_request", resource_id=resource_id,
+            resource_classification="security_event", outcome="deny")
+        commit()
     return jsonify(error=e.message), e.status
 
 
@@ -201,6 +214,7 @@ def audit(action, detail=""):
 
 _AUDIT_VERDICTS = {"tp", "fp", "unclear"}
 _AUDIT_STATUSES = {"new", "ack", "closed"}
+_AUDIT_DECISIONS = {"approved", "rejected"}
 
 
 def redact_audit_metadata(metadata):
@@ -208,12 +222,38 @@ def redact_audit_metadata(metadata):
     if not isinstance(metadata, dict):
         return {}
     safe = {}
-    verdict = metadata.get("verdict")
-    if verdict in _AUDIT_VERDICTS:
-        safe["verdict"] = verdict
-    status = metadata.get("status")
-    if status in _AUDIT_STATUSES:
-        safe["status"] = status
+    for key in ("verdict", "previous_verdict", "new_verdict"):
+        value = metadata.get(key)
+        if value is None or value in _AUDIT_VERDICTS:
+            if key in metadata:
+                safe[key] = value
+    for key in ("status", "previous_status", "new_status"):
+        value = metadata.get(key)
+        if value in _AUDIT_STATUSES:
+            safe[key] = value
+    for key in ("role", "previous_role", "new_role"):
+        value = metadata.get(key)
+        if value in auth.HOSPITAL_ROLES:
+            safe[key] = value
+    for key in ("decision",):
+        value = metadata.get(key)
+        if value in _AUDIT_DECISIONS:
+            safe[key] = value
+    for key in ("owner_from", "owner_to"):
+        value = metadata.get(key)
+        if value in ANALYSTS:
+            safe[key] = value
+    action = metadata.get("response_action")
+    if action in RESPONSE_ACTIONS:
+        safe["response_action"] = action
+    for key in ("record_count", "alerts_created", "credential_id",
+                "previous_credential_id", "new_credential_id", "log_source_id"):
+        value = metadata.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 10**12:
+            safe[key] = value
+    token_version_advanced = metadata.get("token_version_advanced")
+    if isinstance(token_version_advanced, bool):
+        safe["token_version_advanced"] = token_version_advanced
     return safe
 
 
@@ -241,6 +281,26 @@ def record_audit_event(db_session, *, tenant_id, actor_id, actor_role, action, r
         (tenant_id, actor_id, actor_role, auth_context, break_glass_grant_id, action, resource_type,
          str(resource_id) if resource_id is not None else None, resource_classification, outcome,
          safe_metadata, uuid.uuid4().hex, source_ip, device_id))
+
+
+def _record_current_audit(db_session, *, action, resource_type, resource_id=None,
+                          resource_classification="security_event", outcome="allow", metadata=None):
+    identity = g.get("identity") or {}
+    context = g.get("ctx") or {}
+    tenant_id = context.get("tenant")
+    if not tenant_id:
+        raise RuntimeError("audit event requires a tenant-bound request context")
+    kind = identity.get("kind")
+    auth_context = "break_glass" if g.get("break_glass_read") else (
+        "ingest_key" if kind == "ingest" else "session" if kind == "session" else "system")
+    actor_id = identity.get("actor_id")
+    actor_role = identity.get("role") or context.get("role") or "system"
+    return record_audit_event(
+        db_session, tenant_id=tenant_id, actor_id=actor_id, actor_role=actor_role,
+        auth_context=auth_context, action=action, resource_type=resource_type,
+        resource_id=resource_id, resource_classification=resource_classification,
+        outcome=outcome, metadata=metadata, source_ip=request.remote_addr,
+        device_id=request.headers.get("X-Device-ID"))
 
 
 def raise_alert(c, tenant, rule, sev, summary, key, event_ts, attack_id=None, source="builtin",
@@ -523,7 +583,16 @@ def ingest():
             raise Refuse(403, "event tenant does not match this ingest key")
         e["tenant"] = ident["tenant"]
         e["log_source_id"] = ident["log_source_id"]
-    made_ids = _store_events(db(), evs)
+    c = db()
+    made_ids = _store_events(c, evs)
+    _record_current_audit(
+        c, action="event.ingest", resource_type="event_batch", resource_id=None,
+        resource_classification="telemetry", auth_context="ingest_key",
+        metadata={"record_count": len(evs), "alerts_created": len(made_ids)})
+    for alert_id in made_ids:
+        _record_current_audit(
+            c, action="alert.create", resource_type="alert", resource_id=alert_id,
+            resource_classification="telemetry", auth_context="ingest_key", metadata={"status": "new"})
     commit()
     _notify_new(db(), made_ids)
     return jsonify(events=len(evs), alerts_created=len(made_ids))
@@ -557,6 +626,10 @@ def list_events():
     rows = db().execute(query + " ORDER BY id DESC LIMIT %s", [*params, limit]).fetchall()
     events = [{key: _redact_text(row[key]) if key in ("source", "type", "host", "data_classification") else row[key]
                for key in row} for row in rows]
+    _record_current_audit(
+        db(), action="event.read", resource_type="event_batch", resource_id=None,
+        resource_classification="telemetry", metadata={"record_count": len(rows)})
+    commit()
     return jsonify(events=events, next_before_id=events[-1]["id"] if len(events) == limit else None)
 
 
@@ -617,6 +690,10 @@ def list_users():
     hospital_scope("hospital_admin")
     rows = db().execute("SELECT id, username, email, role, account_type, is_active, token_version, status, created "
                         "FROM users ORDER BY id").fetchall()
+    _record_current_audit(
+        db(), action="user.list", resource_type="user_collection", resource_id=None,
+        resource_classification="identity_metadata", metadata={"record_count": len(rows)})
+    commit()
     return jsonify([dict(r) for r in rows])
 
 
@@ -647,6 +724,9 @@ def create_user():
                     (tenant, username, email, role, auth.hash_password(password))).fetchone()
     if not row:
         raise Refuse(409, "username or email already belongs to an account")
+    _record_current_audit(
+        c, action="user.create", resource_type="user", resource_id=row["id"],
+        resource_classification="identity_metadata", metadata={"role": role})
     audit("user.create", f"{username} ({role})")
     commit()
     return jsonify(id=row["id"], username=username, email=email, role=role,
@@ -665,7 +745,11 @@ def change_user_role(uid):
         raise Refuse(404, "user not found or inactive")
     if row["role"] == role:
         return jsonify(id=uid, role=role, token_version_advanced=False)
-    db().execute("UPDATE users SET role=%s, token_version=token_version+1 WHERE id=%s", (role, uid))
+    c = db()
+    c.execute("UPDATE users SET role=%s, token_version=token_version+1 WHERE id=%s", (role, uid))
+    _record_current_audit(
+        c, action="user.role.change", resource_type="user", resource_id=uid,
+        resource_classification="identity_metadata", metadata={"previous_role": row["role"], "new_role": role})
     audit("user.role.change", f"{row['username']}: {row['role']} -> {role}")
     commit()
     return jsonify(id=uid, role=role, token_version_advanced=True)
@@ -681,6 +765,10 @@ def disable_user(uid):
                     "WHERE id=%s AND status='active' AND is_active RETURNING username", (uid,)).fetchone()
     if not row:
         raise Refuse(404, "user not found or already disabled")
+    _record_current_audit(
+        c, action="user.disable", resource_type="user", resource_id=uid,
+        resource_classification="identity_metadata",
+        metadata={"status": "disabled", "token_version_advanced": True})
     audit("user.disable", row["username"])
     commit()
     return jsonify(ok=True)
@@ -729,6 +817,10 @@ def list_credentials():
     """Ingest keys for this hospital. Metadata only: the key itself is shown once, when it is created."""
     hospital_scope("hospital_admin")
     rows = db().execute("SELECT id, label, log_source_id, created, revoked_at FROM ingest_keys ORDER BY id").fetchall()
+    _record_current_audit(
+        db(), action="credential.list", resource_type="credential_collection", resource_id=None,
+        resource_classification="credential_metadata", metadata={"record_count": len(rows)})
+    commit()
     return jsonify([dict(r) for r in rows])
 
 
@@ -747,6 +839,10 @@ def create_credential():
     key = secrets.token_urlsafe(32)
     row = c.execute("INSERT INTO ingest_keys(tenant, label, key_hash, log_source_id) VALUES(%s, %s, %s, %s) RETURNING id",
                     (tenant, label, auth.token_hash(key), sid)).fetchone()
+    _record_current_audit(
+        c, action="credential.create", resource_type="ingest_key", resource_id=row["id"],
+        resource_classification="credential_metadata",
+        metadata={"credential_id": row["id"], "log_source_id": sid})
     audit("credential.create", f"key {row['id']} for log source {sid}")
     commit()
     return jsonify(id=row["id"], log_source_id=sid, label=label, key=key,
@@ -760,9 +856,37 @@ def revoke_credential(kid):
     row = c.execute("UPDATE ingest_keys SET revoked_at=COALESCE(revoked_at, %s) WHERE id=%s RETURNING id", (now(), kid)).fetchone()
     if not row:
         raise Refuse(404, "credential not found")
+    _record_current_audit(
+        c, action="credential.revoke", resource_type="ingest_key", resource_id=row["id"],
+        resource_classification="credential_metadata", metadata={"credential_id": row["id"]})
     audit("credential.revoke", f"key {kid}")
     commit()
     return jsonify(ok=True)
+
+
+@app.post("/api/credentials/<int:kid>/rotate")
+def rotate_credential(kid):
+    tenant = hospital_scope("hospital_admin")
+    c = db()
+    old = c.execute(
+        "UPDATE ingest_keys SET revoked_at=COALESCE(revoked_at, %s) "
+        "WHERE id=%s AND revoked_at IS NULL RETURNING id, label, log_source_id",
+        (now(), kid)).fetchone()
+    if not old:
+        raise Refuse(404, "credential not found or already revoked")
+    key = secrets.token_urlsafe(32)
+    new = c.execute(
+        "INSERT INTO ingest_keys(tenant, label, key_hash, log_source_id) VALUES(%s, %s, %s, %s) RETURNING id",
+        (tenant, old["label"], auth.token_hash(key), old["log_source_id"])).fetchone()
+    _record_current_audit(
+        c, action="credential.rotate", resource_type="ingest_key", resource_id=new["id"],
+        resource_classification="credential_metadata",
+        metadata={"previous_credential_id": old["id"], "new_credential_id": new["id"],
+                  "log_source_id": old["log_source_id"]})
+    audit("credential.rotate", f"key {old['id']} -> {new['id']}")
+    commit()
+    return jsonify(id=new["id"], log_source_id=old["log_source_id"], label=old["label"], key=key,
+                   note="Store this key now. It is not shown again."), 201
 
 
 # ---- Sessions ------------------------------------------------------------------------------------
@@ -872,6 +996,10 @@ def alert_detail(i):
         "FROM alerts WHERE id=%s AND tenant=%s", (i, tenant)).fetchone()
     if not row:
         raise Refuse(404, "alert not found")
+    _record_current_audit(
+        db(), action="alert.detail.read", resource_type="alert", resource_id=i,
+        resource_classification="telemetry")
+    commit()
     return jsonify(_safe_alert(row))
 
 
@@ -879,15 +1007,14 @@ def alert_detail(i):
 def ack(i):
     hospital_scope("hospital_admin", "l1", "l2")
     actor = _session_audit_actor()
-    _alert_or_404(i)
+    row = _alert_or_404(i)
     c = db()
     c.execute("UPDATE alerts SET status='ack', ack_at=%s, acknowledged_by=%s, acknowledged_at=now() "
               "WHERE id=%s AND status='new'", (now(), actor["actor_id"], i))
-    record_audit_event(
-        c, tenant_id=g.ctx["tenant"], actor_id=actor["actor_id"], actor_role=actor["role"],
-        action="alert.ack", resource_type="alert", resource_id=i, resource_classification="telemetry",
-        metadata={"status": "ack"}, source_ip=request.remote_addr,
-        device_id=request.headers.get("X-Device-ID"))
+    _record_current_audit(
+        c, action="alert.ack", resource_type="alert", resource_id=i,
+        resource_classification="telemetry",
+        metadata={"previous_status": row["status"], "status": "ack"})
     commit()
     return jsonify(ok=True)
 
@@ -901,17 +1028,16 @@ def verdict(i):
     if v not in ("tp", "fp", "unclear"):
         raise Refuse(400, "verdict must be tp, fp or unclear")
     note = _text(body, "note", 500)  # optional closing note, kept with the alert
-    _alert_or_404(i)
+    row = _alert_or_404(i)
     c = db()
     c.execute("UPDATE alerts SET verdict=%s, status='closed', ack_at=COALESCE(ack_at,%s), "
               "acknowledged_by=COALESCE(acknowledged_by,%s), acknowledged_at=COALESCE(acknowledged_at,now()), "
               "verdict_by=%s, verdict_at=now(), resolution=COALESCE(NULLIF(%s,''), resolution) WHERE id=%s",
               (v, now(), actor["actor_id"], actor["actor_id"], note, i))
-    record_audit_event(
-        c, tenant_id=g.ctx["tenant"], actor_id=actor["actor_id"], actor_role=actor["role"],
-        action="alert.verdict", resource_type="alert", resource_id=i, resource_classification="telemetry",
-        metadata={"verdict": v}, source_ip=request.remote_addr,
-        device_id=request.headers.get("X-Device-ID"))
+    _record_current_audit(
+        c, action="alert.verdict", resource_type="alert", resource_id=i,
+        resource_classification="telemetry",
+        metadata={"previous_verdict": row.get("verdict"), "new_verdict": v})
     audit("alert.verdict", f"alert {i}: {v}")
     commit()
     return jsonify(ok=True)
@@ -941,6 +1067,9 @@ def handoff(i):
     c.execute("INSERT INTO handoffs(alert_id,at,from_owner,to_owner,note,tenant) VALUES(%s,%s,%s,%s,%s,%s)",
               (i, now(), row["owner"], to, note, row["tenant"]))
     c.execute("UPDATE alerts SET owner=%s WHERE id=%s", (to, i))
+    _record_current_audit(
+        c, action="alert.handoff", resource_type="alert", resource_id=i,
+        resource_classification="telemetry", metadata={"owner_from": row["owner"], "owner_to": to})
     audit("alert.handoff", f"alert {i} to {to}")
     commit()
     return jsonify(ok=True, from_owner=row["owner"], to_owner=to)
@@ -951,6 +1080,10 @@ def handoffs(i):
     hospital_scope(*HOSPITAL_READ, "vendor_admin")
     _alert_or_404(i)
     rows = db().execute("SELECT at, from_owner, to_owner FROM handoffs WHERE alert_id=%s ORDER BY id", (i,)).fetchall()
+    _record_current_audit(
+        db(), action="alert.handoffs.read", resource_type="alert", resource_id=i,
+        resource_classification="telemetry", metadata={"record_count": len(rows)})
+    commit()
     return jsonify([dict(r) for r in rows])
 
 
@@ -965,6 +1098,10 @@ def list_response_approvals(i):
         "SELECT id, alert_id, action, target, reason, status, requested_by, requested_at, "
         "approved_by, decided_at, decision_note FROM response_approvals "
         "WHERE alert_id=%s ORDER BY id DESC", (i,)).fetchall()
+    _record_current_audit(
+        db(), action="response_approval.list", resource_type="alert", resource_id=i,
+        resource_classification="security_event", metadata={"record_count": len(rows)})
+    commit()
     return jsonify([{key: _redact_text(value) if key in ("target", "reason", "decision_note") else value
                      for key, value in row.items()} for row in rows])
 
@@ -1000,6 +1137,10 @@ def request_response_approval(i):
         (tenant, i, action, target, reason, g.identity["actor_id"])).fetchone()
     if not row:
         raise Refuse(409, "a matching response approval is already pending")
+    _record_current_audit(
+        db(), action="response_approval.request", resource_type="response_approval", resource_id=row["id"],
+        resource_classification="security_event",
+        metadata={"response_action": action, "status": row["status"]})
     audit("response_approval.request", f"approval {row['id']}: {action} for alert {i}")
     commit()
     return jsonify(id=row["id"], alert_id=i, action=action, target=_redact_text(target), status=row["status"],
@@ -1028,6 +1169,10 @@ def decide_response_approval(approval_id):
         "UPDATE response_approvals SET status=%s, approved_by=%s, decided_at=%s, decision_note=%s "
         "WHERE id=%s",
         (decision, g.identity["actor_id"], decided_at, note, approval_id))
+    _record_current_audit(
+        db(), action="response_approval.decision", resource_type="response_approval", resource_id=approval_id,
+        resource_classification="security_event",
+        metadata={"response_action": row["action"], "decision": decision})
     audit("response_approval.decision", f"approval {approval_id}: {decision}")
     commit()
     return jsonify(id=approval_id, alert_id=row["alert_id"], action=row["action"],
