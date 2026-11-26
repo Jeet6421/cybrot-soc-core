@@ -71,11 +71,39 @@ CREATE TABLE IF NOT EXISTS alerts(id BIGSERIAL PRIMARY KEY, created TEXT, event_
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS detail TEXT;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS resolution TEXT;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS rule_version TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS users_id_tenant_uidx ON users(id, tenant);
+CREATE UNIQUE INDEX IF NOT EXISTS alerts_id_tenant_uidx ON alerts(id, tenant);
 
 CREATE TABLE IF NOT EXISTS handoffs(id BIGSERIAL PRIMARY KEY, alert_id BIGINT, at TEXT, from_owner TEXT,
   to_owner TEXT, note TEXT);
 ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS tenant TEXT;
 CREATE INDEX IF NOT EXISTS ho_idx ON handoffs(alert_id);
+
+-- Response approvals record a human approval decision. They never execute an action themselves.
+CREATE TABLE IF NOT EXISTS response_approvals(
+  id BIGSERIAL PRIMARY KEY,
+  tenant TEXT NOT NULL REFERENCES tenants(id),
+  alert_id BIGINT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('isolate_host', 'disable_account', 'block_ip')),
+  target TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+  requested_by BIGINT NOT NULL,
+  requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  approved_by BIGINT,
+  decided_at TIMESTAMPTZ,
+  decision_note TEXT NOT NULL DEFAULT '',
+  FOREIGN KEY (alert_id, tenant) REFERENCES alerts(id, tenant),
+  FOREIGN KEY (requested_by, tenant) REFERENCES users(id, tenant),
+  FOREIGN KEY (approved_by, tenant) REFERENCES users(id, tenant),
+  CHECK (length(btrim(target)) BETWEEN 1 AND 200),
+  CHECK (length(btrim(reason)) BETWEEN 1 AND 500),
+  CHECK ((status = 'pending' AND approved_by IS NULL AND decided_at IS NULL)
+      OR (status IN ('approved', 'rejected') AND approved_by IS NOT NULL AND decided_at IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS response_approvals_tenant_alert_idx ON response_approvals(tenant, alert_id, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS response_approvals_one_pending_idx
+  ON response_approvals(alert_id, action, target) WHERE status = 'pending';
 
 -- 3. Request context helpers. The app sets these with set_config(..., true), which is transaction-local:
 --    they vanish at COMMIT or ROLLBACK, so a pooled connection never carries one request's context into
@@ -142,6 +170,10 @@ CREATE POLICY tenants_read ON tenants FOR SELECT
 DROP POLICY IF EXISTS tenants_create ON tenants;
 CREATE POLICY tenants_create ON tenants FOR INSERT
   WITH CHECK (app_role() = 'vendor_admin');
+DROP POLICY IF EXISTS tenants_update ON tenants;
+CREATE POLICY tenants_update ON tenants FOR UPDATE
+  USING (id = app_tenant() AND app_role() = 'hospital_admin')
+  WITH CHECK (id = app_tenant() AND app_role() = 'hospital_admin');
 
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE users FORCE ROW LEVEL SECURITY;
@@ -209,6 +241,30 @@ DROP POLICY IF EXISTS handoffs_write ON handoffs;
 CREATE POLICY handoffs_write ON handoffs FOR INSERT
   WITH CHECK (tenant = app_tenant() AND app_role() IN ('hospital_admin', 'l1', 'l2'));
 
+ALTER TABLE response_approvals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE response_approvals FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS response_approvals_read ON response_approvals;
+CREATE POLICY response_approvals_read ON response_approvals FOR SELECT
+  USING (tenant = app_tenant() AND app_role() IN ('hospital_admin', 'l1', 'l2'));
+DROP POLICY IF EXISTS response_approvals_request ON response_approvals;
+CREATE POLICY response_approvals_request ON response_approvals FOR INSERT
+  WITH CHECK (tenant = app_tenant()
+    AND app_role() IN ('hospital_admin', 'l1', 'l2')
+    AND requested_by = app_actor_id()
+    AND status = 'pending'
+    AND approved_by IS NULL AND decided_at IS NULL);
+DROP POLICY IF EXISTS response_approvals_decide ON response_approvals;
+CREATE POLICY response_approvals_decide ON response_approvals FOR UPDATE
+  USING (tenant = app_tenant()
+    AND app_role() IN ('hospital_admin', 'l2')
+    AND status = 'pending'
+    AND requested_by <> app_actor_id())
+  WITH CHECK (tenant = app_tenant()
+    AND app_role() IN ('hospital_admin', 'l2')
+    AND status IN ('approved', 'rejected')
+    AND approved_by = app_actor_id()
+    AND decided_at IS NOT NULL);
+
 -- A session belongs to one user. The app only sees and changes its own sessions.
 ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions FORCE ROW LEVEL SECURITY;
@@ -236,7 +292,11 @@ CREATE POLICY break_glass_read ON break_glass_grants FOR SELECT
 -- 5. Grants. soc_app gets only what the app uses. No CREATE, no TRUNCATE, no DDL.
 GRANT USAGE ON SCHEMA public TO soc_app;
 GRANT SELECT, INSERT ON tenants TO soc_app;
+GRANT UPDATE (name) ON tenants TO soc_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON users, log_sources, ingest_keys, events, alerts, handoffs, sessions TO soc_app;
 GRANT SELECT, INSERT ON audit_log TO soc_app;
 GRANT SELECT ON break_glass_grants TO soc_app;
+GRANT SELECT, INSERT ON response_approvals TO soc_app;
+GRANT UPDATE (status, approved_by, decided_at, decision_note) ON response_approvals TO soc_app;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO soc_app;
+
