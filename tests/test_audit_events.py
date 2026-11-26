@@ -61,8 +61,13 @@ def test_ack_and_verdict_require_sessions_and_record_the_authenticated_actors(wo
     assert unauthenticated.post(f"/api/alerts/{alert_id}/ack").status_code == 401
     assert unauthenticated.post(
         f"/api/alerts/{alert_id}/verdict", json={"verdict": "tp"}).status_code == 401
+    # The ingest/alert flow and denied unauthenticated attempts are audited, but
+    # neither rejected request may create a triage mutation audit record.
     assert _owner_rows(
-        world, "SELECT count(*) FROM audit_events WHERE resource_id=%s", (str(alert_id),))[0][0] == 0
+        world,
+        "SELECT count(*) FROM audit_events WHERE resource_id=%s AND action IN ('alert.ack', 'alert.verdict')",
+        (str(alert_id),),
+    )[0][0] == 0
 
     l1 = Api(world, CITY, "l1")
     l2 = Api(world, CITY, "l2")
