@@ -152,6 +152,10 @@ BEGIN
     ALTER TABLE break_glass_grants ADD CONSTRAINT break_glass_scope_check
       CHECK (scope IN ('events:read', 'alerts:read', 'handoffs:read', 'metrics:read'));
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='break_glass_ttl_check') THEN
+    ALTER TABLE break_glass_grants ADD CONSTRAINT break_glass_ttl_check
+      CHECK (requested_ttl_minutes BETWEEN 1 AND 60);
+  END IF;
 END $grant_scope_constraint$;
 
 CREATE TABLE IF NOT EXISTS events(id BIGSERIAL PRIMARY KEY, ts TEXT, tenant TEXT, source TEXT, type TEXT,
@@ -242,12 +246,21 @@ CREATE OR REPLACE FUNCTION app_actor_id() RETURNS bigint LANGUAGE sql STABLE
 -- Is there an unrevoked, unexpired break-glass grant for this actor and this hospital? SECURITY DEFINER so
 -- that the check does not depend on the caller's row access to break_glass_grants.
 CREATE OR REPLACE FUNCTION break_glass_active(p_tenant text) RETURNS boolean
-  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
   SELECT p_tenant IS NOT NULL AND EXISTS (
     SELECT 1 FROM break_glass_grants g
     WHERE g.tenant_id = p_tenant AND g.vendor_actor_id = app_actor_id()
       AND g.approved_at IS NOT NULL AND g.revoked_at IS NULL AND g.expires_at > now())
-$;
+$$;
+
+CREATE OR REPLACE FUNCTION break_glass_scope_active(p_tenant text, p_scope text) RETURNS boolean
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  SELECT p_tenant IS NOT NULL AND EXISTS (
+    SELECT 1 FROM break_glass_grants g
+    WHERE g.tenant_id = p_tenant AND g.vendor_actor_id = app_actor_id()
+      AND g.scope = p_scope AND g.approved_at IS NOT NULL
+      AND g.revoked_at IS NULL AND g.expires_at > now())
+$$;
 
 -- Lookups that must run before any tenant is known (login, session check, ingest key check).
 -- They return one narrow row and run as the owner, so they are the only reads that cross tenants.
@@ -287,10 +300,12 @@ REVOKE ALL ON FUNCTION auth_user_for_login(text, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION auth_session(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION auth_ingest_key(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION break_glass_active(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION break_glass_scope_active(text, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION auth_user_for_login(text, text) TO soc_app;
 GRANT EXECUTE ON FUNCTION auth_session(text) TO soc_app;
 GRANT EXECUTE ON FUNCTION auth_ingest_key(text) TO soc_app;
 GRANT EXECUTE ON FUNCTION break_glass_active(text) TO soc_app;
+GRANT EXECUTE ON FUNCTION break_glass_scope_active(text, text) TO soc_app;
 
 -- 4. Row-level security. ENABLE turns RLS on, FORCE makes it apply to the table owner too.
 --    Each policy is dropped and created again, so a changed policy takes effect on the next deploy.
@@ -342,7 +357,7 @@ DROP POLICY IF EXISTS events_read ON events;
 CREATE POLICY events_read ON events FOR SELECT
   USING (tenant = app_tenant() AND (
     app_role() IN ('hospital_admin', 'l1', 'l2', 'viewer', 'ingest')
-    OR (app_role() = 'vendor_admin' AND break_glass_active(app_tenant()))));
+    OR (app_role() = 'vendor_admin' AND break_glass_scope_active(app_tenant(), 'events:read'))));
 DROP POLICY IF EXISTS events_ingest ON events;
 CREATE POLICY events_ingest ON events FOR INSERT
   WITH CHECK (tenant = app_tenant() AND app_role() = 'ingest');
@@ -353,7 +368,8 @@ DROP POLICY IF EXISTS alerts_read ON alerts;
 CREATE POLICY alerts_read ON alerts FOR SELECT
   USING (tenant = app_tenant() AND (
     app_role() IN ('hospital_admin', 'l1', 'l2', 'viewer', 'ingest')
-    OR (app_role() = 'vendor_admin' AND break_glass_active(app_tenant()))));
+    OR (app_role() = 'vendor_admin' AND (break_glass_scope_active(app_tenant(), 'alerts:read')
+      OR break_glass_scope_active(app_tenant(), 'metrics:read')))));
 DROP POLICY IF EXISTS alerts_ingest ON alerts;
 CREATE POLICY alerts_ingest ON alerts FOR INSERT
   WITH CHECK (tenant = app_tenant() AND app_role() = 'ingest');
@@ -373,7 +389,8 @@ DROP POLICY IF EXISTS handoffs_read ON handoffs;
 CREATE POLICY handoffs_read ON handoffs FOR SELECT
   USING (tenant = app_tenant() AND (
     app_role() IN ('hospital_admin', 'l1', 'l2', 'viewer')
-    OR (app_role() = 'vendor_admin' AND break_glass_active(app_tenant()))));
+    OR (app_role() = 'vendor_admin' AND (break_glass_scope_active(app_tenant(), 'handoffs:read')
+      OR break_glass_scope_active(app_tenant(), 'alerts:read')))));
 DROP POLICY IF EXISTS handoffs_write ON handoffs;
 CREATE POLICY handoffs_write ON handoffs FOR INSERT
   WITH CHECK (tenant = app_tenant() AND app_role() IN ('hospital_admin', 'l1', 'l2'));
