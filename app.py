@@ -33,6 +33,11 @@ ROUTE_ROLES = {
     ("GET", "/api/events"): {"hospital_admin", "l1", "l2", "vendor_admin"},
     ("POST", "/api/ingest/wazuh"): {"ingest"},
     ("GET", "/api/tenants"): {"vendor_admin"},
+    ("GET", "/api/break-glass/grants"): {"vendor_admin", "hospital_admin"},
+    ("POST", "/api/break-glass/grants"): {"vendor_admin"},
+    ("POST", "/api/break-glass/grants/<uuid:grant_id>/approve"): {"hospital_admin"},
+    ("POST", "/api/break-glass/grants/<uuid:grant_id>/revoke"): {"hospital_admin"},
+    ("POST", "/api/break-glass/grants/<uuid:grant_id>/review"): {"hospital_admin"},
     ("POST", "/api/tenants"): {"vendor_admin"},
     ("GET", "/api/users"): {"hospital_admin"},
     ("POST", "/api/users"): {"hospital_admin"},
@@ -215,6 +220,7 @@ def audit(action, detail=""):
 _AUDIT_VERDICTS = {"tp", "fp", "unclear"}
 _AUDIT_STATUSES = {"new", "ack", "closed", "pending", "disabled"}
 _AUDIT_DECISIONS = {"approved", "rejected"}
+_AUDIT_SCOPES = {"events:read", "alerts:read", "handoffs:read", "metrics:read"}
 
 
 def redact_audit_metadata(metadata):
@@ -239,6 +245,10 @@ def redact_audit_metadata(metadata):
         value = metadata.get(key)
         if value in _AUDIT_DECISIONS:
             safe[key] = value
+    if metadata.get("scope") in _AUDIT_SCOPES:
+        safe["scope"] = metadata["scope"]
+    if metadata.get("priority") in {"high", "critical"}:
+        safe["priority"] = metadata["priority"]
     for key in ("owner_from", "owner_to"):
         value = metadata.get(key)
         if value in ANALYSTS:
@@ -300,7 +310,8 @@ def _record_current_audit(db_session, *, action, resource_type, resource_id=None
         auth_context=auth_context, action=action, resource_type=resource_type,
         resource_id=resource_id, resource_classification=resource_classification,
         outcome=outcome, metadata=metadata, source_ip=request.remote_addr,
-        device_id=request.headers.get("X-Device-ID"))
+        device_id=request.headers.get("X-Device-ID"),
+        break_glass_grant_id=g.get("break_glass_grant_id"))
 
 
 def raise_alert(c, tenant, rule, sev, summary, key, event_ts, attack_id=None, source="builtin",
@@ -487,9 +498,23 @@ def _require_vendor():
     return ident
 
 
-def _break_glass_active(tenant):
-    row = db().execute("SELECT break_glass_active(%s) AS ok", (tenant,)).fetchone()
-    return bool(row["ok"])
+_VENDOR_READ_SCOPES = {
+    ("GET", "/api/events"): "events:read",
+    ("GET", "/api/alerts"): "alerts:read",
+    ("GET", "/api/alerts/<int:i>"): "alerts:read",
+    ("GET", "/api/alerts/<int:i>/handoffs"): "handoffs:read",
+    ("GET", "/api/metrics"): "metrics:read",
+    ("GET", "/api/exit-criteria"): "metrics:read",
+}
+
+
+def _active_break_glass_grant(tenant, scope):
+    return db().execute(
+        "SELECT grant_id, scope FROM break_glass_grants WHERE vendor_actor_id=%s AND tenant_id=%s "
+        "AND scope=%s AND approved_at IS NOT NULL AND revoked_at IS NULL AND expires_at>now() "
+        "ORDER BY approved_at DESC LIMIT 1",
+        (g.identity["actor_id"], tenant, scope),
+    ).fetchone()
 
 
 def hospital_scope(*allowed):
@@ -508,17 +533,185 @@ def hospital_scope(*allowed):
             raise Refuse(403, "vendor_admin has no routine access to this")
         if not wanted:
             raise Refuse(403, "name the hospital (tenant_id) to request break-glass access")
-        if not _break_glass_active(wanted):
-            raise Refuse(403, "no active break-glass grant for this hospital")
+        route = (request.method, request.url_rule.rule if request.url_rule else request.path)
+        required_scope = _VENDOR_READ_SCOPES.get(route)
+        if not required_scope:
+            raise Refuse(403, "this diagnostic endpoint is not in a supported break-glass scope")
+        grant = _active_break_glass_grant(wanted, required_scope)
+        if not grant:
+            raise Refuse(403, "no active break-glass grant for this hospital and scope")
         set_context(wanted, "vendor_admin", ident["actor_id"])
-        audit("break_glass.read", request.path)
         g.break_glass_read = True
+        g.break_glass_grant_id = grant["grant_id"]
+        audit("break_glass.read", request.path)
+        _record_current_audit(
+            db(), action="break_glass.access", resource_type="api_request",
+            resource_classification="security_event", metadata={"scope": required_scope})
         return wanted
     if wanted and wanted != ident["tenant"]:
         raise Refuse(403, "tenant_id does not match your session")
     if ident["role"] not in allowed:
         raise Refuse(403, "your role cannot do this")
     return ident["tenant"]
+
+
+def _grant_state(row):
+    if row["revoked_at"] is not None:
+        return "revoked"
+    if row["approved_at"] is None:
+        return "pending"
+    return "active" if row["expires_at"] > datetime.now(timezone.utc) else "expired"
+
+
+def _grant_json(row):
+    return {
+        "grant_id": str(row["grant_id"]), "vendor_actor_id": row["vendor_actor_id"],
+        "tenant_id": row["tenant_id"], "ticket_id": row["ticket_id"], "reason": row["reason"],
+        "scope": row["scope"], "requested_at": row["requested_at"],
+        "approved_by": row["approved_by"], "approved_at": row["approved_at"],
+        "expires_at": row["expires_at"], "revoked_at": row["revoked_at"],
+        "reviewed_by": row["reviewed_by"], "reviewed_at": row["reviewed_at"],
+        "state": _grant_state(row),
+    }
+
+
+def _grant_or_404(c, grant_id):
+    row = c.execute("SELECT * FROM break_glass_grants WHERE grant_id=%s", (str(grant_id),)).fetchone()
+    if not row:
+        raise Refuse(404, "break-glass grant not found in this hospital")
+    return row
+
+
+@app.get("/api/break-glass/grants")
+def list_break_glass_grants():
+    ident = g.identity
+    c = db()
+    rows = c.execute(
+        "SELECT * FROM break_glass_grants ORDER BY requested_at DESC, grant_id DESC LIMIT 200"
+    ).fetchall()
+    _record_current_audit(
+        c, action="break_glass.grant.list", resource_type="break_glass_grant",
+        resource_classification="security_event", metadata={"record_count": len(rows)})
+    commit()
+    return jsonify(grants=[_grant_json(row) for row in rows])
+
+
+@app.post("/api/break-glass/grants")
+def request_break_glass_grant():
+    ident = _require_vendor()
+    body = _body(required=True)
+    tenant = _text(body, "tenant_id", 120)
+    ticket_id = _text(body, "ticket_id", 120)
+    reason = _text(body, "reason", 1000)
+    scope = _text(body, "scope", 80)
+    if not tenant or not ticket_id or not reason or not scope:
+        raise Refuse(400, "tenant_id, ticket_id, reason, and scope are required")
+    if scope not in _AUDIT_SCOPES:
+        raise Refuse(400, "scope must be events:read, alerts:read, handoffs:read, or metrics:read")
+    ttl = body.get("ttl_minutes", 30)
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or not 1 <= ttl <= 60:
+        raise Refuse(400, "ttl_minutes must be an integer between 1 and 60")
+    c = db()
+    if not c.execute("SELECT 1 FROM tenants WHERE id=%s", (tenant,)).fetchone() or tenant == auth.PLATFORM_TENANT:
+        raise Refuse(404, "target hospital not found")
+    set_context(tenant, "vendor_admin", ident["actor_id"])
+    row = c.execute(
+        "INSERT INTO break_glass_grants(actor_id, tenant, reason, granted_by, created, expires_at, "
+        "vendor_actor_id, tenant_id, ticket_id, scope, requested_at, requested_ttl_minutes) "
+        "VALUES (%s, %s, %s, %s, now(), now() + (%s * interval '1 minute'), %s, %s, %s, %s, now(), %s) "
+        "RETURNING *",
+        (ident["actor_id"], tenant, reason, ident["name"], ttl, ident["actor_id"], tenant,
+         ticket_id, scope, ttl),
+    ).fetchone()
+    _record_current_audit(
+        c, action="break_glass.request", resource_type="break_glass_grant",
+        resource_id=row["grant_id"], resource_classification="security_event",
+        metadata={"scope": scope})
+    commit()
+    return jsonify(_grant_json(row)), 201
+
+
+@app.post("/api/break-glass/grants/<uuid:grant_id>/approve")
+def approve_break_glass_grant(grant_id):
+    c = db()
+    row = _grant_or_404(c, grant_id)
+    if row["approved_at"] is not None or row["revoked_at"] is not None:
+        raise Refuse(409, "grant is no longer pending approval")
+    actor = _session_audit_actor()
+    approved = c.execute(
+        "UPDATE break_glass_grants SET approved_by=%s, approved_at=now(), "
+        "expires_at=now() + (requested_ttl_minutes * interval '1 minute') "
+        "WHERE grant_id=%s AND approved_at IS NULL AND revoked_at IS NULL RETURNING *",
+        (actor["actor_id"], str(grant_id)),
+    ).fetchone()
+    if not approved:
+        raise Refuse(409, "grant is no longer pending approval")
+    g.break_glass_grant_id = approved["grant_id"]
+    _record_current_audit(
+        c, action="break_glass.activate", resource_type="break_glass_grant",
+        resource_id=approved["grant_id"], resource_classification="security_event",
+        metadata={"scope": approved["scope"], "priority": "high"})
+    event_time = now()
+    alert = c.execute(
+        "INSERT INTO alerts(created, event_ts, tenant, rule, rule_version, severity, summary, dkey, "
+        "owner, step, source, detail) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        (event_time, event_time, approved["tenant_id"], "VENDOR_BREAK_GLASS_ACTIVATED", "1",
+         "critical", "Vendor break-glass access activated; review the access grant.",
+         "break-glass:" + str(approved["grant_id"]), ANALYSTS[0],
+         "Review the vendor access request and confirm the session is limited to its approved scope.",
+         "security", ""),
+    ).fetchone()
+    _record_current_audit(
+        c, action="alert.create", resource_type="alert", resource_id=alert["id"],
+        resource_classification="telemetry",
+        metadata={"rule": "VENDOR_BREAK_GLASS_ACTIVATED", "severity": "critical"})
+    commit()
+    return jsonify(grant=_grant_json(approved), alert_id=alert["id"])
+
+
+@app.post("/api/break-glass/grants/<uuid:grant_id>/revoke")
+def revoke_break_glass_grant(grant_id):
+    c = db()
+    row = _grant_or_404(c, grant_id)
+    if row["revoked_at"] is not None:
+        raise Refuse(409, "grant is already revoked")
+    actor = _session_audit_actor()
+    updated = c.execute(
+        "UPDATE break_glass_grants SET revoked_at=now() WHERE grant_id=%s AND revoked_at IS NULL RETURNING *",
+        (str(grant_id),),
+    ).fetchone()
+    _record_current_audit(
+        c, action="break_glass.revoke", resource_type="break_glass_grant",
+        resource_id=grant_id, resource_classification="security_event",
+        metadata={"scope": row["scope"]})
+    commit()
+    return jsonify(grant=_grant_json(updated), revoked_by=actor["actor_id"])
+
+
+@app.post("/api/break-glass/grants/<uuid:grant_id>/review")
+def review_break_glass_grant(grant_id):
+    c = db()
+    row = _grant_or_404(c, grant_id)
+    if row["approved_at"] is None:
+        raise Refuse(409, "pending grants do not need a post-session review")
+    if row["revoked_at"] is None and c.execute(
+        "SELECT %s::timestamptz > now() AS active", (row["expires_at"],)
+    ).fetchone()["active"]:
+        raise Refuse(409, "review is available after the grant expires or is revoked")
+    if row["reviewed_at"] is not None:
+        raise Refuse(409, "grant has already been reviewed")
+    actor = _session_audit_actor()
+    updated = c.execute(
+        "UPDATE break_glass_grants SET reviewed_by=%s, reviewed_at=now() "
+        "WHERE grant_id=%s AND reviewed_at IS NULL RETURNING *",
+        (actor["actor_id"], str(grant_id)),
+    ).fetchone()
+    _record_current_audit(
+        c, action="break_glass.review", resource_type="break_glass_grant",
+        resource_id=grant_id, resource_classification="security_event",
+        metadata={"scope": row["scope"]})
+    commit()
+    return jsonify(grant=_grant_json(updated))
 
 
 def _body(required=False):
