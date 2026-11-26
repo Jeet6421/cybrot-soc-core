@@ -127,7 +127,8 @@ ALTER TABLE alerts ADD COLUMN IF NOT EXISTS acknowledged_by BIGINT;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS verdict_by BIGINT;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS verdict_at TIMESTAMPTZ;
-DO $
+CREATE UNIQUE INDEX IF NOT EXISTS users_id_tenant_uidx ON users(id, tenant);
+DO $constraint$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'alerts_acknowledged_by_tenant_fk') THEN
     ALTER TABLE alerts ADD CONSTRAINT alerts_acknowledged_by_tenant_fk
@@ -137,8 +138,7 @@ BEGIN
     ALTER TABLE alerts ADD CONSTRAINT alerts_verdict_by_tenant_fk
       FOREIGN KEY (verdict_by, tenant) REFERENCES users(id, tenant);
   END IF;
-END $;
-CREATE UNIQUE INDEX IF NOT EXISTS users_id_tenant_uidx ON users(id, tenant);
+END $constraint$;
 CREATE UNIQUE INDEX IF NOT EXISTS alerts_id_tenant_uidx ON alerts(id, tenant);
 CREATE INDEX IF NOT EXISTS alerts_tenant_id_idx ON alerts(tenant, id);
 
@@ -355,10 +355,10 @@ CREATE POLICY sessions_own ON sessions FOR ALL
 
 -- Audit rows are written by the app and read by hospital admins. The app cannot change or delete them.
 CREATE OR REPLACE FUNCTION reject_audit_event_mutation() RETURNS trigger
-LANGUAGE plpgsql AS $
+LANGUAGE plpgsql AS $audit$
 BEGIN
   RAISE EXCEPTION 'audit_events is append-only' USING ERRCODE = '55000';
-END $;
+END $audit$;
 DROP TRIGGER IF EXISTS audit_events_no_update_delete ON audit_events;
 CREATE TRIGGER audit_events_no_update_delete
   BEFORE UPDATE OR DELETE ON audit_events
