@@ -98,11 +98,12 @@ def world():
     with psycopg.connect(SESSION_OWNER_URL) as owner:
         manage.create_tenant(owner, "city-hospital", "City Hospital")
         manage.create_tenant(owner, "ortho-clinic", "Ortho Clinic")
-        manage.create_user(owner, "platform", USERNAME["vendor_admin"], "vendor_admin", PASSWORD)
+        manage.create_user(owner, "platform", USERNAME["vendor_admin"], "vendor_admin", PASSWORD, "vendor@example.test")
         keys = {}
         for tenant in HOSPITALS:
             for role in HOSPITAL_ROLES:
-                manage.create_user(owner, tenant, USERNAME[role], role, PASSWORD)
+                manage.create_user(owner, tenant, USERNAME[role], role, PASSWORD,
+                                   f"{USERNAME[role]}+{tenant}@example.test")
             manage.create_log_source(owner, tenant, "ehr-feed", "wazuh")
             keys[tenant] = manage.create_ingest_key(owner, tenant, "ehr-feed", "test key")
             owner.commit()

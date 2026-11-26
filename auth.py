@@ -127,6 +127,13 @@ def decrypt_secret(token, secret_key):
         return None
 
 
+def email_problem(email):
+    """None when email is a valid, normalized per-person identity."""
+    if not isinstance(email, str) or not EMAIL_RE.fullmatch(email.strip().lower()):
+        return "email must be a valid address"
+    return None
+
+
 def new_session_token():
     return secrets.token_urlsafe(32)
 
@@ -140,6 +147,8 @@ def token_hash(token):
 # Identity constants and helpers used by the tenant/RBAC API in PR #16.
 TENANT_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
 USERNAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{2,39}")
+EMAIL_RE = re.compile(r"(?=.{3,254}$)[^@\s]+@[^@\s]+\.[^@\s]+")
+ACCOUNT_TYPES = ("hospital_staff", "vendor_support", "external_auditor", "service_principal")
 PLATFORM_TENANT = "platform"
 HOSPITAL_ROLES = ("hospital_admin", "l1", "l2", "viewer")
 ROLES = HOSPITAL_ROLES + ("vendor_admin",)

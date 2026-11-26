@@ -114,7 +114,7 @@ The six `HC-*` rules are a pilot implementation of the P1 items in the healthcar
 
 ## Wazuh integration
 - Wazuh alerts arrive at `POST /api/ingest/wazuh` with the hospital's ingest key (header, or `?token=` for Wazuh's integration). The key sets the hospital; `tenant` in the URL is ignored. Level 12+ is critical, 10+ high, 7+ medium.
-- Each alert keeps its key facts (file path, process) in the `detail` column, shown under the summary.
+- Each alert may retain key facts (file path, process) internally in the `detail` column; API alert responses omit that raw field.
 - Rule 92213 (Sysmon file drop) has its own response step. Other Wazuh rules use a level-based step.
 - Repeats of the same rule, host, file and process within 10 minutes are suppressed. A different file alerts again.
 - Tuning rule 100200 in `wazuh/local_rules.xml` silences the benign PowerShell execution-policy test file.
@@ -139,9 +139,9 @@ The six `HC-*` rules are a pilot implementation of the P1 items in the healthcar
 ## First-time setup (vendor admin and first hospital)
 Run these from the Docker host, as the owner role. None of them is an API call, and the password is typed at a prompt.
 
-    docker compose run --rm migrate python manage.py create-user platform vendor vendor_admin
+    docker compose run --rm migrate python manage.py create-user platform vendor vendor_admin --email vendor@example.com
     docker compose run --rm migrate python manage.py create-tenant city-hospital "City Hospital"
-    docker compose run --rm migrate python manage.py create-user city-hospital admin hospital_admin
+    docker compose run --rm migrate python manage.py create-user city-hospital admin hospital_admin --email admin@city-hospital.example
     docker compose run --rm migrate python manage.py create-log-source city-hospital ehr-feed --kind wazuh
     docker compose run --rm migrate python manage.py create-ingest-key city-hospital ehr-feed --label wazuh-01
 
@@ -151,7 +151,7 @@ The hospital admin then signs in, adds analysts with `POST /api/users`, and issu
     docker compose run --rm migrate python manage.py grant-break-glass vendor city-hospital --hours 4 --reason "INC-123"
 
 ## Accounts, roles and ingest keys (v1.2)
-Each hospital is a **tenant**, with a stable id (2 to 63 lowercase letters, digits or hyphens). The vendor's own tenant is `platform`.
+Each hospital is a **tenant**, with a stable id (2 to 63 lowercase letters, digits or hyphens). Vendor support signs in using `platform`, but its user row has no hospital tenant. Each person has a unique email identity; shared usernames or email addresses are rejected. Accounts are classified as `hospital_staff`, `vendor_support`, `external_auditor` or `service_principal`, and can be disabled independently.
 The tenant of every request comes from the caller's identity. A `tenant_id` in the request can narrow within that scope; any other value gets `403` before a query runs.
 
 | Role | Can | Cannot |
@@ -160,7 +160,7 @@ The tenant of every request comes from the caller's identity. A `tenant_id` in t
 | `l1` | Read its events and alerts; acknowledge; hand off; request a response approval | Close alerts (verdict); approve response requests; manage users, keys, log sources or settings |
 | `l2` | Everything `l1` can, plus final verdicts (`tp`, `fp`, `unclear`) that close alerts and approve or reject response requests | Manage users, keys, log sources or settings |
 | `viewer` | Read its hospital's alerts, handoffs and metrics | Change anything |
-| `vendor_admin` (platform tenant) | Create and list tenants; read one hospital's events, alerts and handoffs with a time-limited **break-glass** grant (read-only, audited) | Routine access to hospital data, users, credentials |
+| `vendor_admin` (platform account) | Create and list tenants; read one hospital's events, alerts and handoffs with a time-limited **break-glass** grant (read-only, audited) | Routine access to hospital data, users, credentials |
 | ingest key | `POST /api/events` and `POST /api/ingest/*` for its own hospital and log source | Any read or change |
 
 | Step | Call | Who | Result |
@@ -168,14 +168,15 @@ The tenant of every request comes from the caller's identity. A `tenant_id` in t
 | Sign in | `POST /api/login` `{"tenant","username","password"}` | anyone | `200` with a session `token` (shown once; send as `Authorization: Bearer`). `401` for any failure |
 | Sign out | `POST /api/logout` | user | Ends the session |
 | Who am I | `GET /api/me` | user | Tenant, role, username |
-| Add a user | `POST /api/users` `{"username","role","password"}` | hospital_admin | `201`. Roles above, except `vendor_admin`. Password 12+ characters |
-| Disable a user | `POST /api/users/<id>/disable` | hospital_admin | Their sessions stop at once |
+| Add a user | `POST /api/users` `{"username","email","role","password"}` | hospital_admin | `201`. Roles above, except `vendor_admin`. Email is unique; password 12+ characters |
+| Change a user's role | `PATCH /api/users/<id>` `{"role":"l1"}` | hospital_admin | Advances token version; that user's existing sessions stop at once |
+| Disable a user | `POST /api/users/<id>/disable` | hospital_admin | Marks inactive and advances token version; their sessions stop at once |
 | Add a log source | `POST /api/log-sources` `{"name","kind"}` | hospital_admin | `201` |
 | Issue an ingest key | `POST /api/credentials` `{"log_source_id","label"}` | hospital_admin | `201`, with the key. **Shown once** |
 | Revoke a key | `POST /api/credentials/<id>/revoke` | hospital_admin | Revoked keys get `401` |
 | Create a hospital | `POST /api/tenants` `{"id","name"}` | vendor_admin | `201`. `409` if it exists |
 
-Events and Wazuh alerts sent with a key are stored under that key's hospital and log source. Any `tenant` or `log_source_id` in the body is ignored, or refused if it names another hospital.
+Events and Wazuh alerts sent with a key are stored under that key's hospital and log source. Any `tenant` or `log_source_id` in the body is ignored, or refused if it names another hospital. Event and alert reads expose only telemetry fields: raw usernames, patient identifiers, IPs, free-form details, resolution notes, and attack simulation identifiers are omitted or redacted.
 
 ## Row-level security (how the database enforces it)
 - `db/schema.sql` turns on `ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY` on `tenants`, `users`, `log_sources`, `ingest_keys`, `events`, `alerts`, `handoffs`, `sessions`, `audit_log` and `break_glass_grants`.
@@ -206,7 +207,7 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 | `GET /api/analysts` | hospital roles | Analysts that alerts can be handed to |
 | `GET /api/metrics` | hospital roles; vendor with break-glass | Counts, false-positive rate (overall and weekly), detection rate, mean time to ack |
 | `GET /api/exit-criteria` | hospital roles; vendor with break-glass | The four roadmap gates, as `pass`, `fail` or `not_measured` |
-| `GET/POST /api/users`, `POST /api/users/<id>/disable` | `hospital_admin` | Users of one hospital |
+| `GET/POST /api/users`, `PATCH /api/users/<id>`, `POST /api/users/<id>/disable` | `hospital_admin` | Users of one hospital; role changes and disablement revoke existing sessions |
 | `GET/POST /api/log-sources`, `POST /api/log-sources/<id>/disable` | read: hospital roles; write: `hospital_admin` | Log sources |
 | `GET/POST /api/credentials`, `POST /api/credentials/<id>/revoke` | `hospital_admin` | Ingest keys |
 | `GET/POST /api/tenants` | `vendor_admin` | Hospitals |
@@ -216,6 +217,11 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 | `POST /api/demo`, `/api/autolabel`, `/api/reset` | `vendor_admin`, lab only | Synthetic data; need `LAB_DATABASE_URL` |
 
 ## Changes
+**PR 2 (deny-by-default RBAC, account classification and telemetry boundaries)**
+- API routes are explicitly allowlisted by role; unlisted routes are denied. Vendor accounts have no hospital tenant and need a time-limited break-glass grant for hospital payload reads.
+- Unique email identities, account type, active state and token versions are tracked. Role changes and disablement invalidate existing sessions.
+- Event and alert payloads omit raw authentication secrets and unnecessary patient/user fields.
+
 **v1.2 (tenant-scoped identity, RBAC and PostgreSQL row-level security; PR 1 of the multi-tenant work)**
 - The shared `SOC_API_TOKEN` is gone. Every call is a user session or an ingest key.
 - Users, roles (`hospital_admin`, `l1`, `l2`, `viewer`, `vendor_admin`), sessions and scrypt password hashes.
@@ -318,4 +324,3 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 - Shuffle playbooks (v0.7 sends alerts to a webhook; Shuffle itself is not set up yet)
 - MISP and Sigma rule conversion
 - Hospital-facing portal, PDF reports, plan-based feature gating
-
