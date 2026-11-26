@@ -100,8 +100,10 @@ def test_ack_and_verdict_require_sessions_and_record_the_authenticated_actors(wo
     verdict = by_action["alert.verdict"]
     assert ack[0:4] == (l1_actor, "l1", "session", None)
     assert verdict[0:4] == (l2_actor, "l2", "session", None)
-    assert ack[5:10] == ("alert", str(alert_id), "telemetry", "allow", {"status": "ack"})
-    assert verdict[5:10] == ("alert", str(alert_id), "telemetry", "allow", {"verdict": "tp"})
+    assert ack[5:10] == ("alert", str(alert_id), "telemetry", "allow",
+                        {"status": "ack", "previous_status": "new"})
+    assert verdict[5:10] == ("alert", str(alert_id), "telemetry", "allow",
+                             {"previous_verdict": None, "new_verdict": "tp"})
     assert ack[10] and verdict[10] and ack[10] != verdict[10]
     assert ack[11] is not None and verdict[11] is not None
     assert all("reviewed" not in str(row[9]) for row in events)
