@@ -1,6 +1,5 @@
 import pytest
 
-import app as soc
 from support import Api, CITY
 
 c = None
@@ -22,37 +21,37 @@ def one_alert():
     return c.get(f"/api/alerts?tenant={CITY}").get_json()[0]
 
 
-def other_analyst(owner):
-    return next(a for a in soc.ANALYSTS if a != owner)
+TARGET = "analyst-l1"  # an active L1 analyst of the City hospital
+
+
+def analyst_id(username):
+    return next(a["user_id"] for a in c.get("/api/analysts").get_json()["analysts"] if a["username"] == username)
 
 
 def test_handoff_changes_owner_and_keeps_history():
     a = one_alert()
-    to = other_analyst(a["owner"])
-    r = c.post(f"/api/alerts/{a['id']}/handoff", json={"to_owner": to, "note": "check the host"})
-    assert r.status_code == 200 and r.get_json()["to_owner"] == to
+    r = c.post(f"/api/alerts/{a['id']}/handoff", json={"to_actor_id": analyst_id(TARGET), "note": "check the host"})
+    assert r.status_code == 200 and r.get_json()["to_owner"] == TARGET
     after = next(x for x in c.get("/api/alerts").get_json() if x["id"] == a["id"])
-    assert after["owner"] == to
+    assert after["owner"] == TARGET
     hist = c.get(f"/api/alerts/{a['id']}/handoffs").get_json()
     assert len(hist) == 1
-    assert hist[0]["from_owner"] == a["owner"] and hist[0]["to_owner"] == to
+    assert hist[0]["from_owner"] == a["owner"] and hist[0]["to_owner"] == TARGET
     assert "note" not in hist[0] and hist[0]["at"]
 
 
 def test_alert_list_shows_latest_handoff_without_free_form_note():
     a = one_alert()
-    to = other_analyst(a["owner"])
-    c.post(f"/api/alerts/{a['id']}/handoff", json={"to_owner": to, "note": "check the host"})
+    c.post(f"/api/alerts/{a['id']}/handoff", json={"to_actor_id": analyst_id(TARGET), "note": "check the host"})
     row = next(x for x in c.get("/api/alerts").get_json() if x["id"] == a["id"])
-    assert row["last_handoff"] == f"{a['owner']} -> {to}"
+    assert row["last_handoff"] == f"{a['owner']} -> {TARGET}"
 
 
 def test_alert_list_marks_handoff_without_note():
     a = one_alert()
-    to = other_analyst(a["owner"])
-    c.post(f"/api/alerts/{a['id']}/handoff", json={"to_owner": to})
+    c.post(f"/api/alerts/{a['id']}/handoff", json={"to_actor_id": analyst_id(TARGET)})
     row = next(x for x in c.get("/api/alerts").get_json() if x["id"] == a["id"])
-    assert row["last_handoff"] == f"{a['owner']} -> {to}"
+    assert row["last_handoff"] == f"{a['owner']} -> {TARGET}"
 
 
 def test_alert_without_handoff_has_no_last_handoff():
@@ -61,28 +60,35 @@ def test_alert_without_handoff_has_no_last_handoff():
     assert row["last_handoff"] is None
 
 
-def test_handoff_refuses_unknown_owner():
+def test_handoff_refuses_a_user_who_is_not_an_active_analyst():
     a = one_alert()
-    r = c.post(f"/api/alerts/{a['id']}/handoff", json={"to_owner": "nobody"})
-    assert r.status_code == 400
+    assert c.post(f"/api/alerts/{a['id']}/handoff", json={"to_actor_id": 999999}).status_code == 400
+    viewer_id = next(u["id"] for u in c.get("/api/users").get_json() if u["username"] == "viewer")
+    assert c.post(f"/api/alerts/{a['id']}/handoff", json={"to_actor_id": viewer_id}).status_code == 400
+
+
+def test_handoff_by_name_is_retired():
+    a = one_alert()
+    r = c.post(f"/api/alerts/{a['id']}/handoff", json={"to_owner": TARGET})
+    assert r.status_code == 400 and "to_actor_id" in r.get_json()["error"]
 
 
 def test_handoff_refuses_same_owner():
     a = one_alert()
-    r = c.post(f"/api/alerts/{a['id']}/handoff", json={"to_owner": a["owner"]})
-    assert r.status_code == 400
+    assert c.post(f"/api/alerts/{a['id']}/handoff", json={"to_actor_id": analyst_id(TARGET)}).status_code == 200
+    assert c.post(f"/api/alerts/{a['id']}/handoff", json={"to_actor_id": analyst_id(TARGET)}).status_code == 400
 
 
 def test_handoff_unknown_alert_is_404():
     one_alert()
-    r = c.post("/api/alerts/999999/handoff", json={"to_owner": soc.ANALYSTS[0]})
+    r = c.post("/api/alerts/999999/handoff", json={"to_actor_id": analyst_id(TARGET)})
     assert r.status_code == 404
 
 
 def test_closed_alert_cannot_be_handed_off():
     a = one_alert()
     c.post(f"/api/alerts/{a['id']}/verdict", json={"verdict": "tp"})
-    r = c.post(f"/api/alerts/{a['id']}/handoff", json={"to_owner": other_analyst(a["owner"])})
+    r = c.post(f"/api/alerts/{a['id']}/handoff", json={"to_actor_id": analyst_id(TARGET)})
     assert r.status_code == 409
 
 
@@ -101,13 +107,15 @@ def test_repeated_verdict_does_not_expose_resolution_note():
     assert after["status"] == "closed" and "resolution" not in after
 
 
-def test_analysts_endpoint_lists_owners():
-    assert c.get("/api/analysts").get_json()["analysts"] == soc.ANALYSTS
+def test_analysts_endpoint_lists_active_hospital_analysts():
+    names = {a["username"] for a in c.get("/api/analysts").get_json()["analysts"]}
+    assert {"admin", "analyst-l1", "analyst-l2"} <= names
+    assert "viewer" not in names and "vendor" not in names
 
 
 def test_reset_clears_handoff_history():
     a = one_alert()
-    c.post(f"/api/alerts/{a['id']}/handoff", json={"to_owner": other_analyst(a["owner"])})
+    c.post(f"/api/alerts/{a['id']}/handoff", json={"to_actor_id": analyst_id(TARGET)})
     c.post("/api/reset")
     # The alert is gone with the reset, so its history is gone too.
     assert c.get(f"/api/alerts/{a['id']}/handoffs").status_code == 404

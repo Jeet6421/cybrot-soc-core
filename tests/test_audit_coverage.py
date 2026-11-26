@@ -1,5 +1,4 @@
 """Integration coverage for PR 7 audit emission and transaction boundaries."""
-import os
 import uuid
 
 import psycopg
@@ -113,9 +112,12 @@ def test_credential_create_rotate_and_revoke_are_audited_without_recording_keys(
     assert second["id"] != first["id"] and second["key"] != first["key"]
     assert admin.post(f"/api/credentials/{second['id']}/revoke").status_code == 200
 
-    old = _owner_rows(world, "SELECT revoked_at FROM ingest_keys WHERE id=%s", (first["id"],))[0][0]
+    # The old key is not revoked at rotation: it keeps working for the overlap window, then stops on its own.
+    old_revoked, old_retire_after = _owner_rows(
+        world, "SELECT revoked_at, retire_after FROM ingest_keys WHERE id=%s", (first["id"],))[0]
+    assert old_revoked is None and old_retire_after is not None
     new = _owner_rows(world, "SELECT revoked_at FROM ingest_keys WHERE id=%s", (second["id"],))[0][0]
-    assert old is not None and new is not None
+    assert new is not None
 
     created_event = _audit(world, "credential.create", first["id"])[-1]
     rotation_event = _audit(world, "credential.rotate", second["id"])[-1]
@@ -125,6 +127,7 @@ def test_credential_create_rotate_and_revoke_are_audited_without_recording_keys(
         "previous_credential_id": first["id"],
         "new_credential_id": second["id"],
         "log_source_id": source_id,
+        "overlap_minutes": 60,
     }
     for event in (created_event, rotation_event, revoked_event):
         encoded = str(event[10])
@@ -135,12 +138,12 @@ def test_triage_handoff_verdict_and_approval_decision_are_audited(world):
     alert_id = _seed_alert(world)
     l1 = Api(world, CITY, "l1")
     l2 = Api(world, CITY, "l2")
-    admin = Api(world, CITY, "hospital_admin")
 
     alert = l1.get(f"/api/alerts/{alert_id}").get_json()
-    new_owner = next(name for name in ("analyst1", "analyst2", "analyst3") if name != alert["owner"])
+    new_owner = next(a["user_id"] for a in l1.get("/api/analysts").get_json()["analysts"]
+                     if a["username"] == "analyst-l2")
     assert l1.post(f"/api/alerts/{alert_id}/ack").status_code == 200
-    assert l1.post(f"/api/alerts/{alert_id}/handoff", json={"to_owner": new_owner}).status_code == 200
+    assert l1.post(f"/api/alerts/{alert_id}/handoff", json={"to_actor_id": new_owner}).status_code == 200
     request = l1.post(f"/api/alerts/{alert_id}/response-approvals", json={
         "action": "isolate_host", "target": "test-host", "reason": "Audit coverage test"})
     assert request.status_code == 201
@@ -166,7 +169,7 @@ def test_triage_handoff_verdict_and_approval_decision_are_audited(world):
 
 
 def test_cross_tenant_denial_is_audited_and_missing_mutation_has_no_allow_event(world):
-    alert_id = _seed_alert(world)
+    _seed_alert(world)
     other_alert = _owner_rows(
         world, "SELECT id FROM alerts WHERE tenant='ortho-clinic' ORDER BY id DESC LIMIT 1")
     if not other_alert:

@@ -257,7 +257,7 @@ def test_viewer_reads_but_cannot_change(world):
     assert viewer.get("/api/alerts").status_code == 200
     assert viewer.post(f"/api/alerts/{alert_id}/ack").status_code == 403
     assert viewer.post(f"/api/alerts/{alert_id}/verdict", json={"verdict": "tp"}).status_code == 403
-    assert viewer.post(f"/api/alerts/{alert_id}/handoff", json={"to_owner": "analyst2"}).status_code == 403
+    assert viewer.post(f"/api/alerts/{alert_id}/handoff", json={"to_actor_id": 1}).status_code == 403
     assert viewer.post("/api/log-sources", json={"name": "x"}).status_code == 403
     assert viewer.post("/api/credentials", json={"log_source_id": 1}).status_code == 403
     assert viewer.get("/api/users").status_code == 403
@@ -267,11 +267,9 @@ def test_l1_triages_and_hands_off_but_does_not_close_or_administer(world):
     alert_id = new_alert(world, CITY)
     l1 = Api(world, CITY, "l1")
     assert l1.post(f"/api/alerts/{alert_id}/ack").status_code == 200
-    alerts = Api(world, CITY, "viewer").get("/api/alerts").get_json()
-    alert = next(a for a in alerts if a["id"] == alert_id)
-    owners = Api(world, CITY, "viewer").get("/api/analysts").get_json()["analysts"]
-    next_owner = next(owner for owner in owners if owner != alert["owner"])
-    assert l1.post(f"/api/alerts/{alert_id}/handoff", json={"to_owner": next_owner, "note": "check it"}).status_code == 200
+    analysts = Api(world, CITY, "viewer").get("/api/analysts").get_json()["analysts"]
+    target = next(a["user_id"] for a in analysts if a["username"] == "analyst-l2")
+    assert l1.post(f"/api/alerts/{alert_id}/handoff", json={"to_actor_id": target, "note": "check it"}).status_code == 200
     assert l1.post(f"/api/alerts/{alert_id}/verdict", json={"verdict": "tp"}).status_code == 403
     assert l1.post("/api/log-sources", json={"name": "x"}).status_code == 403
     assert l1.post("/api/credentials", json={"log_source_id": 1}).status_code == 403
@@ -391,7 +389,7 @@ def test_admin_cannot_reach_another_hospitals_records(world):
 
     assert city.post(f"/api/alerts/{alert_id}/ack").status_code == 404
     assert city.post(f"/api/alerts/{alert_id}/verdict", json={"verdict": "tp"}).status_code == 404
-    assert city.post(f"/api/alerts/{alert_id}/handoff", json={"to_owner": "analyst2"}).status_code == 404
+    assert city.post(f"/api/alerts/{alert_id}/handoff", json={"to_actor_id": 1}).status_code == 404
     assert city.get(f"/api/alerts/{alert_id}/handoffs").status_code == 404
     assert city.get(f"/api/alerts/{alert_id}/response-approvals").status_code == 404
     assert city.post(f"/api/alerts/{alert_id}/response-approvals", json={

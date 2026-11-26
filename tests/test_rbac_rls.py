@@ -54,7 +54,8 @@ def data(world):
     for tenant in (CITY, ORTHO):
         world.client.post("/api/events", json=failed_logins(tenant), headers=world.ingest(tenant))
     alert = Api(world, ORTHO, "viewer").get(f"/api/alerts?tenant={ORTHO}").get_json()[0]
-    Api(world, ORTHO, "l1").post(f"/api/alerts/{alert['id']}/handoff", json={"to_owner": "analyst2"})
+    Api(world, ORTHO, "l1").post(f"/api/alerts/{alert['id']}/handoff",
+                                 json={"to_actor_id": actor_id(world, ORTHO, "analyst-l2")})
     approval = Api(world, ORTHO, "l1").post(f"/api/alerts/{alert['id']}/response-approvals", json={
         "action": "isolate_host", "target": "ehr-01", "reason": "Test RLS visibility"})
     assert approval.status_code == 201

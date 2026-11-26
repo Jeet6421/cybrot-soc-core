@@ -9,8 +9,8 @@ The tenant always comes from the caller's identity. A tenant_id in the query can
 anything else is refused with 403 before a query runs. PostgreSQL row-level security enforces the same rule
 underneath: every transaction carries the identity in transaction-local settings (see db/schema.sql).
 """
-import json, os, secrets, sys, threading, time, urllib.error, urllib.request, uuid
-from datetime import datetime, timezone
+import hashlib, ipaddress, json, os, re, secrets, sys, threading, time, urllib.error, urllib.request, uuid
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 from flask import Flask, g, request, jsonify, send_from_directory
@@ -59,6 +59,14 @@ ROUTE_ROLES = {
     ("POST", "/api/alerts/<int:i>/ack"): {"hospital_admin", "l1", "l2"},
     ("POST", "/api/alerts/<int:i>/verdict"): {"hospital_admin", "l2"},
     ("GET", "/api/analysts"): set(HOSPITAL_READ),
+    ("GET", "/api/assets"): set(HOSPITAL_READ),
+    ("POST", "/api/assets"): {"hospital_admin"},
+    ("PATCH", "/api/assets/<int:asset_id>"): {"hospital_admin"},
+    ("GET", "/api/data-flow"): {"hospital_admin"},
+    ("POST", "/api/offboarding/start"): {"hospital_admin"},
+    ("POST", "/api/tenants/<tid>/offboarding/export"): {"vendor_admin"},
+    ("POST", "/api/tenants/<tid>/offboarding/archive"): {"vendor_admin"},
+    ("POST", "/api/tenants/<tid>/offboarding/purge"): {"vendor_admin"},
     ("POST", "/api/alerts/<int:i>/handoff"): {"hospital_admin", "l1", "l2"},
     ("GET", "/api/alerts/<int:i>/handoffs"): set(HOSPITAL_READ) | {"vendor_admin"},
     ("GET", "/api/alerts/<int:i>/response-approvals"): {"hospital_admin", "l1", "l2"},
@@ -123,15 +131,16 @@ class Refuse(Exception):
 def _refused(e):
     identity = g.get("identity")
     context = g.get("ctx")
-    if e.status in (401, 403, 404) and identity and context and context.get("tenant"):
+    ingest_rejected = e.status == 400 and identity and identity.get("kind") == "ingest"
+    if (e.status in (401, 403, 404) or ingest_rejected) and identity and context and context.get("tenant"):
         c = db()
         c.rollback()
         _bind(c, context["tenant"], context["role"], context["actor_id"])
         route_args = request.view_args or {}
         resource_id = next((value for value in route_args.values() if isinstance(value, int)), None)
         _record_current_audit(
-            c, action="authorization.denied", resource_type="api_request", resource_id=resource_id,
-            resource_classification="security_event", outcome="deny")
+            c, action="ingest.reject" if ingest_rejected else "authorization.denied", resource_type="api_request",
+            resource_id=resource_id, resource_classification="security_event", outcome="deny")
         commit()
     return jsonify(error=e.message), e.status
 
@@ -253,11 +262,14 @@ def redact_audit_metadata(metadata):
         value = metadata.get(key)
         if value in ANALYSTS:
             safe[key] = value
+    if metadata.get("monitoring_mode") in MONITORING_MODES:
+        safe["monitoring_mode"] = metadata["monitoring_mode"]
     action = metadata.get("response_action")
     if action in RESPONSE_ACTIONS:
         safe["response_action"] = action
     for key in ("record_count", "alerts_created", "credential_id",
-                "previous_credential_id", "new_credential_id", "log_source_id"):
+                "previous_credential_id", "new_credential_id", "log_source_id", "overlap_minutes",
+                "users_disabled", "keys_revoked", "source_count", "changed_fields", "to_actor_id", "from_actor_id"):
         value = metadata.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 10**12:
             safe[key] = value
@@ -552,6 +564,8 @@ def hospital_scope(*allowed):
         raise Refuse(403, "tenant_id does not match your session")
     if ident["role"] not in allowed:
         raise Refuse(403, "your role cannot do this")
+    if request.method != "GET" and _lifecycle(ident["tenant"]) != "active":
+        raise Refuse(409, "this hospital is being offboarded; no new changes are accepted")
     return ident["tenant"]
 
 
@@ -732,7 +746,7 @@ def _text(body, key, limit=None):
 
 
 def _alert_or_404(i):
-    row = db().execute("SELECT id, owner, status, tenant FROM alerts WHERE id=%s", (i,)).fetchone()
+    row = db().execute("SELECT id, owner, owner_user_id, status, tenant FROM alerts WHERE id=%s", (i,)).fetchone()
     if not row:
         raise Refuse(404, "alert not found")  # also what another hospital's alert returns
     return row
@@ -851,7 +865,7 @@ def ingest_wazuh():
 @app.get("/api/tenants")
 def list_tenants():
     _require_vendor()
-    rows = db().execute("SELECT id, name, created FROM tenants ORDER BY id").fetchall()
+    rows = db().execute("SELECT id, name, created, lifecycle_state FROM tenants ORDER BY id").fetchall()
     return jsonify([dict(r) for r in rows])
 
 
@@ -1007,7 +1021,8 @@ def disable_log_source(sid):
 def list_credentials():
     """Ingest keys for this hospital. Metadata only: the key itself is shown once, when it is created."""
     hospital_scope("hospital_admin")
-    rows = db().execute("SELECT id, label, log_source_id, created, revoked_at FROM ingest_keys ORDER BY id").fetchall()
+    rows = db().execute("SELECT id, label, log_source_id, key_prefix, created, revoked_at, retire_after "
+                        "FROM ingest_keys ORDER BY id").fetchall()
     _record_current_audit(
         db(), action="credential.list", resource_type="credential_collection", resource_id=None,
         resource_classification="credential_metadata", metadata={"record_count": len(rows)})
@@ -1028,15 +1043,16 @@ def create_credential():
     if not c.execute("SELECT 1 FROM log_sources WHERE id=%s AND disabled_at IS NULL", (sid,)).fetchone():
         raise Refuse(404, "log source not found")
     key = secrets.token_urlsafe(32)
-    row = c.execute("INSERT INTO ingest_keys(tenant, label, key_hash, log_source_id) VALUES(%s, %s, %s, %s) RETURNING id",
-                    (tenant, label, auth.token_hash(key), sid)).fetchone()
+    row = c.execute("INSERT INTO ingest_keys(tenant, label, key_hash, key_prefix, log_source_id) "
+                    "VALUES(%s, %s, %s, %s, %s) RETURNING id",
+                    (tenant, label, auth.token_hash(key), key[:8], sid)).fetchone()
     _record_current_audit(
         c, action="credential.create", resource_type="ingest_key", resource_id=row["id"],
         resource_classification="credential_metadata",
         metadata={"credential_id": row["id"], "log_source_id": sid})
     audit("credential.create", f"key {row['id']} for log source {sid}")
     commit()
-    return jsonify(id=row["id"], log_source_id=sid, label=label, key=key,
+    return jsonify(id=row["id"], log_source_id=sid, label=label, key=key, key_prefix=key[:8],
                    note="Store this key now. It is not shown again."), 201
 
 
@@ -1057,27 +1073,255 @@ def revoke_credential(kid):
 
 @app.post("/api/credentials/<int:kid>/rotate")
 def rotate_credential(kid):
+    """Issue a new key for the same log source. The old key keeps working for overlap_minutes (0 to 1440, default 60),
+    so the collector can switch over without a gap. Then it stops on its own, or the admin revokes it early."""
     tenant = hospital_scope("hospital_admin")
+    body = _body()
+    overlap = body.get("overlap_minutes", 60)
+    if isinstance(overlap, bool) or not isinstance(overlap, int) or not 0 <= overlap <= 1440:
+        raise Refuse(400, "overlap_minutes must be an integer between 0 and 1440")
     c = db()
     old = c.execute(
-        "UPDATE ingest_keys SET revoked_at=COALESCE(revoked_at, %s) "
-        "WHERE id=%s AND revoked_at IS NULL RETURNING id, label, log_source_id",
-        (now(), kid)).fetchone()
+        "UPDATE ingest_keys SET retire_after = now() + (%s * interval '1 minute') "
+        "WHERE id=%s AND revoked_at IS NULL AND (retire_after IS NULL OR retire_after > now()) "
+        "RETURNING id, label, log_source_id, retire_after",
+        (overlap, kid)).fetchone()
     if not old:
-        raise Refuse(404, "credential not found or already revoked")
+        raise Refuse(404, "credential not found or already retired")
     key = secrets.token_urlsafe(32)
     new = c.execute(
-        "INSERT INTO ingest_keys(tenant, label, key_hash, log_source_id) VALUES(%s, %s, %s, %s) RETURNING id",
-        (tenant, old["label"], auth.token_hash(key), old["log_source_id"])).fetchone()
+        "INSERT INTO ingest_keys(tenant, label, key_hash, key_prefix, log_source_id) VALUES(%s, %s, %s, %s, %s) RETURNING id",
+        (tenant, old["label"], auth.token_hash(key), key[:8], old["log_source_id"])).fetchone()
     _record_current_audit(
         c, action="credential.rotate", resource_type="ingest_key", resource_id=new["id"],
         resource_classification="credential_metadata",
         metadata={"previous_credential_id": old["id"], "new_credential_id": new["id"],
-                  "log_source_id": old["log_source_id"]})
+                  "log_source_id": old["log_source_id"], "overlap_minutes": overlap})
     audit("credential.rotate", f"key {old['id']} -> {new['id']}")
     commit()
     return jsonify(id=new["id"], log_source_id=old["log_source_id"], label=old["label"], key=key,
-                   note="Store this key now. It is not shown again."), 201
+                   key_prefix=key[:8], previous_credential_id=old["id"], previous_retire_after=old["retire_after"],
+                   note="Store this key now. It is not shown again. The old key stops at previous_retire_after."), 201
+
+
+# ---- Hospital onboarding: asset inventory and data-flow check ----------------------------------------
+
+# Clinical equipment: a patient depends on these, so they are watched without an agent or an intrusive scan.
+MEDICAL_CLASSES = ("mri", "ct", "x_ray", "ultrasound", "ventilator", "patient_monitor", "infusion_pump")
+ASSET_CLASSES = MEDICAL_CLASSES + ("workstation", "server", "network_device", "other")
+MONITORING_MODES = ("edr_managed", "agentless_medical", "network_infra", "unmanaged")
+CRITICALITY = ("low", "medium", "high", "critical")
+_MAC_RE = re.compile(r"[0-9A-F]{2}(:[0-9A-F]{2}){5}")
+
+
+def _asset_fields(body, current=None):
+    """Checked asset fields. On an update, `current` supplies the values that were not sent, so the result is checked as a whole."""
+    current = current or {}
+
+    def pick(key, default=""):
+        return _text(body, key, 120) if key in body else (current.get(key) or default)
+
+    device_name = pick("device_name")
+    if not device_name:
+        raise Refuse(400, "device_name is required")
+    ip = pick("ip_address")
+    if ip:
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            raise Refuse(400, "ip_address is not a valid IPv4 or IPv6 address")
+    mac = pick("mac_address").upper()
+    if mac and not _MAC_RE.fullmatch(mac):
+        raise Refuse(400, "mac_address must look like 00:1A:2B:3C:4D:5E")
+    asset_class = pick("asset_class", "workstation")
+    if asset_class not in ASSET_CLASSES:
+        raise Refuse(400, "asset_class must be one of: " + ", ".join(ASSET_CLASSES))
+    monitoring_mode = pick("monitoring_mode")
+    if monitoring_mode not in MONITORING_MODES:
+        raise Refuse(400, "monitoring_mode must be one of: " + ", ".join(MONITORING_MODES))
+    if asset_class in MEDICAL_CLASSES and monitoring_mode != "agentless_medical":
+        raise Refuse(400, "clinical equipment must use monitoring_mode agentless_medical")
+    criticality = pick("criticality", "medium")
+    if criticality not in CRITICALITY:
+        raise Refuse(400, "criticality must be one of: " + ", ".join(CRITICALITY))
+    return {"device_name": device_name, "ip_address": ip, "mac_address": mac,
+            "department": pick("department")[:80], "asset_class": asset_class,
+            "monitoring_mode": monitoring_mode, "criticality": criticality}
+
+
+@app.get("/api/assets")
+def list_assets():
+    tenant = hospital_scope(*HOSPITAL_READ)
+    rows = db().execute(
+        "SELECT asset_id, device_name, ip_address, mac_address, department, asset_class, monitoring_mode, "
+        "criticality, last_seen_at FROM assets WHERE tenant_id=%s ORDER BY asset_id", (tenant,)).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/assets")
+def create_asset():
+    tenant = hospital_scope("hospital_admin")
+    fields = _asset_fields(_body(required=True))
+    c = db()
+    try:
+        row = c.execute(
+            "INSERT INTO assets(tenant_id, device_name, ip_address, mac_address, department, asset_class, "
+            "monitoring_mode, criticality) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING asset_id",
+            (tenant, fields["device_name"], fields["ip_address"], fields["mac_address"], fields["department"],
+             fields["asset_class"], fields["monitoring_mode"], fields["criticality"])).fetchone()
+    except psycopg.errors.UniqueViolation:
+        raise Refuse(409, "an asset with this device_name already exists")
+    _record_current_audit(
+        c, action="asset.create", resource_type="asset", resource_id=row["asset_id"],
+        resource_classification="telemetry", metadata={"monitoring_mode": fields["monitoring_mode"]})
+    commit()
+    return jsonify(asset_id=row["asset_id"], **fields), 201
+
+
+@app.patch("/api/assets/<int:asset_id>")
+def update_asset(asset_id):
+    tenant = hospital_scope("hospital_admin")
+    body = _body(required=True)
+    c = db()
+    current = c.execute("SELECT * FROM assets WHERE asset_id=%s AND tenant_id=%s", (asset_id, tenant)).fetchone()
+    if not current:
+        raise Refuse(404, "asset not found")
+    fields = _asset_fields(body, dict(current))
+    try:
+        c.execute(
+            "UPDATE assets SET device_name=%s, ip_address=%s, mac_address=%s, department=%s, asset_class=%s, "
+            "monitoring_mode=%s, criticality=%s, updated=now() WHERE asset_id=%s AND tenant_id=%s",
+            (fields["device_name"], fields["ip_address"], fields["mac_address"], fields["department"],
+             fields["asset_class"], fields["monitoring_mode"], fields["criticality"], asset_id, tenant))
+    except psycopg.errors.UniqueViolation:
+        raise Refuse(409, "an asset with this device_name already exists")
+    changed = sorted(k for k in fields if current.get(k) != fields[k])
+    _record_current_audit(
+        c, action="asset.update", resource_type="asset", resource_id=asset_id,
+        resource_classification="telemetry", metadata={"changed_fields": len(changed)})
+    commit()
+    return jsonify(asset_id=asset_id, **fields)
+
+
+@app.get("/api/data-flow")
+def data_flow():
+    """Is data arriving, and is it usable? Last event time, accepted and rejected counts, and a readiness sample."""
+    tenant = hospital_scope("hospital_admin")
+    c = db()
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime(detect.FMT)
+    sources = c.execute(
+        "SELECT ls.id, ls.name, ls.kind, ls.disabled_at IS NOT NULL AS disabled, "
+        "(SELECT max(e.ts) FROM events e WHERE e.tenant = ls.tenant AND e.log_source_id = ls.id) AS last_seen_event_ts, "
+        "(SELECT count(*) FROM events e WHERE e.tenant = ls.tenant AND e.log_source_id = ls.id AND e.ts >= %s) "
+        "AS accepted_24h FROM log_sources ls WHERE ls.tenant = %s ORDER BY ls.id", (since, tenant)).fetchall()
+    rejected = c.execute(
+        "SELECT count(*) FROM audit_events WHERE tenant_id = %s AND action = 'ingest.reject' "
+        "AND occurred_at >= now() - interval '24 hours'", (tenant,)).fetchone()[0]
+    sample = c.execute('SELECT ts, source, type, host, "user" FROM events WHERE tenant = %s ORDER BY id DESC LIMIT 20',
+                       (tenant,)).fetchall()
+    ready = [bool(r["ts"] and r["source"] and r["type"] and (r["host"] or r["user"])) for r in sample]
+    _record_current_audit(
+        c, action="data_flow.verify", resource_type="log_source_collection", resource_id=None,
+        resource_classification="telemetry", metadata={"source_count": len(sources)})
+    commit()
+    last_seen = max((s_["last_seen_event_ts"] for s_ in sources if s_["last_seen_event_ts"]), default=None)
+    return jsonify(
+        last_seen_event_ts=last_seen,
+        accepted_24h=sum(s_["accepted_24h"] for s_ in sources),
+        rejected_24h=rejected,
+        sources=[dict(s_) for s_ in sources],
+        readiness={"checked": len(ready), "normalized": sum(ready),
+                   "note": "a sampled event is ready when it has time, source, type and host or user"})
+
+
+# ---- Hospital offboarding: separate from vendor support -----------------------------------------------
+
+def _lifecycle(tenant):
+    row = db().execute("SELECT lifecycle_state FROM tenants WHERE id=%s", (tenant,)).fetchone()
+    return row["lifecycle_state"] if row else None
+
+
+@app.post("/api/offboarding/start")
+def start_offboarding():
+    """The hospital admin starts offboarding. Every login and ingest key stops, and no new changes are accepted."""
+    tenant = hospital_scope("hospital_admin")
+    c = db()
+    if not c.execute("SELECT set_tenant_lifecycle(%s, 'active', 'offboarding') AS ok", (tenant,)).fetchone()["ok"]:
+        raise Refuse(409, "this hospital is not active")
+    disabled = c.execute("UPDATE users SET is_active = FALSE, status = 'disabled', token_version = token_version + 1 "
+                         "WHERE tenant = %s AND is_active", (tenant,)).rowcount
+    revoked = c.execute("UPDATE ingest_keys SET revoked_at = COALESCE(revoked_at, %s) "
+                        "WHERE tenant = %s AND revoked_at IS NULL", (now(), tenant)).rowcount
+    _record_current_audit(
+        c, action="tenant.offboarding.start", resource_type="tenant", resource_id=None,
+        resource_classification="security_event", metadata={"users_disabled": disabled, "keys_revoked": revoked})
+    commit()
+    return jsonify(state="offboarding", users_disabled=disabled, keys_revoked=revoked)
+
+
+def _vendor_hospital(tid):
+    """The vendor's checks for an offboarding step: a real hospital, not the platform itself."""
+    ident = _require_vendor()
+    row = None if (not tid or tid == auth.PLATFORM_TENANT) else db().execute(
+        "SELECT id, lifecycle_state FROM tenants WHERE id=%s", (tid,)).fetchone()
+    if not row:
+        raise Refuse(404, "hospital not found")
+    return ident, row["lifecycle_state"]
+
+
+def _vendor_audit(c, ident, tid, action, metadata):
+    """A vendor step is written into the hospital's own audit trail, in the same transaction as the step."""
+    set_context(tid, "vendor_admin", ident["actor_id"])
+    record_audit_event(c, tenant_id=tid, actor_id=ident["actor_id"], actor_role="vendor_admin", action=action,
+                       resource_type="tenant", resource_id=tid, resource_classification="security_event",
+                       outcome="allow", auth_context="session", metadata=metadata, source_ip=request.remote_addr)
+
+
+@app.post("/api/tenants/<tid>/offboarding/export")
+def export_tenant(tid):
+    """Compliance export hook. Records what the hospital holds and a digest of it. Delivering the bundle is wired up per hospital."""
+    ident, state = _vendor_hospital(tid)
+    if state not in ("offboarding", "archived"):
+        raise Refuse(409, "export is available while a hospital is offboarding or archived")
+    c = db()
+    counts = c.execute("SELECT tenant_export_counts(%s) AS counts", (tid,)).fetchone()["counts"]
+    digest = hashlib.sha256(json.dumps(counts, sort_keys=True).encode()).hexdigest()
+    _vendor_audit(c, ident, tid, "tenant.export", {"record_count": sum(counts.values())})
+    commit()
+    return jsonify(tenant=tid, state=state, record_counts=counts, digest_sha256=digest)
+
+
+@app.post("/api/tenants/<tid>/offboarding/archive")
+def archive_tenant(tid):
+    ident, state = _vendor_hospital(tid)
+    c = db()
+    if state != "offboarding":
+        raise Refuse(409, "only a hospital that is offboarding can be archived")
+    if not c.execute("SELECT tenant_exported(%s) AS ok", (tid,)).fetchone()["ok"]:
+        raise Refuse(409, "export the hospital's records before archiving")
+    if not c.execute("SELECT set_tenant_lifecycle(%s, 'offboarding', 'archived') AS ok", (tid,)).fetchone()["ok"]:
+        raise Refuse(409, "the hospital changed state; reload and try again")
+    _vendor_audit(c, ident, tid, "tenant.archive", {})
+    commit()
+    return jsonify(tenant=tid, state="archived")
+
+
+@app.post("/api/tenants/<tid>/offboarding/purge")
+def purge_tenant(tid):
+    """Delete the hospital's operational data. Audit rows and the tenant record stay. Users are anonymised."""
+    ident, state = _vendor_hospital(tid)
+    if state != "archived":
+        raise Refuse(409, "only an archived hospital can be purged")
+    c = db()
+    if not c.execute("SELECT tenant_exported(%s) AS ok", (tid,)).fetchone()["ok"]:
+        raise Refuse(409, "export the hospital's records before purging")
+    try:
+        removed = c.execute("SELECT purge_tenant_data(%s) AS counts", (tid,)).fetchone()["counts"]
+    except psycopg.Error:
+        raise Refuse(409, "the purge was refused; the hospital's data is unchanged")
+    _vendor_audit(c, ident, tid, "tenant.purge", {"record_count": sum(removed.values())})
+    commit()
+    return jsonify(tenant=tid, state="purged", removed=removed)
 
 
 # ---- Sessions ------------------------------------------------------------------------------------
@@ -1236,34 +1480,44 @@ def verdict(i):
 
 @app.get("/api/analysts")
 def analysts():
-    hospital_scope(*HOSPITAL_READ)
-    return jsonify(analysts=ANALYSTS)
+    """Active analysts of this hospital. Their user ids are what a handoff names."""
+    tenant = hospital_scope(*HOSPITAL_READ)
+    rows = db().execute("SELECT user_id, username, user_role FROM hospital_analysts(%s)", (tenant,)).fetchall()
+    return jsonify(analysts=[dict(r) for r in rows])
 
 
 @app.post("/api/alerts/<int:i>/handoff")
 def handoff(i):
-    """Pass an open alert to another analyst. The owner changes and the handoff is kept in history."""
+    """Pass an open alert to another active analyst of the same hospital. Both users are recorded by id."""
     hospital_scope("hospital_admin", "l1", "l2")
+    actor = _session_audit_actor()
     body = _body(required=True)
-    to = _text(body, "to_owner")
+    if "to_owner" in body:
+        raise Refuse(400, "to_owner is retired: send to_actor_id (an id from GET /api/analysts)")
+    to_id = body.get("to_actor_id")
+    if isinstance(to_id, bool) or not isinstance(to_id, int):
+        raise Refuse(400, "to_actor_id must be the id of an active analyst in this hospital")
     note = _text(body, "note", 500)
-    if to not in ANALYSTS:
-        raise Refuse(400, f"to_owner must be one of: {', '.join(ANALYSTS)}")
     row = _alert_or_404(i)
     if row["status"] == "closed":
         raise Refuse(409, "alert is closed")
-    if to == row["owner"]:
-        raise Refuse(400, f"alert is already owned by {to}")
+    target = db().execute("SELECT handoff_target_name(%s, %s) AS name", (row["tenant"], to_id)).fetchone()["name"]
+    if not target:
+        raise Refuse(400, "to_actor_id must be an active analyst in this hospital")
+    if row["owner_user_id"] == to_id or (row["owner_user_id"] is None and row["owner"] == target):
+        raise Refuse(400, f"alert is already owned by {target}")
     c = db()
-    c.execute("INSERT INTO handoffs(alert_id,at,from_owner,to_owner,note,tenant) VALUES(%s,%s,%s,%s,%s,%s)",
-              (i, now(), row["owner"], to, note, row["tenant"]))
-    c.execute("UPDATE alerts SET owner=%s WHERE id=%s", (to, i))
+    c.execute("INSERT INTO handoffs(alert_id,at,from_owner,to_owner,note,tenant,from_user_id,to_user_id) "
+              "VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
+              (i, now(), row["owner"], target, note, row["tenant"], actor["actor_id"], to_id))
+    c.execute("UPDATE alerts SET owner=%s, owner_user_id=%s WHERE id=%s", (target, to_id, i))
     _record_current_audit(
         c, action="alert.handoff", resource_type="alert", resource_id=i,
-        resource_classification="telemetry", metadata={"owner_from": row["owner"], "owner_to": to})
-    audit("alert.handoff", f"alert {i} to {to}")
+        resource_classification="telemetry",
+        metadata={"from_actor_id": actor["actor_id"], "to_actor_id": to_id})
+    audit("alert.handoff", f"alert {i} to {target}")
     commit()
-    return jsonify(ok=True, from_owner=row["owner"], to_owner=to)
+    return jsonify(ok=True, from_owner=row["owner"], to_owner=target, to_actor_id=to_id)
 
 
 @app.get("/api/alerts/<int:i>/handoffs")

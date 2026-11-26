@@ -174,8 +174,8 @@ def test_handoff_keeps_the_hospital_on_the_history_row(world):
     c.post("/api/reset")
     c.post("/api/events", json=failed_logins(CITY))
     alert = alerts_of(world, CITY)[0]
-    other = next(x for x in ["analyst1", "analyst2", "analyst3"] if x != alert["owner"])
-    assert c.post(f"/api/alerts/{alert['id']}/handoff", json={"to_owner": other, "note": "scoped"}).status_code == 200
+    other = next(a["user_id"] for a in c.get("/api/analysts").get_json()["analysts"] if a["username"] == "analyst-l2")
+    assert c.post(f"/api/alerts/{alert['id']}/handoff", json={"to_actor_id": other, "note": "scoped"}).status_code == 200
     with psycopg.connect(world.owner_url) as owner:
         row = owner.execute("SELECT tenant FROM handoffs WHERE alert_id=%s", (alert["id"],)).fetchone()
     assert row[0] == CITY
