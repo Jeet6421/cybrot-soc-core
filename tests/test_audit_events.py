@@ -61,8 +61,13 @@ def test_ack_and_verdict_require_sessions_and_record_the_authenticated_actors(wo
     assert unauthenticated.post(f"/api/alerts/{alert_id}/ack").status_code == 401
     assert unauthenticated.post(
         f"/api/alerts/{alert_id}/verdict", json={"verdict": "tp"}).status_code == 401
+    # The ingest/alert flow and denied unauthenticated attempts are audited, but
+    # neither rejected request may create a triage mutation audit record.
     assert _owner_rows(
-        world, "SELECT count(*) FROM audit_events WHERE resource_id=%s", (str(alert_id),))[0][0] == 0
+        world,
+        "SELECT count(*) FROM audit_events WHERE resource_id=%s AND action IN ('alert.ack', 'alert.verdict')",
+        (str(alert_id),),
+    )[0][0] == 0
 
     l1 = Api(world, CITY, "l1")
     l2 = Api(world, CITY, "l2")
@@ -86,7 +91,8 @@ def test_ack_and_verdict_require_sessions_and_record_the_authenticated_actors(wo
         world,
         "SELECT actor_id, actor_role, auth_context, break_glass_grant_id, action, resource_type, "
         "resource_id, resource_classification, outcome, metadata, request_id, occurred_at "
-        "FROM audit_events WHERE tenant_id=%s AND resource_id=%s ORDER BY action",
+        "FROM audit_events WHERE tenant_id=%s AND resource_type='alert' AND resource_id=%s "
+        "AND action IN ('alert.ack', 'alert.verdict') ORDER BY action",
         (CITY, str(alert_id)))
     assert len(events) == 2
     by_action = {row[4]: row for row in events}
@@ -94,8 +100,10 @@ def test_ack_and_verdict_require_sessions_and_record_the_authenticated_actors(wo
     verdict = by_action["alert.verdict"]
     assert ack[0:4] == (l1_actor, "l1", "session", None)
     assert verdict[0:4] == (l2_actor, "l2", "session", None)
-    assert ack[5:10] == ("alert", str(alert_id), "telemetry", "allow", {"status": "ack"})
-    assert verdict[5:10] == ("alert", str(alert_id), "telemetry", "allow", {"verdict": "tp"})
+    assert ack[5:10] == ("alert", str(alert_id), "telemetry", "allow",
+                        {"status": "ack", "previous_status": "new"})
+    assert verdict[5:10] == ("alert", str(alert_id), "telemetry", "allow",
+                             {"previous_verdict": None, "new_verdict": "tp"})
     assert ack[10] and verdict[10] and ack[10] != verdict[10]
     assert ack[11] is not None and verdict[11] is not None
     assert all("reviewed" not in str(row[9]) for row in events)
