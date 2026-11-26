@@ -100,7 +100,11 @@ def test_l1_triages_and_hands_off_but_does_not_close_or_administer(world):
     alert_id = new_alert(world, CITY)
     l1 = Api(world, CITY, "l1")
     assert l1.post(f"/api/alerts/{alert_id}/ack").status_code == 200
-    assert l1.post(f"/api/alerts/{alert_id}/handoff", json={"to_owner": "analyst2", "note": "check it"}).status_code == 200
+    alerts = Api(world, CITY, "viewer").get("/api/alerts").get_json()
+    alert = next(a for a in alerts if a["id"] == alert_id)
+    owners = Api(world, CITY, "viewer").get("/api/analysts").get_json()["analysts"]
+    next_owner = next(owner for owner in owners if owner != alert["owner"])
+    assert l1.post(f"/api/alerts/{alert_id}/handoff", json={"to_owner": next_owner, "note": "check it"}).status_code == 200
     assert l1.post(f"/api/alerts/{alert_id}/verdict", json={"verdict": "tp"}).status_code == 403
     assert l1.post("/api/log-sources", json={"name": "x"}).status_code == 403
     assert l1.post("/api/credentials", json={"log_source_id": 1}).status_code == 403

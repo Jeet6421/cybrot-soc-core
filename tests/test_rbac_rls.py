@@ -186,8 +186,13 @@ def test_ingest_role_cannot_read_users_credentials_or_change_history(runtime, da
 
 # ---- Vendor admin --------------------------------------------------------------------------------
 
-def test_vendor_without_a_grant_reads_no_hospital_rows(runtime, data):
+def test_vendor_without_a_grant_reads_no_hospital_rows(runtime, world, data):
     vendor = vendor_actor()
+    # Other break-glass tests use this same fixture database. Revoke any leftover grants
+    # so this test checks the no-grant policy regardless of test execution order.
+    with psycopg.connect(world.owner_url) as owner:
+        owner.execute("UPDATE break_glass_grants SET revoked_at = now() WHERE actor_id = %s AND revoked_at IS NULL",
+                      (vendor,))
     for tenant in (CITY, ORTHO):
         as_identity(runtime, tenant, "vendor_admin", vendor)
         for table in HOSPITAL_TABLES + ADMIN_TABLES:

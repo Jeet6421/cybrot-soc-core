@@ -115,6 +115,15 @@ def _close_db(exc):
         c.close()
 
 
+@app.after_request
+def _commit_break_glass_audit(response):
+    # A successful break-glass read must persist its audit row. Normal read-only requests
+    # stay uncommitted; this commits the audit and the authorized read in the same transaction.
+    if g.get("break_glass_read") and response.status_code < 400:
+        commit()
+    return response
+
+
 def now():
     return datetime.now(timezone.utc).strftime(detect.FMT)
 
@@ -303,6 +312,7 @@ def hospital_scope(*allowed):
             raise Refuse(403, "no active break-glass grant for this hospital")
         set_context(wanted, "vendor_admin", ident["actor_id"])
         audit("break_glass.read", request.path)
+        g.break_glass_read = True
         return wanted
     if wanted and wanted != ident["tenant"]:
         raise Refuse(403, "tenant_id does not match your session")
