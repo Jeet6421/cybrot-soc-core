@@ -82,6 +82,34 @@ def test_tenant_id_can_only_narrow_within_the_callers_hospital(world):
     assert admin.get(f"/api/alerts?tenant_id={CITY}").status_code == 200
 
 
+def test_l1_can_read_only_its_hospital_events(world):
+    new_alert(world, CITY)
+    l1 = Api(world, CITY, "l1")
+    response = l1.get("/api/events?limit=20&type=auth_fail")
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["events"] and all(event["tenant"] == CITY for event in body["events"])
+    assert all(event["type"] == "auth_fail" for event in body["events"])
+    assert l1.get(f"/api/events?tenant_id={ORTHO}").status_code == 403
+    assert Api(world, CITY, "viewer").get("/api/events").status_code == 403
+    assert l1.get("/api/events?limit=501").status_code == 400
+
+
+def test_hospital_admin_can_update_only_its_hospital_name_setting(world):
+    admin = Api(world, CITY, "hospital_admin")
+    ortho = Api(world, ORTHO, "hospital_admin")
+    assert admin.get("/api/settings").get_json()["name"] == "City Hospital"
+    updated = admin.put("/api/settings", json={"name": "City Hospital Test"})
+    assert updated.status_code == 200 and updated.get_json()["name"] == "City Hospital Test"
+    assert ortho.get("/api/settings").get_json()["name"] == "Ortho Clinic"
+    assert Api(world, CITY, "l1").put("/api/settings", json={"name": "Nope"}).status_code == 403
+    assert admin.put(f"/api/settings?tenant_id={ORTHO}", json={"name": "Nope"}).status_code == 403
+    rows = owner_rows(world, "SELECT count(*) FROM audit_log WHERE tenant=%s AND action='tenant.settings.update'",
+                      (CITY,))
+    assert rows[0][0] == 1
+    assert admin.put("/api/settings", json={"name": "City Hospital"}).status_code == 200
+
+
 # ---- What each role may do -----------------------------------------------------------------------
 
 def test_viewer_reads_but_cannot_change(world):
@@ -119,6 +147,36 @@ def test_l2_closes_alerts_with_a_verdict(world):
     assert row["status"] == "closed" and row["verdict"] == "tp"
 
 
+def test_l2_approval_is_required_for_allowlisted_response_actions(world):
+    alert_id = new_alert(world, CITY)
+    l1 = Api(world, CITY, "l1")
+    l2 = Api(world, CITY, "l2")
+    request_body = {"action": "isolate_host", "target": "vpn-01", "reason": "Contain confirmed brute force"}
+    created = l1.post(f"/api/alerts/{alert_id}/response-approvals", json=request_body)
+    assert created.status_code == 201
+    approval_id = created.get_json()["id"]
+    assert created.get_json()["execution"] == "not_performed"
+    assert l1.post(f"/api/response-approvals/{approval_id}/decision", json={"decision": "approved"}).status_code == 403
+    assert l1.post(f"/api/alerts/{alert_id}/response-approvals", json=request_body).status_code == 409
+    assert l2.post(f"/api/response-approvals/{approval_id}/decision",
+                   json={"decision": "approved", "note": "Confirmed by L2"}).status_code == 200
+    listing = l1.get(f"/api/alerts/{alert_id}/response-approvals").get_json()
+    assert listing[0]["status"] == "approved" and listing[0]["decision_note"] == "Confirmed by L2"
+    assert Api(world, CITY, "viewer").get(f"/api/alerts/{alert_id}/response-approvals").status_code == 403
+    assert l1.post(f"/api/alerts/{alert_id}/response-approvals",
+                   json={**request_body, "action": "run_shell_command"}).status_code == 400
+
+
+def test_response_requester_cannot_approve_own_request(world):
+    alert_id = new_alert(world, CITY)
+    l2 = Api(world, CITY, "l2")
+    created = l2.post(f"/api/alerts/{alert_id}/response-approvals", json={
+        "action": "block_ip", "target": "203.0.113.10", "reason": "Block confirmed hostile source"})
+    assert created.status_code == 201
+    approval_id = created.get_json()["id"]
+    assert l2.post(f"/api/response-approvals/{approval_id}/decision", json={"decision": "approved"}).status_code == 409
+
+
 def test_hospital_admin_manages_their_own_users(world):
     admin = Api(world, CITY, "hospital_admin")
     names = {u["username"] for u in admin.get("/api/users").get_json()}
@@ -142,6 +200,11 @@ def test_admin_cannot_reach_another_hospitals_records(world):
     assert city.post(f"/api/alerts/{alert_id}/verdict", json={"verdict": "tp"}).status_code == 404
     assert city.post(f"/api/alerts/{alert_id}/handoff", json={"to_owner": "analyst2"}).status_code == 404
     assert city.get(f"/api/alerts/{alert_id}/handoffs").status_code == 404
+    assert city.get(f"/api/alerts/{alert_id}/response-approvals").status_code == 404
+    assert city.post(f"/api/alerts/{alert_id}/response-approvals", json={
+        "action": "isolate_host", "target": "ehr-01", "reason": "wrong tenant"}).status_code == 404
+    assert city.get(f"/api/events?tenant_id={ORTHO}").status_code == 403
+    assert city.get(f"/api/settings?tenant_id={ORTHO}").status_code == 403
     ortho_key = Api(world, ORTHO, "hospital_admin").get("/api/credentials").get_json()[0]["id"]
     assert city.post(f"/api/credentials/{ortho_key}/revoke").status_code == 404
     ortho_user = _own_id(world, ORTHO, "viewer")
@@ -209,3 +272,4 @@ def test_admin_changes_are_audited(world):
     rows = owner_rows(world, "SELECT count(*) FROM audit_log WHERE tenant=%s AND action='log_source.create' AND detail=%s",
                       (CITY, name))
     assert rows[0][0] == 1
+
