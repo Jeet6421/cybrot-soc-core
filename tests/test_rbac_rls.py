@@ -76,19 +76,21 @@ def test_app_context_settings_are_transaction_local(world):
         conn = soc.db()
         soc.set_context(CITY, "l1", 42)
         settings = conn.execute(
-            "SELECT current_setting('app.current_tenant_id', true), "
-            "current_setting('app.current_actor_id', true), "
-            "current_setting('app.current_actor_role', true), "
-            "current_setting('app.tenant_id', true), current_setting('app.actor_id', true), "
-            "current_setting('app.role', true)").fetchone()
+            "SELECT current_setting('app.current_tenant_id', true) AS tenant_id, "
+            "current_setting('app.current_actor_id', true) AS actor_id, "
+            "current_setting('app.current_actor_role', true) AS actor_role, "
+            "current_setting('app.tenant_id', true) AS legacy_tenant_id, "
+            "current_setting('app.actor_id', true) AS legacy_actor_id, "
+            "current_setting('app.role', true) AS legacy_role").fetchone()
         assert tuple(settings[i] for i in range(6)) == (CITY, "42", "l1", CITY, "42", "l1")
         conn.commit()
         cleared = conn.execute(
-            "SELECT current_setting('app.current_tenant_id', true), "
-            "current_setting('app.current_actor_id', true), "
-            "current_setting('app.current_actor_role', true), "
-            "current_setting('app.tenant_id', true), current_setting('app.actor_id', true), "
-            "current_setting('app.role', true)").fetchone()
+            "SELECT current_setting('app.current_tenant_id', true) AS tenant_id, "
+            "current_setting('app.current_actor_id', true) AS actor_id, "
+            "current_setting('app.current_actor_role', true) AS actor_role, "
+            "current_setting('app.tenant_id', true) AS legacy_tenant_id, "
+            "current_setting('app.actor_id', true) AS legacy_actor_id, "
+            "current_setting('app.role', true) AS legacy_role").fetchone()
         assert all(cleared[i] in (None, "") for i in range(6))
 
 
@@ -330,3 +332,4 @@ def test_lookups_work_before_any_identity_is_set(runtime, world, data):
     assert runtime.execute("SELECT count(*) FROM auth_ingest_key(%s)", ("not-a-key-hash",)).fetchone()[0] == 0
     row = runtime.execute("SELECT count(*) FROM auth_user_for_login(%s, %s)", (CITY, "admin")).fetchone()[0]
     assert row == 1
+
