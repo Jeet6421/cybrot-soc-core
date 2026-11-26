@@ -434,15 +434,17 @@ def test_break_glass_is_read_only_audited_and_time_limited(world):
     with psycopg.connect(world.owner_url) as owner:
         manage.grant_break_glass(owner, "vendor", CITY, 1, "INC-TEST-1", "test")
         owner.commit()
-    assert vendor.get(f"/api/alerts?tenant_id={CITY}").status_code == 200
-    assert vendor.post(f"/api/alerts/{alert_id}/ack").status_code == 403  # read-only, even with a grant
-    assert vendor.get(f"/api/alerts?tenant_id={ORTHO}").status_code == 403  # the grant is for City only
-    audited = owner_rows(world, "SELECT count(*) FROM audit_log WHERE tenant=%s AND action='break_glass.read'", (CITY,))
-    assert audited[0][0] >= 1
-
-    with psycopg.connect(world.owner_url) as owner:
-        owner.execute("UPDATE break_glass_grants SET revoked_at = now() WHERE tenant=%s", (CITY,))
-        owner.commit()
+    try:
+        assert vendor.get(f"/api/alerts?tenant_id={CITY}").status_code == 200
+        assert vendor.post(f"/api/alerts/{alert_id}/ack").status_code == 403  # read-only, even with a grant
+        assert vendor.get(f"/api/alerts?tenant_id={ORTHO}").status_code == 403  # the grant is for City only
+        audited = owner_rows(world, "SELECT count(*) FROM audit_log WHERE tenant=%s AND action='break_glass.read'", (CITY,))
+        assert audited[0][0] >= 1
+    finally:
+        # Revoke even when an assert fails, so a leftover grant cannot change later tests.
+        with psycopg.connect(world.owner_url) as owner:
+            owner.execute("UPDATE break_glass_grants SET revoked_at = now() WHERE tenant=%s", (CITY,))
+            owner.commit()
     assert vendor.get(f"/api/alerts?tenant_id={CITY}").status_code == 403
 
 
