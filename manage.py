@@ -7,7 +7,6 @@ Typical first setup (inside the compose network; see README):
     docker compose run --rm migrate python manage.py create-user city-hospital admin hospital_admin
     docker compose run --rm migrate python manage.py create-log-source city-hospital ehr-feed --kind wazuh
     docker compose run --rm migrate python manage.py create-ingest-key city-hospital ehr-feed --label wazuh-01
-    docker compose run --rm migrate python manage.py grant-break-glass vendor city-hospital --hours 4 --reason "INC-123"
 
 Passwords are read from a prompt and never appear in the command line or the shell history.
 """
@@ -82,25 +81,6 @@ def create_ingest_key(conn, tenant, log_source_name, label=""):
     return key
 
 
-def grant_break_glass(conn, vendor_username, tenant, hours, reason, granted_by):
-    """A time-limited grant that lets one vendor admin read one hospital's events, alerts and handoffs."""
-    if not 0 < hours <= 24:
-        raise ValueError("break-glass grants last between 1 minute and 24 hours")
-    if not (reason or "").strip():
-        raise ValueError("a break-glass grant needs a reason, such as a ticket number")
-    row = conn.execute("SELECT id FROM users WHERE tenant IS NULL AND username = %s AND role = 'vendor_admin'",
-                       (vendor_username,)).fetchone()
-    if not row:
-        raise ValueError("vendor admin not found")
-    if not conn.execute("SELECT 1 FROM tenants WHERE id = %s", (tenant,)).fetchone():
-        raise ValueError("tenant not found")
-    gid = conn.execute(
-        "INSERT INTO break_glass_grants(actor_id, tenant, reason, granted_by, expires_at) "
-        "VALUES (%s, %s, %s, %s, now() + make_interval(secs => %s)) RETURNING id",
-        (row[0], tenant, reason.strip()[:200], granted_by.strip()[:80], float(hours) * 3600)).fetchone()
-    return gid[0]
-
-
 def _owner_connection():
     url = os.environ.get(MIGRATE_ENV, "")
     if not url:
@@ -118,9 +98,6 @@ def main(argv=None):
     p.add_argument("--kind", default="")
     p = sub.add_parser("create-ingest-key"); p.add_argument("tenant"); p.add_argument("log_source")
     p.add_argument("--label", default="")
-    p = sub.add_parser("grant-break-glass"); p.add_argument("vendor"); p.add_argument("tenant")
-    p.add_argument("--hours", type=float, required=True); p.add_argument("--reason", required=True)
-    p.add_argument("--by", default=os.environ.get("USER", "dba"))
     args = ap.parse_args(argv)
     try:
         with _owner_connection() as conn:
@@ -140,9 +117,6 @@ def main(argv=None):
                 key = create_ingest_key(conn, args.tenant, args.log_source, args.label)
                 print("ingest key (shown once; store it in the log source's config):")
                 print(key)
-            elif args.cmd == "grant-break-glass":
-                gid = grant_break_glass(conn, args.vendor, args.tenant, args.hours, args.reason, args.by)
-                print(f"break-glass grant {gid} for {args.vendor} on {args.tenant} for {args.hours} h")
             conn.commit()
     except (ValueError, psycopg.Error) as e:
         print(f"refused: {e}", file=sys.stderr)

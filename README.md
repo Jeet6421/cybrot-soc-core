@@ -87,7 +87,7 @@ trend (test plan step 4) can be tracked.
 - `auth.py`    scrypt password hashing and token hashing (standard library)
 - `db/schema.sql` tables, row-level security policies, the SECURITY DEFINER lookups and grants (idempotent)
 - `migrate.py` applies `db/schema.sql` as the owner and sets the `soc_app` password (compose service `migrate`)
-- `manage.py`  owner-only bootstrap and admin: tenants, users, log sources, ingest keys, break-glass grants
+- `manage.py`  owner-only bootstrap and admin: tenants, users, log sources, ingest keys
 - `detect.py`   built-in rules and playbooks; Wazuh playbooks by rule id (`WAZUH_PLAYBOOK`), with a level-based fallback
 - `generate.py` synthetic clinic logs with 3 planted attacks (ground truth in `attack_id`)
 - `scripts/`    attack simulations and load test (see above)
@@ -146,9 +146,12 @@ Run these from the Docker host, as the owner role. None of them is an API call, 
     docker compose run --rm migrate python manage.py create-ingest-key city-hospital ehr-feed --label wazuh-01
 
 The hospital admin then signs in, adds analysts with `POST /api/users`, and issues more ingest keys with
-`POST /api/credentials` (one key per log source). A break-glass grant for the vendor admin is created by a database administrator:
-
-    docker compose run --rm migrate python manage.py grant-break-glass vendor city-hospital --hours 4 --reason "INC-123"
+`POST /api/credentials` (one key per log source). The vendor admin has no standing access to hospital data. For a
+break-glass session the vendor admin requests a grant with `POST /api/break-glass/grants` (a `tenant_id`, `ticket_id`,
+`reason`, one `scope` and a `ttl_minutes` of 1–60, default 30). The grant becomes active only when that hospital's admin
+approves it (`POST /api/break-glass/grants/<id>/approve`). The same admin can revoke it early and must complete a
+post-session review (`POST /api/break-glass/grants/<id>/review`) once it ends. Every read under a grant is audited with
+`auth_context = 'break_glass'` and the grant id, and approval raises a critical `VENDOR_BREAK_GLASS_ACTIVATED` alert.
 
 ## Accounts, roles and ingest keys (v1.2)
 Each hospital is a **tenant**, with a stable id (2 to 63 lowercase letters, digits or hyphens). Vendor support signs in using `platform`, but its user row has no hospital tenant. Each person has a unique email identity; shared usernames or email addresses are rejected. Accounts are classified as `hospital_staff`, `vendor_support`, `external_auditor` or `service_principal`, and can be disabled independently.

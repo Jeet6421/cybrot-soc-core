@@ -10,8 +10,8 @@ import pytest
 from psycopg import errors
 
 import app as soc
-import manage
-from support import Api, CITY, ORTHO, failed_logins
+from support import (Api, CITY, ORTHO, active_break_glass, failed_logins, request_break_glass,
+                     revoke_break_glass)
 
 HOSPITAL_TABLES = ("events", "alerts", "handoffs", "response_approvals")
 ADMIN_TABLES = ("users", "ingest_keys", "log_sources")
@@ -348,34 +348,44 @@ def test_vendor_sees_the_tenant_list_but_no_hospital_data(runtime, data):
     assert runtime.execute("SELECT count(*) FROM tenants").fetchone()[0] >= 3
 
 
-def test_break_glass_lets_the_vendor_read_one_hospital_and_only_while_valid(runtime, world, data):
+def test_pending_grant_reads_nothing(runtime, world, data):
     vendor = vendor_actor()
-    with psycopg.connect(world.owner_url) as owner:
-        grant = manage.grant_break_glass(owner, "vendor", CITY, 1, "INC-RLS-1", "test")
-        owner.commit()
+    request_break_glass(world, CITY, "alerts:read")  # requested, never approved
+    try:
+        as_identity(runtime, CITY, "vendor_admin", vendor)
+        assert count(runtime, "alerts", CITY) == 0
+    finally:
+        revoke_break_glass(world, CITY)
+
+
+def test_approved_grant_reads_only_its_scope_and_only_while_valid(runtime, world, data):
+    vendor = vendor_actor()
+    active_break_glass(world, CITY, "alerts:read")
     try:
         as_identity(runtime, CITY, "vendor_admin", vendor)
         assert count(runtime, "alerts", CITY) >= 1
-        assert count(runtime, "events", CITY) >= 1
+        assert count(runtime, "events", CITY) == 0  # events:read was not granted
         assert runtime.execute("UPDATE alerts SET status = 'closed'").rowcount == 0  # read-only
         assert runtime.execute("SELECT count(*) FROM ingest_keys").fetchone()[0] == 0  # never credentials
         assert runtime.execute("SELECT count(*) FROM response_approvals").fetchone()[0] == 0
         as_identity(runtime, ORTHO, "vendor_admin", vendor)
         assert count(runtime, "alerts", ORTHO) == 0  # the grant is for City only
     finally:
-        with psycopg.connect(world.owner_url) as owner:
-            owner.execute("UPDATE break_glass_grants SET revoked_at = now() WHERE id = %s", (grant,))
-            owner.commit()
+        revoke_break_glass(world, CITY)
 
 
-def test_expired_break_glass_grant_reads_nothing(runtime, world, data):
+def test_expired_grant_reads_nothing(runtime, world, data):
     vendor = vendor_actor()
-    with psycopg.connect(world.owner_url) as owner:
-        grant = manage.grant_break_glass(owner, "vendor", ORTHO, 1, "INC-RLS-2", "test")
-        owner.execute("UPDATE break_glass_grants SET expires_at = now() - interval '1 second' WHERE id = %s", (grant,))
-        owner.commit()
-    as_identity(runtime, ORTHO, "vendor_admin", vendor)
-    assert count(runtime, "alerts", ORTHO) == 0
+    gid = active_break_glass(world, ORTHO, "alerts:read")
+    try:
+        with psycopg.connect(world.owner_url) as owner:
+            owner.execute("UPDATE break_glass_grants SET expires_at = now() - interval '1 second' WHERE grant_id = %s",
+                          (gid,))
+            owner.commit()
+        as_identity(runtime, ORTHO, "vendor_admin", vendor)
+        assert count(runtime, "alerts", ORTHO) == 0
+    finally:
+        revoke_break_glass(world, ORTHO)
 
 
 _VENDOR = {}

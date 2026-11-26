@@ -48,3 +48,35 @@ def failed_logins(tenant, ip=None, day="2026-11-25"):
     ip = ip or f"100.{random.randint(64, 127)}.{random.randint(0, 255)}.{random.randint(1, 254)}"
     return [{"ts": f"{day}T10:00:0{i}", "tenant": tenant, "source": "auth", "type": "auth_fail",
              "user": "u", "ip": ip} for i in range(5)]
+
+
+# ---- Break-glass helpers: the vendor requests, the hospital admin approves, revokes and reviews ------------
+
+def request_break_glass(world, tenant, scope="alerts:read", ttl=None, ticket="INC-TEST"):
+    body = {"tenant_id": tenant, "ticket_id": ticket, "reason": "scripted test", "scope": scope}
+    if ttl is not None:
+        body["ttl_minutes"] = ttl
+    return Api(world, "platform", "vendor_admin").post("/api/break-glass/grants", json=body)
+
+
+def approve_break_glass(world, tenant, grant_id):
+    return Api(world, tenant, "hospital_admin").post(f"/api/break-glass/grants/{grant_id}/approve")
+
+
+def active_break_glass(world, tenant, scope="alerts:read"):
+    """Request a grant and approve it as the hospital's admin. Returns the grant id."""
+    r = request_break_glass(world, tenant, scope)
+    assert r.status_code == 201, r.get_json()
+    gid = r.get_json()["grant_id"]
+    assert approve_break_glass(world, tenant, gid).status_code == 200
+    return gid
+
+
+def revoke_break_glass(world, tenant):
+    """Test cleanup only: end every open grant for one hospital through the owner, so no grant leaks to other tests."""
+    import psycopg
+    with psycopg.connect(world.owner_url) as owner:
+        owner.execute("UPDATE break_glass_grants SET revoked_at = now() WHERE tenant_id = %s AND revoked_at IS NULL",
+                      (tenant,))
+        owner.commit()
+
