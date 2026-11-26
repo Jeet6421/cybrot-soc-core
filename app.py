@@ -213,7 +213,7 @@ def audit(action, detail=""):
 
 
 _AUDIT_VERDICTS = {"tp", "fp", "unclear"}
-_AUDIT_STATUSES = {"new", "ack", "closed"}
+_AUDIT_STATUSES = {"new", "ack", "closed", "pending", "disabled"}
 _AUDIT_DECISIONS = {"approved", "rejected"}
 
 
