@@ -9,7 +9,7 @@ BEGIN
     CREATE ROLE soc_app LOGIN;
   END IF;
 END $$;
-ALTER ROLE soc_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+ALTER ROLE soc_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
 
 -- 2. Tables. Earlier PRs' tables are kept; new columns are added in place.
 CREATE TABLE IF NOT EXISTS tenants(id TEXT PRIMARY KEY, name TEXT NOT NULL,
@@ -135,11 +135,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS response_approvals_one_pending_idx
 --    they vanish at COMMIT or ROLLBACK, so a pooled connection never carries one request's context into
 --    the next. An unset or empty value makes app_tenant() NULL, and NULL matches no row (fail closed).
 CREATE OR REPLACE FUNCTION app_tenant() RETURNS text LANGUAGE sql STABLE
-  AS $$ SELECT NULLIF(current_setting('app.tenant_id', true), '') $$;
+  AS $$ SELECT COALESCE(NULLIF(current_setting('app.current_tenant_id', true), ''),
+                        NULLIF(current_setting('app.tenant_id', true), '')) $$;
 CREATE OR REPLACE FUNCTION app_role() RETURNS text LANGUAGE sql STABLE
-  AS $$ SELECT NULLIF(current_setting('app.role', true), '') $$;
+  AS $$ SELECT COALESCE(NULLIF(current_setting('app.current_actor_role', true), ''),
+                        NULLIF(current_setting('app.role', true), '')) $$;
 CREATE OR REPLACE FUNCTION app_actor_id() RETURNS bigint LANGUAGE sql STABLE
-  AS $$ SELECT NULLIF(current_setting('app.actor_id', true), '')::bigint $$;
+  AS $$ SELECT COALESCE(NULLIF(current_setting('app.current_actor_id', true), ''),
+                        NULLIF(current_setting('app.actor_id', true), ''))::bigint $$;
 
 -- Is there an unrevoked, unexpired break-glass grant for this actor and this hospital? SECURITY DEFINER so
 -- that the check does not depend on the caller's row access to break_glass_grants.
