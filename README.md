@@ -83,6 +83,7 @@ The dashboard shows these at the top. `GET /api/metrics` also returns `false_pos
 trend (test plan step 4) can be tracked.
 
 ## Layout
+- `docs/RUNBOOKS.md`  Operating procedures: 100-bed onboarding, intra-tenant handoffs, vendor break-glass, hospital offboarding
 - `app.py`      Flask API + PostgreSQL (psycopg 3, runtime role `soc_app`): identity, roles, `/api/events`, `/api/ingest/wazuh`, `/api/alerts`, `/api/alerts/<id>/handoff`, `/api/metrics`, `/api/exit-criteria`
 - `auth.py`    scrypt password hashing and token hashing (standard library)
 - `db/schema.sql` tables, row-level security policies, the SECURITY DEFINER lookups and grants (idempotent)
@@ -206,7 +207,11 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 | `GET /api/alerts/<id>` | hospital roles; vendor with break-glass | One tenant-scoped alert with telemetry-safe fields |
 | `POST /api/alerts/<id>/ack` | `hospital_admin`, `l1`, `l2` | Acknowledge an alert |
 | `POST /api/alerts/<id>/verdict` | `hospital_admin`, `l2` | Close with `tp`, `fp` or `unclear`, and an optional `note` |
-| `POST /api/alerts/<id>/handoff` | `hospital_admin`, `l1`, `l2` | Pass an open alert to another analyst: `to_owner`, `note` |
+| `POST /api/alerts/<id>/handoff` | `hospital_admin`, `l1`, `l2` | Pass an open alert to an active analyst of the same hospital: `to_actor_id` (a user id from `/api/analysts`), `note`. `to_owner` is retired (400) |
+| `GET /api/assets`, `POST /api/assets`, `PATCH /api/assets/<id>` | read: hospital roles; write: `hospital_admin` | Asset inventory. Clinical classes (`mri`, `ct`, `x_ray`, `ultrasound`, `ventilator`, `patient_monitor`, `infusion_pump`) must be `agentless_medical` |
+| `GET /api/data-flow` | `hospital_admin` | Last event time, accepted and rejected counts (24 h), per-source status, readiness sample |
+| `POST /api/offboarding/start` | `hospital_admin` | Start offboarding: disables all logins, revokes all ingest keys, stops new writes |
+| `POST /api/tenants/<id>/offboarding/{export,archive,purge}` | `vendor_admin` | Compliance export, then archive, then purge (each step needs the one before) |
 | `GET /api/alerts/<id>/handoffs` | hospital roles; vendor with break-glass | Handoff history for an alert |
 | `GET /api/analysts` | hospital roles | Analysts that alerts can be handed to |
 | `GET /api/metrics` | hospital roles; vendor with break-glass | Counts, false-positive rate (overall and weekly), detection rate, mean time to ack |
@@ -238,6 +243,7 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 
 **Deviations from the PR 1 spec, and what is not there yet**
 - The column is still called `tenant`, and the API also accepts `tenant_id`. `credentials` is the existing `ingest_keys` table, now bound to a log source.
+- Credentials: `POST /api/credentials/<id>/rotate` takes `overlap_minutes` (0 to 1440, default 60). The old key keeps working for that window, then stops. Keys are shown once; the list shows `key_prefix` only.
 - `docs/MULTITENANT.md` uses other role names (Platform admin, Hospital admin, SOC analyst, Viewer). The roles above are the ones in the code; the design doc needs updating.
 - Response approvals record an allowlisted action request and an independent `hospital_admin` or `l2` decision. They do not execute isolation, account-disabling or IP-blocking actions.
 - The database lets `l1` update alerts (acknowledge, hand off). Only the API stops `l1` from giving a verdict. Column-level rules would move this into the database.

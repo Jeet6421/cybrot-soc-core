@@ -492,3 +492,201 @@ GRANT UPDATE (approved_by, approved_at, expires_at, revoked_at, reviewed_by, rev
 GRANT SELECT, INSERT ON response_approvals TO soc_app;
 GRANT UPDATE (status, approved_by, decided_at, decision_note) ON response_approvals TO soc_app;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO soc_app;
+
+-- ===== PR 9: asset inventory, onboarding, intra-tenant handoffs, offboarding =====
+
+-- Asset inventory (IEC 80001 / NIST CSF). Clinical equipment must be monitored agentlessly: no EDR agent and
+-- no intrusive scan can run on a device that a patient depends on.
+CREATE TABLE IF NOT EXISTS assets(
+  asset_id BIGSERIAL PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  device_name TEXT NOT NULL,
+  ip_address TEXT NOT NULL DEFAULT '',
+  mac_address TEXT NOT NULL DEFAULT '',
+  department TEXT NOT NULL DEFAULT '',
+  asset_class TEXT NOT NULL DEFAULT 'workstation',
+  monitoring_mode TEXT NOT NULL
+    CHECK (monitoring_mode IN ('edr_managed', 'agentless_medical', 'network_infra', 'unmanaged')),
+  criticality TEXT NOT NULL DEFAULT 'medium' CHECK (criticality IN ('low', 'medium', 'high', 'critical')),
+  last_seen_at TIMESTAMPTZ,
+  created TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, device_name),
+  CONSTRAINT assets_medical_is_agentless CHECK (
+    asset_class NOT IN ('mri', 'ct', 'x_ray', 'ultrasound', 'ventilator', 'patient_monitor', 'infusion_pump')
+    OR monitoring_mode = 'agentless_medical'));
+CREATE INDEX IF NOT EXISTS assets_tenant_idx ON assets(tenant_id, asset_id);
+
+-- Hospital lifecycle: active -> offboarding -> archived -> purged. Only the steps below are allowed.
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS lifecycle_state TEXT NOT NULL DEFAULT 'active';
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS lifecycle_changed TEXT;
+DO $lifecycle$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'tenants_lifecycle_check') THEN
+    ALTER TABLE tenants ADD CONSTRAINT tenants_lifecycle_check
+      CHECK (lifecycle_state IN ('active', 'offboarding', 'archived', 'purged'));
+  END IF;
+END $lifecycle$;
+
+-- Ingest credentials: a short prefix for humans to recognise a key, and the hash for checking it. The raw key is
+-- never stored. retire_after keeps a rotated key valid for an overlap window, then it stops on its own.
+ALTER TABLE ingest_keys ADD COLUMN IF NOT EXISTS key_prefix TEXT NOT NULL DEFAULT '';
+ALTER TABLE ingest_keys ADD COLUMN IF NOT EXISTS retire_after TIMESTAMPTZ;
+
+-- Handoffs name real users (actor ids), not analyst name strings.
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS owner_user_id BIGINT;
+ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS from_user_id BIGINT;
+ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS to_user_id BIGINT;
+DO $owner_fk$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'alerts_owner_user_tenant_fk') THEN
+    ALTER TABLE alerts ADD CONSTRAINT alerts_owner_user_tenant_fk FOREIGN KEY (owner_user_id, tenant)
+      REFERENCES users(id, tenant);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'handoffs_to_user_tenant_fk') THEN
+    ALTER TABLE handoffs ADD CONSTRAINT handoffs_to_user_tenant_fk FOREIGN KEY (to_user_id, tenant)
+      REFERENCES users(id, tenant);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'handoffs_from_user_tenant_fk') THEN
+    ALTER TABLE handoffs ADD CONSTRAINT handoffs_from_user_tenant_fk FOREIGN KEY (from_user_id, tenant)
+      REFERENCES users(id, tenant);
+  END IF;
+END $owner_fk$;
+
+-- Who may own or receive an alert: an active hospital analyst (admin, L1 or L2) of that hospital.
+CREATE OR REPLACE FUNCTION handoff_target_name(p_tenant text, p_user bigint) RETURNS text
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  SELECT u.username FROM users u
+  WHERE p_tenant IS NOT NULL AND u.id = p_user AND u.tenant = p_tenant
+    AND u.is_active AND u.status = 'active' AND u.role IN ('hospital_admin', 'l1', 'l2')
+    AND u.account_type = 'hospital_staff'
+$$;
+
+CREATE OR REPLACE FUNCTION handoff_target_active(p_tenant text, p_user bigint) RETURNS boolean
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  SELECT handoff_target_name(p_tenant, p_user) IS NOT NULL
+$$;
+
+CREATE OR REPLACE FUNCTION hospital_analysts(p_tenant text)
+  RETURNS TABLE(user_id bigint, username text, user_role text)
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  SELECT u.id, u.username, u.role FROM users u
+  WHERE u.tenant = p_tenant AND u.is_active AND u.status = 'active'
+    AND u.role IN ('hospital_admin', 'l1', 'l2') AND u.account_type = 'hospital_staff'
+  ORDER BY u.id
+$$;
+
+-- The only way a hospital's lifecycle changes. The update is a compare-and-set on the current state.
+CREATE OR REPLACE FUNCTION set_tenant_lifecycle(p_tenant text, p_from text, p_to text) RETURNS boolean
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+BEGIN
+  IF p_tenant IS NULL OR p_tenant = 'platform' THEN
+    RETURN false;
+  END IF;
+  IF (p_from, p_to) NOT IN (('active', 'offboarding'), ('offboarding', 'archived')) THEN
+    RAISE EXCEPTION 'illegal lifecycle step % -> %', p_from, p_to;
+  END IF;
+  UPDATE tenants SET lifecycle_state = p_to,
+    lifecycle_changed = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS')
+    WHERE id = p_tenant AND lifecycle_state = p_from;
+  RETURN FOUND;
+END $$;
+
+-- Row counts of everything a hospital holds. Used by the export hook and returned by the purge.
+CREATE OR REPLACE FUNCTION tenant_export_counts(p_tenant text) RETURNS jsonb
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  SELECT jsonb_build_object(
+    'events', (SELECT count(*) FROM events WHERE tenant = p_tenant),
+    'alerts', (SELECT count(*) FROM alerts WHERE tenant = p_tenant),
+    'handoffs', (SELECT count(*) FROM handoffs WHERE tenant = p_tenant),
+    'response_approvals', (SELECT count(*) FROM response_approvals WHERE tenant = p_tenant),
+    'assets', (SELECT count(*) FROM assets WHERE tenant_id = p_tenant),
+    'log_sources', (SELECT count(*) FROM log_sources WHERE tenant = p_tenant),
+    'ingest_keys', (SELECT count(*) FROM ingest_keys WHERE tenant = p_tenant),
+    'users', (SELECT count(*) FROM users WHERE tenant = p_tenant))
+$$;
+
+-- Purge an archived hospital. Operational data is deleted. Users are deactivated and their personal fields are
+-- replaced, because audit rows point at them. Audit rows and the tenant row stay, so the record of what happened remains.
+CREATE OR REPLACE FUNCTION purge_tenant_data(p_tenant text) RETURNS jsonb
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE before_counts jsonb;
+BEGIN
+  IF p_tenant IS NULL OR p_tenant = 'platform' THEN
+    RAISE EXCEPTION 'this tenant cannot be purged';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM tenants WHERE id = p_tenant AND lifecycle_state = 'archived') THEN
+    RAISE EXCEPTION 'tenant must be archived before it is purged';
+  END IF;
+  before_counts := tenant_export_counts(p_tenant);
+  DELETE FROM response_approvals WHERE tenant = p_tenant;
+  DELETE FROM handoffs WHERE tenant = p_tenant;
+  DELETE FROM alerts WHERE tenant = p_tenant;
+  DELETE FROM events WHERE tenant = p_tenant;
+  DELETE FROM assets WHERE tenant_id = p_tenant;
+  DELETE FROM ingest_keys WHERE tenant = p_tenant;
+  DELETE FROM log_sources WHERE tenant = p_tenant;
+  DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE tenant = p_tenant);
+  UPDATE users SET username = 'purged-' || id::text, email = 'purged+' || id::text || '@invalid.local',
+    is_active = FALSE, status = 'disabled', token_version = token_version + 1, password_hash = 'purged'
+    WHERE tenant = p_tenant;
+  UPDATE tenants SET lifecycle_state = 'purged',
+    lifecycle_changed = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS')
+    WHERE id = p_tenant;
+  RETURN before_counts;
+END $$;
+
+-- Ingest keys stop when their hospital is not active, and a rotated key stops after its overlap window.
+CREATE OR REPLACE FUNCTION auth_ingest_key(p_key_hash text)
+  RETURNS TABLE(key_id bigint, key_tenant text, key_log_source_id bigint)
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  SELECT k.id, k.tenant, k.log_source_id
+  FROM ingest_keys k
+  JOIN log_sources ls ON ls.id = k.log_source_id
+  JOIN tenants t ON t.id = k.tenant
+  WHERE k.key_hash = p_key_hash AND k.revoked_at IS NULL
+    AND (k.retire_after IS NULL OR k.retire_after > now())
+    AND ls.disabled_at IS NULL AND ls.tenant = k.tenant AND t.lifecycle_state = 'active'
+$$;
+
+-- Row-level security for the new and changed tables.
+ALTER TABLE assets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE assets FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS assets_read ON assets;
+CREATE POLICY assets_read ON assets FOR SELECT
+  USING (tenant_id = app_tenant() AND app_role() IN ('hospital_admin', 'l1', 'l2', 'viewer'));
+DROP POLICY IF EXISTS assets_admin ON assets;
+CREATE POLICY assets_admin ON assets FOR ALL
+  USING (tenant_id = app_tenant() AND app_role() = 'hospital_admin')
+  WITH CHECK (tenant_id = app_tenant() AND app_role() = 'hospital_admin');
+
+-- A handoff is written by the acting analyst, to an active analyst of the same hospital.
+DROP POLICY IF EXISTS handoffs_write ON handoffs;
+CREATE POLICY handoffs_write ON handoffs FOR INSERT
+  WITH CHECK (tenant = app_tenant() AND app_role() IN ('hospital_admin', 'l1', 'l2')
+    AND from_user_id = app_actor_id() AND handoff_target_active(app_tenant(), to_user_id));
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON assets TO soc_app;
+-- The blanket sequence grant above runs before this table exists, so grant its sequence explicitly.
+GRANT USAGE, SELECT ON SEQUENCE assets_asset_id_seq TO soc_app;
+REVOKE ALL ON FUNCTION handoff_target_name(text, bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION handoff_target_active(text, bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION hospital_analysts(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION set_tenant_lifecycle(text, text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION tenant_export_counts(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION purge_tenant_data(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION handoff_target_name(text, bigint) TO soc_app;
+GRANT EXECUTE ON FUNCTION handoff_target_active(text, bigint) TO soc_app;
+GRANT EXECUTE ON FUNCTION hospital_analysts(text) TO soc_app;
+GRANT EXECUTE ON FUNCTION set_tenant_lifecycle(text, text, text) TO soc_app;
+GRANT EXECUTE ON FUNCTION tenant_export_counts(text) TO soc_app;
+GRANT EXECUTE ON FUNCTION purge_tenant_data(text) TO soc_app;
+
+-- Whether a hospital's records were exported. Archive and purge require it. The vendor cannot read audit rows
+-- directly (they are visible to the hospital admin only), so this check runs with the owner's rights.
+CREATE OR REPLACE FUNCTION tenant_exported(p_tenant text) RETURNS boolean
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  SELECT EXISTS (SELECT 1 FROM audit_events WHERE tenant_id = p_tenant AND action = 'tenant.export')
+$$;
+REVOKE ALL ON FUNCTION tenant_exported(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION tenant_exported(text) TO soc_app;
