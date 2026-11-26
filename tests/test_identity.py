@@ -371,7 +371,24 @@ def _own_id(world, tenant, username):
 
 def test_admin_cannot_reach_another_hospitals_records(world):
     alert_id = new_alert(world, ORTHO)
+    ortho = Api(world, ORTHO, "hospital_admin")
     city = Api(world, CITY, "hospital_admin")
+    ortho_approval = Api(world, ORTHO, "l1").post(
+        f"/api/alerts/{alert_id}/response-approvals",
+        json={"action": "isolate_host", "target": "ehr-01", "reason": "cross tenant test"})
+    assert ortho_approval.status_code == 201
+    approval_id = ortho_approval.get_json()["id"]
+
+    ortho_key = ortho.get("/api/credentials").get_json()[0]["id"]
+    ortho_user = _own_id(world, ORTHO, "viewer")
+    ortho_source = owner_rows(world, "SELECT id FROM log_sources WHERE tenant=%s", (ORTHO,))[0][0]
+    before_alert = owner_rows(world, "SELECT status, owner FROM alerts WHERE id=%s", (alert_id,))[0]
+    before_handoffs = owner_rows(world, "SELECT count(*) FROM handoffs WHERE alert_id=%s", (alert_id,))[0][0]
+    before_approvals = owner_rows(world, "SELECT count(*) FROM response_approvals WHERE alert_id=%s", (alert_id,))[0][0]
+    before_key = owner_rows(world, "SELECT revoked_at FROM ingest_keys WHERE id=%s", (ortho_key,))[0][0]
+    before_user = owner_rows(world, "SELECT status, is_active, token_version FROM users WHERE id=%s", (ortho_user,))[0]
+    before_source = owner_rows(world, "SELECT disabled_at FROM log_sources WHERE id=%s", (ortho_source,))[0][0]
+
     assert city.post(f"/api/alerts/{alert_id}/ack").status_code == 404
     assert city.post(f"/api/alerts/{alert_id}/verdict", json={"verdict": "tp"}).status_code == 404
     assert city.post(f"/api/alerts/{alert_id}/handoff", json={"to_owner": "analyst2"}).status_code == 404
@@ -379,16 +396,23 @@ def test_admin_cannot_reach_another_hospitals_records(world):
     assert city.get(f"/api/alerts/{alert_id}/response-approvals").status_code == 404
     assert city.post(f"/api/alerts/{alert_id}/response-approvals", json={
         "action": "isolate_host", "target": "ehr-01", "reason": "wrong tenant"}).status_code == 404
+    assert city.post(f"/api/response-approvals/{approval_id}/decision",
+                     json={"decision": "approved"}).status_code == 404
     assert city.get(f"/api/events?tenant_id={ORTHO}").status_code == 403
     assert city.get(f"/api/settings?tenant_id={ORTHO}").status_code == 403
-    ortho_key = Api(world, ORTHO, "hospital_admin").get("/api/credentials").get_json()[0]["id"]
     assert city.post(f"/api/credentials/{ortho_key}/revoke").status_code == 404
-    ortho_user = _own_id(world, ORTHO, "viewer")
     assert city.post(f"/api/users/{ortho_user}/disable").status_code == 404
-    ortho_source = owner_rows(world, "SELECT id FROM log_sources WHERE tenant=%s", (ORTHO,))[0][0]
     assert city.post(f"/api/log-sources/{ortho_source}/disable").status_code == 404
     city_user_ids = {u["id"] for u in city.get("/api/users").get_json()}
     assert ortho_user not in city_user_ids
+
+    assert owner_rows(world, "SELECT status, owner FROM alerts WHERE id=%s", (alert_id,))[0] == before_alert
+    assert owner_rows(world, "SELECT count(*) FROM handoffs WHERE alert_id=%s", (alert_id,))[0][0] == before_handoffs
+    assert owner_rows(world, "SELECT count(*) FROM response_approvals WHERE alert_id=%s", (alert_id,))[0][0] == before_approvals
+    assert owner_rows(world, "SELECT revoked_at FROM ingest_keys WHERE id=%s", (ortho_key,))[0][0] == before_key
+    assert owner_rows(world, "SELECT status, is_active, token_version FROM users WHERE id=%s",
+                      (ortho_user,))[0] == before_user
+    assert owner_rows(world, "SELECT disabled_at FROM log_sources WHERE id=%s", (ortho_source,))[0][0] == before_source
 
 
 # ---- Vendor admin: no routine access, break-glass only ------------------------------------------------

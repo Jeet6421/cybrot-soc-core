@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS log_sources(id BIGSERIAL PRIMARY KEY, tenant TEXT NOT
   name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT '',
   created TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS'),
   disabled_at TEXT, UNIQUE (tenant, name));
+CREATE INDEX IF NOT EXISTS log_sources_tenant_id_idx ON log_sources(tenant, id);
 
 CREATE TABLE IF NOT EXISTS users(id BIGSERIAL PRIMARY KEY, tenant TEXT NOT NULL REFERENCES tenants(id),
   username TEXT NOT NULL,
@@ -45,6 +46,7 @@ UPDATE users SET account_type = CASE WHEN role = 'vendor_admin' THEN 'vendor_sup
 UPDATE users SET is_active = (status = 'active');
 UPDATE users SET tenant = NULL WHERE role = 'vendor_admin';
 ALTER TABLE users ALTER COLUMN email SET NOT NULL;
+CREATE INDEX IF NOT EXISTS users_tenant_id_idx ON users(tenant, id);
 ALTER TABLE users DROP CONSTRAINT IF EXISTS users_account_classification_check;
 ALTER TABLE users ADD CONSTRAINT users_account_classification_check CHECK (
   (role = 'vendor_admin' AND account_type = 'vendor_support' AND tenant IS NULL)
@@ -57,6 +59,7 @@ CREATE TABLE IF NOT EXISTS ingest_keys(id BIGSERIAL PRIMARY KEY, tenant TEXT NOT
   label TEXT NOT NULL DEFAULT '', key_hash TEXT NOT NULL UNIQUE,
   created TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS'), revoked_at TEXT);
 ALTER TABLE ingest_keys ADD COLUMN IF NOT EXISTS log_source_id BIGINT REFERENCES log_sources(id);
+CREATE INDEX IF NOT EXISTS ingest_keys_tenant_id_idx ON ingest_keys(tenant, id);
 
 CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,
   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -99,11 +102,13 @@ ALTER TABLE alerts ADD COLUMN IF NOT EXISTS resolution TEXT;
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS rule_version TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS users_id_tenant_uidx ON users(id, tenant);
 CREATE UNIQUE INDEX IF NOT EXISTS alerts_id_tenant_uidx ON alerts(id, tenant);
+CREATE INDEX IF NOT EXISTS alerts_tenant_id_idx ON alerts(tenant, id);
 
 CREATE TABLE IF NOT EXISTS handoffs(id BIGSERIAL PRIMARY KEY, alert_id BIGINT, at TEXT, from_owner TEXT,
   to_owner TEXT, note TEXT);
 ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS tenant TEXT;
 CREATE INDEX IF NOT EXISTS ho_idx ON handoffs(alert_id);
+CREATE INDEX IF NOT EXISTS handoffs_tenant_alert_id_idx ON handoffs(tenant, alert_id, id);
 
 -- Response approvals record a human approval decision. They never execute an action themselves.
 CREATE TABLE IF NOT EXISTS response_approvals(

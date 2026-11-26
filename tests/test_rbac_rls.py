@@ -29,11 +29,15 @@ def runtime(world):
 
 
 def as_identity(conn, tenant, role, actor=None):
-    conn.execute("SELECT set_config('app.tenant_id', %s, true), set_config('app.role', %s, true), "
+    tenant_value = tenant or ""
+    role_value = role or ""
+    actor_value = "" if actor is None else str(actor)
+    conn.execute("SELECT set_config('app.current_tenant_id', %s, true), "
+                 "set_config('app.current_actor_role', %s, true), "
+                 "set_config('app.current_actor_id', %s, true), "
+                 "set_config('app.tenant_id', %s, true), set_config('app.role', %s, true), "
                  "set_config('app.actor_id', %s, true)",
-                 (tenant or "", role or "", "" if actor is None else str(actor)))
-
-
+                 (tenant_value, role_value, actor_value, tenant_value, role_value, actor_value))
 def count(conn, table, tenant):
     return conn.execute(f"SELECT count(*) FROM {table} WHERE tenant = %s", (tenant,)).fetchone()[0]
 
@@ -63,6 +67,92 @@ def test_runtime_role_cannot_bypass_rls_or_administer(runtime):
     row = runtime.execute("SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, rolinherit, rolreplication "
                           "FROM pg_roles WHERE rolname = current_user").fetchone()
     assert row == (False, False, False, False, False, False)
+
+
+TENANT_TABLES = ("users", "ingest_keys", "log_sources", "events", "alerts", "handoffs", "response_approvals")
+
+
+def test_every_tenant_table_has_rls_enabled_and_forced(runtime):
+    rows = runtime.execute(
+        "SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class "
+        "WHERE relnamespace = 'public'::regnamespace AND relname = ANY(%s)",
+        (list(TENANT_TABLES),)).fetchall()
+    assert {row[0] for row in rows} == set(TENANT_TABLES)
+    assert all(enabled and forced for _, enabled, forced in rows)
+
+
+def test_canonical_unset_context_fails_closed_for_all_tenant_tables(runtime, data):
+    for table in TENANT_TABLES:
+        assert runtime.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0, table
+
+
+def test_spoofed_tenant_inserts_are_rejected(runtime, world, data):
+    # Valid payloads and existing foreign keys ensure each failure comes from the tenant policy.
+    with psycopg.connect(world.owner_url) as owner:
+        ortho_actor = owner.execute(
+            "SELECT id FROM users WHERE tenant=%s AND username='admin'", (ORTHO,)).fetchone()[0]
+        ortho_alert = owner.execute(
+            "SELECT id FROM alerts WHERE tenant=%s ORDER BY id LIMIT 1", (ORTHO,)).fetchone()[0]
+    statements = (
+        ("INSERT INTO users(tenant, username, email, role, password_hash) "
+         "VALUES (%s, 'rls-spoof', 'rls-spoof@example.invalid', 'l1', 'hash')", (ORTHO,)),
+        ("INSERT INTO ingest_keys(tenant, label, key_hash) VALUES (%s, 'spoof', 'rls-spoof-key')", (ORTHO,)),
+        ("INSERT INTO log_sources(tenant, name, kind) VALUES (%s, 'rls-spoof', 'test')", (ORTHO,)),
+        ("INSERT INTO events(ts, tenant, type) VALUES ('2026-11-25T10:00:00', %s, 'auth_fail')", (ORTHO,)),
+        ("INSERT INTO alerts(tenant, rule) VALUES (%s, 'RLS_SPOOF')", (ORTHO,)),
+        ("INSERT INTO handoffs(alert_id, at, from_owner, to_owner, note, tenant) "
+         "VALUES (%s, '2026-11-25T10:00:00', 'a', 'b', '', %s)", (ortho_alert, ORTHO)),
+        ("INSERT INTO response_approvals(tenant, alert_id, action, target, reason, requested_by) "
+         "VALUES (%s, %s, 'isolate_host', 'ehr-01', 'spoofed tenant test', %s)",
+         (ORTHO, ortho_alert, ortho_actor)),
+    )
+    for sql, params in statements:
+        with pytest.raises(errors.InsufficientPrivilege):
+            with runtime.transaction():
+                runtime.execute(sql, params)
+    as_identity(runtime, CITY, "hospital_admin", actor_id(world, CITY, "admin"))
+    for sql, params in statements:
+        with pytest.raises(errors.InsufficientPrivilege):
+            with runtime.transaction():
+                runtime.execute(sql, params)
+
+
+@pytest.mark.parametrize("table", TENANT_TABLES)
+def test_hospital_cannot_select_update_or_delete_another_tenant(runtime, world, data, table):
+    as_identity(runtime, CITY, "hospital_admin", actor_id(world, CITY, "admin"))
+    assert runtime.execute(f"SELECT count(*) FROM {table} WHERE tenant = %s", (ORTHO,)).fetchone()[0] == 0
+    update_column = "status" if table == "response_approvals" else "tenant"
+    assert runtime.execute(
+        f"UPDATE {table} SET {update_column} = {update_column} WHERE tenant = %s", (ORTHO,)).rowcount == 0
+    if table == "response_approvals":
+        # soc_app deliberately has no DELETE grant for approval records.
+        with pytest.raises(errors.InsufficientPrivilege):
+            runtime.execute(f"DELETE FROM {table} WHERE tenant = %s", (ORTHO,))
+    else:
+        assert runtime.execute(f"DELETE FROM {table} WHERE tenant = %s", (ORTHO,)).rowcount == 0
+
+
+def test_tenant_leading_indexes_exist(runtime):
+    expected = {
+        "users": "users_tenant_id_idx",
+        "ingest_keys": "ingest_keys_tenant_id_idx",
+        "log_sources": "log_sources_tenant_id_idx",
+        "events": "ev_idx",
+        "alerts": "alerts_tenant_id_idx",
+        "handoffs": "handoffs_tenant_alert_id_idx",
+        "response_approvals": "response_approvals_tenant_alert_idx",
+    }
+    rows = runtime.execute(
+        "SELECT tablename, indexname, indexdef FROM pg_indexes "
+        "WHERE schemaname = 'public' AND indexname = ANY(%s)",
+        (list(expected.values()),)).fetchall()
+    found = {row[0]: row[2] for row in rows}
+    assert set(found) == set(expected)
+    for table, index_name in expected.items():
+        assert index_name in found[table]
+        assert f"ON public.{table} USING btree (tenant" in found[table], found[table]
+
+
 
 
 def test_app_queries_connect_as_soc_app(world):
