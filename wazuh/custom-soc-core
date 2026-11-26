@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""Wazuh custom integration: sends one alert file to SOC Core.
+
+Wazuh calls:  custom-soc-core <alert_file> <api_key> <hook_url>
+Install as /var/ossec/integrations/custom-soc-core (owner root, group wazuh, mode 750).
+Standard library only. The ingest key is sent as a bearer token and is never written to the log.
+"""
+import sys
+import urllib.error
+import urllib.request
+
+
+def main():
+    if len(sys.argv) < 4:
+        print("usage: custom-soc-core <alert_file> <api_key> <hook_url>", file=sys.stderr)
+        return 2
+    alert_file, api_key, hook_url = sys.argv[1], sys.argv[2], sys.argv[3]
+    with open(alert_file, "rb") as f:
+        body = f.read()
+    req = urllib.request.Request(hook_url, data=body, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": f"Bearer {api_key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return 0 if 200 <= r.status < 300 else 1
+    except urllib.error.HTTPError as e:
+        print(f"SOC Core refused the alert: HTTP {e.code}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as e:
+        print(f"SOC Core unreachable: {e.reason}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

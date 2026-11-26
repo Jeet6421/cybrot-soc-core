@@ -37,9 +37,9 @@ This version follows the internal test plan in the prototype plan document: the 
 | `LAB_ENDPOINTS` | `1` | `0` disables `/api/demo`, `/api/autolabel`, `/api/reset` (they return 404) |
 | `ANALYSTS` | `analyst1,analyst2,analyst3` | Owner names for alerts, assigned round-robin per hospital, and the names handoffs can use |
 | `FP_TARGET` | not set | The false-positive ceiling the team agrees, as a fraction (e.g. `0.10`). Until set, the Review gate is `not_measured`. |
-| `PLAYBOOK_WEBHOOK` | empty (off) | v0.7: each new alert is POSTed as JSON to this URL, e.g. a Shuffle webhook. Sent after the database commit; a failed send is logged and never blocks ingest. |
-| `PLAYBOOK_TIMEOUT` | `3` | Seconds to wait for the playbook webhook |
-| `PLAYBOOK_SECRET` | empty (unsigned) | v0.8: if set, each playbook request carries `X-Cybrot-Signature` (HMAC-SHA256). Set it whenever `PLAYBOOK_WEBHOOK` is set. |
+| `WORKER_POLL_SECONDS` | `5` | Seconds the response worker waits when the queue is empty (`worker.py`) |
+| `WORKER_LEASE_SECONDS` | `120` | How long a worker holds a job. If it crashes, the job is retried after this lease expires |
+| `WORKER_BATCH` | `10` | Jobs a worker claims per pass |
 | `PORT` | `5000` | HTTP port when running `python app.py` |
 
 `SOC_API_TOKEN` (the shared operator token) was removed in v1.2. Nothing reads it any more.
@@ -84,6 +84,7 @@ trend (test plan step 4) can be tracked.
 
 ## Layout
 - `docs/RUNBOOKS.md`  Operating procedures: 100-bed onboarding, intra-tenant handoffs, vendor break-glass, hospital offboarding
+- `worker.py`   durable response-job worker (claims `response_jobs`, leases, backoff, dead-letter); compose service `worker`
 - `app.py`      Flask API + PostgreSQL (psycopg 3, runtime role `soc_app`): identity, roles, `/api/events`, `/api/ingest/wazuh`, `/api/alerts`, `/api/alerts/<id>/handoff`, `/api/metrics`, `/api/exit-criteria`
 - `auth.py`    scrypt password hashing and token hashing (standard library)
 - `db/schema.sql` tables, row-level security policies, the SECURITY DEFINER lookups and grants (idempotent)
@@ -267,25 +268,23 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 - SQLite data is not migrated. The prototype data is test data, so start with an empty database.
 - Tests create and drop their own PostgreSQL databases. They also check that an old `alerts` table gets the new columns.
 
-**v0.8**
-- Playbook webhook is signed when `PLAYBOOK_SECRET` is set: `X-Cybrot-Signature` (HMAC-SHA256 over `<timestamp>.<raw body>`),
-  `X-Cybrot-Timestamp`, and `X-Cybrot-Event-Id` (`alert-<id>`, the same on retries so the receiver can de-duplicate).
-- Retries: up to 3 attempts for server and network errors (1 s, 2 s backoff). 4xx replies are not retried.
-- `docs/SHUFFLE.md`: how to connect Shuffle, verify the signature, test it, and troubleshoot.
-- Tests: 4 more in `tests/test_playbook.py` (signature, no signature without a secret, retry, no retry on 4xx). 46 tests in total.
-
 **v0.7.1**
 - The dashboard shows each alert's latest handoff under the summary ("Handoff: analyst2 -> analyst1: note").
   Before this, a handoff note was saved in the history only, and the row showed only the closing note.
 - `GET /api/alerts` adds a `last_handoff` field (null when the alert was never handed off).
 
-**v0.7**
-- Playbook hook (roadmap phase 3, Response): with `PLAYBOOK_WEBHOOK` set, each new alert is POSTed as JSON
-  (`{"event": "alert.created", "alert": {...}}`) to that URL, so Shuffle or another SOAR tool can run a playbook.
-- Sends happen after the database commit, on a background thread, with a timeout. A duplicate alert is sent once.
-  Failures are logged without the URL and never fail ingest. The API token is never sent.
-- New settings `PLAYBOOK_WEBHOOK` and `PLAYBOOK_TIMEOUT`, passed through docker-compose.yml.
-- Tests: `tests/test_playbook.py` (6 tests), including a real HTTP round trip to a local receiver.
+**PR 10: durable response queue (`response_jobs`); the outbound webhook is removed**
+- Approving a response now queues one job in `response_jobs` (same transaction). A repeat with the same
+  `(tenant_id, idempotency_key)` returns the existing job. The response reads `execution: "queued"` and a `job_id`.
+- `worker.py` (compose service `worker`) claims due jobs with `FOR UPDATE SKIP LOCKED` through `claim_response_jobs`,
+  and records outcomes through `finish_response_job`, which refuses a worker whose lease was taken over.
+- A job whose worker crashes is reclaimed when its lease expires. Failures retry with exponential backoff and jitter,
+  and a job that runs out of attempts is dead-lettered (`status = dead`) with its errors kept.
+- Jobs wait, without using an attempt, when no executor exists for their action. PR 11 adds the executors.
+- Removed: the alert webhook, its daemon threads, its three environment settings,
+  its signing, and its documentation. Alerts, owners, status and handoffs are still changed only in SOC Core.
+- Tests: `tests/test_response_jobs.py` covers restart survival, lease reclaim, the fenced finish, backoff and
+  dead-letter, duplicate keys, tenant isolation, and a repository scan that fails if the removed integration or its settings reappear.
 
 **v0.6**
 - Simple case queue: `POST /api/alerts/<id>/handoff` passes an open alert to another analyst, and
@@ -331,6 +330,6 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 - MFA, login rate limits and account lockout (Phase 2 of `docs/MULTITENANT.md`)
 - Fluent Bit log shipping and Kafka buffer
 - Live Wazuh connection on the VM (agents, Kali attacker VM)
-- Shuffle playbooks (v0.7 sends alerts to a webhook; Shuffle itself is not set up yet)
+- Ansible execution of approved responses and per-tenant inventories (PR 11 runs the queued jobs)
 - MISP and Sigma rule conversion
 - Hospital-facing portal, PDF reports, plan-based feature gating

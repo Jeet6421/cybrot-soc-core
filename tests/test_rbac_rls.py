@@ -39,7 +39,8 @@ def as_identity(conn, tenant, role, actor=None):
                  "set_config('app.actor_id', %s, true)",
                  (tenant_value, role_value, actor_value, tenant_value, role_value, actor_value))
 def count(conn, table, tenant):
-    return conn.execute(f"SELECT count(*) FROM {table} WHERE tenant = %s", (tenant,)).fetchone()[0]
+    return conn.execute(f"SELECT count(*) FROM {table} WHERE {TENANT_COLUMN.get(table, 'tenant')} = %s",
+                        (tenant,)).fetchone()[0]
 
 
 def actor_id(world, tenant, username):
@@ -70,7 +71,9 @@ def test_runtime_role_cannot_bypass_rls_or_administer(runtime):
     assert row == (False, False, False, False, False, False)
 
 
-TENANT_TABLES = ("users", "ingest_keys", "log_sources", "events", "alerts", "handoffs", "response_approvals")
+TENANT_TABLES = ("users", "ingest_keys", "log_sources", "events", "alerts", "handoffs", "response_approvals",
+                 "response_jobs")
+TENANT_COLUMN = {"response_jobs": "tenant_id"}  # the queue table names its tenant column tenant_id
 
 
 def test_every_tenant_table_has_rls_enabled_and_forced(runtime):
@@ -106,6 +109,9 @@ def test_spoofed_tenant_inserts_are_rejected(runtime, world, data):
         ("INSERT INTO response_approvals(tenant, alert_id, action, target, reason, requested_by) "
          "VALUES (%s, %s, 'isolate_host', 'ehr-01', 'spoofed tenant test', %s)",
          (ORTHO, ortho_alert, ortho_actor)),
+        ("INSERT INTO response_jobs(tenant_id, alert_id, action_type, target_host, idempotency_key, requested_by, "
+         "approved_by, approved_at) VALUES (%s, %s, 'isolate_host', 'ehr-01', 'rls-spoof', %s, %s, now())",
+         (ORTHO, ortho_alert, ortho_actor, ortho_actor)),
     )
     for sql, params in statements:
         with pytest.raises(errors.InsufficientPrivilege):
@@ -121,16 +127,27 @@ def test_spoofed_tenant_inserts_are_rejected(runtime, world, data):
 @pytest.mark.parametrize("table", TENANT_TABLES)
 def test_hospital_cannot_select_update_or_delete_another_tenant(runtime, world, data, table):
     as_identity(runtime, CITY, "hospital_admin", actor_id(world, CITY, "admin"))
-    assert runtime.execute(f"SELECT count(*) FROM {table} WHERE tenant = %s", (ORTHO,)).fetchone()[0] == 0
+    column = TENANT_COLUMN.get(table, "tenant")
+    assert runtime.execute(f"SELECT count(*) FROM {table} WHERE {column} = %s", (ORTHO,)).fetchone()[0] == 0
+    if table == "response_jobs":
+        # The runtime role cannot change or delete queue rows at all: only the worker's functions do.
+        with pytest.raises(errors.InsufficientPrivilege):
+            runtime.execute(f"UPDATE {table} SET {column} = {column} WHERE {column} = %s", (ORTHO,))
+        runtime.rollback()  # a refused statement aborts the transaction; the identity is transaction-local
+        as_identity(runtime, CITY, "hospital_admin", actor_id(world, CITY, "admin"))
+        with pytest.raises(errors.InsufficientPrivilege):
+            runtime.execute(f"DELETE FROM {table} WHERE {column} = %s", (ORTHO,))
+        runtime.rollback()
+        return
     update_column = "status" if table == "response_approvals" else "tenant"
     assert runtime.execute(
-        f"UPDATE {table} SET {update_column} = {update_column} WHERE tenant = %s", (ORTHO,)).rowcount == 0
+        f"UPDATE {table} SET {update_column} = {update_column} WHERE {column} = %s", (ORTHO,)).rowcount == 0
     if table == "response_approvals":
         # soc_app deliberately has no DELETE grant for approval records.
         with pytest.raises(errors.InsufficientPrivilege):
-            runtime.execute(f"DELETE FROM {table} WHERE tenant = %s", (ORTHO,))
+            runtime.execute(f"DELETE FROM {table} WHERE {column} = %s", (ORTHO,))
     else:
-        assert runtime.execute(f"DELETE FROM {table} WHERE tenant = %s", (ORTHO,)).rowcount == 0
+        assert runtime.execute(f"DELETE FROM {table} WHERE {column} = %s", (ORTHO,)).rowcount == 0
 
 
 def test_tenant_leading_indexes_exist(runtime):

@@ -9,7 +9,7 @@ The tenant always comes from the caller's identity. A tenant_id in the query can
 anything else is refused with 403 before a query runs. PostgreSQL row-level security enforces the same rule
 underneath: every transaction carries the identity in transaction-local settings (see db/schema.sql).
 """
-import hashlib, ipaddress, json, os, re, secrets, sys, threading, time, urllib.error, urllib.request, uuid
+import hashlib, ipaddress, json, os, re, secrets, sys, uuid
 from datetime import datetime, timedelta, timezone
 
 import psycopg
@@ -24,8 +24,6 @@ ANALYSTS = os.environ.get("ANALYSTS", "analyst1,analyst2,analyst3").split(",")
 LAB_ENDPOINTS = os.environ.get("LAB_ENDPOINTS", "1") == "1"
 LAB_PATHS = {"/api/demo", "/api/autolabel", "/api/reset"}
 SESSION_HOURS = float(os.environ.get("SOC_SESSION_HOURS", "8"))
-# Playbook hook (v0.7): every new alert is POSTed as JSON to this URL, e.g. a Shuffle webhook. Empty = off.
-PLAYBOOK_TIMEOUT = float(os.environ.get("PLAYBOOK_TIMEOUT", "3"))
 PUBLIC_ROUTES = {("POST", "/api/login")}
 HOSPITAL_READ = ("hospital_admin", "l1", "l2", "viewer")
 ROUTE_ROLES = {
@@ -341,11 +339,6 @@ def raise_alert(c, tenant, rule, sev, summary, key, event_ts, attack_id=None, so
     return cur.fetchone()["id"]
 
 
-def _playbook_url():
-    """Read at call time so the setting can change without reloading the module."""
-    return os.environ.get("PLAYBOOK_WEBHOOK", "").strip()
-
-
 def _redact_text(value):
     """Mask credentials accidentally embedded in free text before telemetry leaves the service."""
     if not isinstance(value, str):
@@ -367,65 +360,6 @@ def _safe_alert(row):
         if key in result:
             result[key] = _redact_text(result[key])
     return result
-
-
-def _alert_payload(row):
-    keys = ("id", "created", "tenant", "rule", "rule_version", "severity", "summary", "owner", "step", "source")
-    return {"event": "alert.created", "alert": {k: _redact_text(row[k]) if k in ("summary", "step") else row[k]
-                                                    for k in keys}}
-
-
-def _playbook_secret():
-    return os.environ.get("PLAYBOOK_SECRET", "")
-
-
-def sign(secret, timestamp, body):
-    """HMAC-SHA256 over '<timestamp>.<raw body>'. The receiver recomputes it and compares (see docs/SHUFFLE.md)."""
-    import hashlib, hmac
-    mac = hmac.new(secret.encode(), f"{timestamp}.".encode() + body, hashlib.sha256)
-    return "sha256=" + mac.hexdigest()
-
-
-def _send(url, payload, timeout=None, attempts=3, delay=1.0):
-    """POST one alert to the playbook webhook. Returns True on a 2xx reply. Never raises; the URL is not logged.
-    Signed with PLAYBOOK_SECRET when set. Server errors and network errors are retried with backoff;
-    4xx replies are not, because retrying a rejected request does not help."""
-    body = json.dumps(payload).encode()
-    secret = _playbook_secret()
-    event_id = f"alert-{payload.get('alert', {}).get('id', 'unknown')}"  # same on every retry: lets the receiver de-duplicate
-    for n in range(attempts):
-        ts = str(int(time.time()))
-        headers = {"Content-Type": "application/json", "X-Cybrot-Event-Id": event_id, "X-Cybrot-Timestamp": ts}
-        if secret:
-            headers["X-Cybrot-Signature"] = sign(secret, ts, body)
-        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout or PLAYBOOK_TIMEOUT) as r:
-                if 200 <= r.status < 300:
-                    return True
-        except urllib.error.HTTPError as e:
-            print(f"playbook webhook failed: HTTP {e.code}", file=sys.stderr, flush=True)
-            if 400 <= e.code < 500:
-                return False
-        except Exception as e:  # delivery problems must never break ingest
-            print(f"playbook webhook failed: {type(e).__name__}", file=sys.stderr, flush=True)
-        if n < attempts - 1:
-            time.sleep(delay * (2 ** n))
-    return False
-
-
-def _dispatch(url, payload):
-    threading.Thread(target=_send, args=(url, payload), daemon=True).start()
-
-
-def _notify_new(c, ids):
-    """Called after commit, so a rolled-back alert is never sent."""
-    url = _playbook_url()
-    if not url or not ids:
-        return
-    marks = ",".join(["%s"] * len(ids))
-    for row in c.execute(f"SELECT * FROM alerts WHERE id IN ({marks}) ORDER BY id", ids).fetchall():
-        _dispatch(url, _alert_payload(row))
 
 
 # ---- Identity ---------------------------------------------------------------------------------
@@ -799,7 +733,6 @@ def ingest():
             c, action="alert.create", resource_type="alert", resource_id=alert_id,
             resource_classification="telemetry", metadata={"status": "new"})
     commit()
-    _notify_new(db(), made_ids)
     return jsonify(events=len(evs), alerts_created=len(made_ids))
 
 
@@ -856,7 +789,6 @@ def ingest_wazuh():
                     key, a.get("timestamp", now())[:19], None, "wazuh",
                     detail=detail, step=detect.wazuh_step(rid, lvl))
     commit()
-    _notify_new(db(), [i] if i else [])
     return jsonify(alert_id=i)
 
 
@@ -1614,6 +1546,11 @@ def decide_response_approval(approval_id):
         "UPDATE response_approvals SET status=%s, approved_by=%s, decided_at=%s, decision_note=%s "
         "WHERE id=%s",
         (decision, g.identity["actor_id"], decided_at, note, approval_id))
+    job_id = None
+    if decision == "approved":
+        job_id = enqueue_response_job(tenant, row["alert_id"], row["action"], row["target"],
+                                      f"approval:{approval_id}", row["requested_by"],
+                                      g.identity["actor_id"], decided_at)
     _record_current_audit(
         db(), action="response_approval.decision", resource_type="response_approval", resource_id=approval_id,
         resource_classification="security_event",
@@ -1621,8 +1558,23 @@ def decide_response_approval(approval_id):
     audit("response_approval.decision", f"approval {approval_id}: {decision}")
     commit()
     return jsonify(id=approval_id, alert_id=row["alert_id"], action=row["action"],
-                   target=_redact_text(row["target"]),
-                   status=decision, execution="not_performed")
+                   target=_redact_text(row["target"]), status=decision,
+                   job_id=job_id, execution="queued" if job_id else "not_performed")
+
+
+def enqueue_response_job(tenant, alert_id, action, target, idempotency_key, requested_by, approved_by, approved_at):
+    """Put an approved response on the durable queue (response_jobs), in the caller's transaction.
+    A repeat with the same idempotency key returns the job that already exists; it never creates a second one."""
+    c = db()
+    row = c.execute(
+        "INSERT INTO response_jobs(tenant_id, alert_id, action_type, target_host, idempotency_key, "
+        "requested_by, approved_by, approved_at) VALUES(%s, %s, %s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (tenant_id, idempotency_key) DO NOTHING RETURNING job_id",
+        (tenant, alert_id, action, target, idempotency_key, requested_by, approved_by, approved_at)).fetchone()
+    if row:
+        return row["job_id"]
+    return c.execute("SELECT job_id FROM response_jobs WHERE tenant_id=%s AND idempotency_key=%s",
+                     (tenant, idempotency_key)).fetchone()["job_id"]
 
 
 # ---- Metrics and exit criteria -----------------------------------------------------------------
@@ -1732,7 +1684,6 @@ def demo():
     try:
         made_ids = _store_events(c, evs)
         c.commit()
-        _notify_new(c, made_ids)
     finally:
         c.close()
     return jsonify(events=len(evs), alerts_created=len(made_ids))
@@ -1756,7 +1707,7 @@ def reset():
     _require_vendor()
     c = _lab_connection()
     try:
-        c.execute("TRUNCATE events, alerts, handoffs, response_approvals RESTART IDENTITY")
+        c.execute("TRUNCATE events, alerts, handoffs, response_approvals, response_jobs RESTART IDENTITY")
         c.commit()
     finally:
         c.close()

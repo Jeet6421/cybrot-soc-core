@@ -1,9 +1,11 @@
 <!-- Add inside <ossec_config> in /var/ossec/etc/ossec.conf on the Wazuh manager.
-     Wazuh's built-in "shuffle" integration just POSTs the alert JSON to hook_url, so it can point
-     straight at SOC Core now, and at a Shuffle workflow later (Shuffle then calls SOC Core / TheHive). -->
+     This is a custom integration: Wazuh runs /var/ossec/integrations/custom-soc-core (see wazuh/custom-soc-core)
+     for each alert at level 7 or above, and that script POSTs the alert JSON to SOC Core with the ingest key.
+     Replace SOC_CORE_HOST, the tenant, and the ingest key (create the key in SOC Core: POST /api/credentials). -->
 <integration>
-  <name>shuffle</name>
+  <name>custom-soc-core</name>
   <hook_url>http://SOC_CORE_HOST:5000/api/ingest/wazuh?tenant=city-hospital</hook_url>
+  <api_key>INGEST_KEY_FROM_SOC_CORE</api_key>
   <level>7</level>
   <alert_format>json</alert_format>
 </integration>
