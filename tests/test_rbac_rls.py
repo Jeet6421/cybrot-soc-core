@@ -133,8 +133,11 @@ def test_hospital_cannot_select_update_or_delete_another_tenant(runtime, world, 
         # The runtime role cannot change or delete queue rows at all: only the worker's functions do.
         with pytest.raises(errors.InsufficientPrivilege):
             runtime.execute(f"UPDATE {table} SET {column} = {column} WHERE {column} = %s", (ORTHO,))
+        runtime.rollback()  # a refused statement aborts the transaction; the identity is transaction-local
+        as_identity(runtime, CITY, "hospital_admin", actor_id(world, CITY, "admin"))
         with pytest.raises(errors.InsufficientPrivilege):
             runtime.execute(f"DELETE FROM {table} WHERE {column} = %s", (ORTHO,))
+        runtime.rollback()
         return
     update_column = "status" if table == "response_approvals" else "tenant"
     assert runtime.execute(
