@@ -60,6 +60,7 @@ def test_key_cannot_read_or_change_anything(world):
     c.post("/api/events", json=failed_logins(CITY))
     alert_id = alerts_of(world, CITY)[0]["id"]
     key = world.ingest(CITY)
+    assert c.get("/api/events", headers=key).status_code == 403
     assert c.get("/api/alerts", headers=key).status_code == 403
     assert c.get("/api/metrics", headers=key).status_code == 403
     assert c.get("/api/tenants", headers=key).status_code == 403
@@ -184,3 +185,4 @@ def _log_source_id(world, tenant, name):
     """The owner looks the id up directly; the API tests above do not depend on this helper's result."""
     with psycopg.connect(world.owner_url) as owner:
         return owner.execute("SELECT id FROM log_sources WHERE tenant=%s AND name=%s", (tenant, name)).fetchone()[0]
+
