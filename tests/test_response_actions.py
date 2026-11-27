@@ -217,7 +217,7 @@ def ansible_dirs(tmp_path):
     return creds, work
 
 
-def run_with(job_id, runner, creds, work, rounds=10):
+def run_with(world, job_id, runner, creds, work, rounds=10):
     def dispatch(job):
         if job["job_id"] != job_id:
             return {"skipped": True}  # other jobs in the shared database are not this test's concern
@@ -228,13 +228,13 @@ def run_with(job_id, runner, creds, work, rounds=10):
     for _ in range(rounds):
         with soc.connect() as conn:
             worker.run_once(conn, "worker-ansible", executors=executors, limit=100)
-        if job_row_status(job_id) in ("succeeded", "dead"):
+        if job_row_status(world, job_id) in ("succeeded", "dead"):
             break
 
 
-def job_row_status(job_id):
-    with soc.connect() as conn:
-        return conn.execute("SELECT status FROM response_jobs WHERE job_id=%s", (job_id,)).fetchone()["status"]
+def job_row_status(world, job_id):
+    # Owner connection: the app role cannot see a tenant's jobs without that tenant's session identity.
+    return owner_rows(world, "SELECT status FROM response_jobs WHERE job_id=%s", (job_id,))[0][0]
 
 
 def test_successful_run_records_result_writes_audit_and_removes_files(world, ansible_dirs):
@@ -242,7 +242,7 @@ def test_successful_run_records_result_writes_audit_and_removes_files(world, ans
     target = new_asset(world)
     job_id = approved_job(world, target=target)
     fake = FakeAnsible()
-    run_with(job_id, fake, creds, work, rounds=1)
+    run_with(world, job_id, fake, creds, work, rounds=1)
 
     recorded = [c for c in fake.calls]
     assert len(recorded) == 1, "the playbook must run exactly once for this job"
@@ -274,7 +274,7 @@ def test_successful_run_records_result_writes_audit_and_removes_files(world, ans
 def test_failed_playbook_is_dead_lettered_with_its_error_and_files_are_removed(world, ansible_dirs):
     creds, work = ansible_dirs
     job_id = approved_job(world)
-    run_with(job_id, FakeAnsible(code=2, out=RECAP_FAILED), creds, work, rounds=1)
+    run_with(world, job_id, FakeAnsible(code=2, out=RECAP_FAILED), creds, work, rounds=1)
     status, _, _, _, result, errors, _, _ = job_row(world, job_id)
     assert status == "dead" and result == {}
     assert len(errors) == 1 and "playbook exit 2" in errors[0]["error"]
@@ -286,7 +286,7 @@ def test_failed_playbook_is_dead_lettered_with_its_error_and_files_are_removed(w
 def test_unreachable_host_is_retried_later(world, ansible_dirs):
     creds, work = ansible_dirs
     job_id = approved_job(world)
-    run_with(job_id, FakeAnsible(code=4, out=RECAP_UNREACHABLE), creds, work, rounds=1)
+    run_with(world, job_id, FakeAnsible(code=4, out=RECAP_UNREACHABLE), creds, work, rounds=1)
     status, attempts, _, _, _, errors, _, _ = job_row(world, job_id)
     assert (status, attempts, len(errors)) == ("queued", 1, 1)
     assert list(work.iterdir()) == []
@@ -297,7 +297,7 @@ def test_missing_hospital_credentials_fail_safely(world, tmp_path):
     fake = FakeAnsible()
     empty = tmp_path / "no-creds"
     empty.mkdir()
-    run_with(job_id, fake, empty, tmp_path, rounds=1)
+    run_with(world, job_id, fake, empty, tmp_path, rounds=1)
     assert fake.calls == []                                # nothing ran without a credential
     status, _, _, _, _, errors, _, _ = job_row(world, job_id)
     assert status == "dead" and "no SSH credential" in errors[0]["error"]
@@ -311,7 +311,7 @@ def test_medical_asset_is_refused_at_run_time_even_after_approval(world, ansible
         owner.execute("UPDATE assets SET asset_class='mri', monitoring_mode='agentless_medical' "
                       "WHERE tenant_id=%s AND device_name=%s", (CITY, target))
     fake = FakeAnsible()
-    run_with(job_id, fake, creds, work, rounds=1)
+    run_with(world, job_id, fake, creds, work, rounds=1)
     assert fake.calls == []
     status, _, _, _, _, errors, _, _ = job_row(world, job_id)
     assert status == "dead" and "IEC 80001" in errors[0]["error"]
@@ -324,7 +324,7 @@ def test_a_host_that_is_not_an_asset_at_run_time_is_refused(world, ansible_dirs)
     with psycopg.connect(world.owner_url) as owner:
         owner.execute("DELETE FROM assets WHERE tenant_id=%s AND device_name=%s", (CITY, target))
     fake = FakeAnsible()
-    run_with(job_id, fake, creds, work, rounds=1)
+    run_with(world, job_id, fake, creds, work, rounds=1)
     assert fake.calls == []
     status, _, _, _, _, errors, _, _ = job_row(world, job_id)
     assert status == "dead" and "not an asset" in errors[0]["error"]
