@@ -4,7 +4,7 @@ import uuid
 import psycopg
 
 import app as soc
-from support import Api, CITY, PASSWORD, failed_logins
+from support import Api, CITY, PASSWORD, failed_logins, ensure_asset
 
 
 def _owner_rows(world, sql, params=()):
@@ -143,6 +143,7 @@ def test_triage_handoff_verdict_and_approval_decision_are_audited(world):
                      if a["username"] == "analyst-l2")
     assert l1.post(f"/api/alerts/{alert_id}/ack").status_code == 200
     assert l1.post(f"/api/alerts/{alert_id}/handoff", json={"to_actor_id": new_owner}).status_code == 200
+    ensure_asset(world, CITY, "test-host")
     request = l1.post(f"/api/alerts/{alert_id}/response-approvals", json={
         "action": "isolate_host", "target": "test-host", "reason": "Audit coverage test"})
     assert request.status_code == 201

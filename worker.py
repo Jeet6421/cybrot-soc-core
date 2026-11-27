@@ -34,8 +34,8 @@ class Permanent(Exception):
     """A failure that retrying cannot fix (bad target, action refused). The job is dead-lettered at once."""
 
 
-# action_type -> callable(job_row) -> dict. PR 10 registers none: approved jobs wait (deferred) until an
-# executor exists for their action. PR 11 adds the Ansible-backed executors here.
+# action_type -> callable(job_row) -> dict. main() fills this with the Ansible executors (ansible_runner.py).
+# With no executor for an action, its jobs wait (deferred) and no attempt is used.
 EXECUTORS = {}
 
 
@@ -85,6 +85,9 @@ def run_once(conn, worker_id, executors=None, limit=None, lease=None, rng=None):
 
 
 def main():
+    # Register the Ansible executors. Imported here, after the exception classes exist, to avoid a cycle.
+    import ansible_runner
+    EXECUTORS.update(ansible_runner.executors())
     worker_id = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
     print(f"worker {worker_id} started", flush=True)
     while True:
@@ -100,4 +103,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Run through the importable module, so the exception classes are the same objects ansible_runner imports.
+    import worker
+    worker.main()

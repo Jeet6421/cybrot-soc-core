@@ -1,0 +1,12 @@
+# playbook: contain.disable_account   version: 1.0.0   tier: disruptive
+#
+# Disables one directory account. The account name comes from extra-vars (soc_target), never from a shell string.
+#
+# No directory module ships in this repository. The task fails until the site configures its approved module.
+- name: Disable the approved account
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Refuse until the site directory module is configured
+      ansible.builtin.fail:
+        msg: "No directory module is configured for this site. Configure the approved module, then re-approve."

@@ -1,0 +1,15 @@
+# playbook: contain.isolate_host   version: 1.0.0   tier: disruptive
+#
+# Isolates one host. The SOC worker passes the host with --limit, after SOC Core has checked that it is an asset
+# of the hospital that asked for the action, and that it is not medical equipment.
+#
+# This repository ships no isolation module. The task below fails on purpose until the site replaces it with its
+# approved module (an EDR isolation API call, or a switch port shutdown). A success here would tell an analyst a
+# host was contained when it was not.
+- name: Isolate the verified host
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Refuse until the site isolation module is configured
+      ansible.builtin.fail:
+        msg: "No isolation module is configured for this site. Configure the approved module, then re-approve."

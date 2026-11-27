@@ -592,36 +592,44 @@ BEGIN
   RETURN FOUND;
 END $$;
 
--- ---- PR 10: durable response job queue (outbox) -------------------------------------------------------------
--- An approved response becomes one row here. The worker (worker.py) claims rows with SKIP LOCKED and a lease.
--- Only the worker's functions change a job's state after it is queued. Alerts, owners, status and handoffs are
--- never written by the queue.
+-- ---- PR 10/11: durable response jobs (the outbox) ---------------------------------------------------------
+-- A response is one row from the moment it is requested. A disruptive one waits in 'pending_approval' until a
+-- second person approves it (maker-checker), then becomes 'queued'. Workers claim queued rows (see below).
+-- Alerts, owners, status and handoffs are never written here.
 CREATE TABLE IF NOT EXISTS response_jobs(
   job_id BIGSERIAL PRIMARY KEY,
   tenant_id TEXT NOT NULL REFERENCES tenants(id),
   alert_id BIGINT NOT NULL,
   action_type TEXT NOT NULL CHECK (action_type IN ('isolate_host', 'disable_account', 'block_ip')),
+  risk_tier TEXT NOT NULL DEFAULT 'disruptive' CHECK (risk_tier IN ('read_only', 'disruptive')),
+  playbook_id TEXT NOT NULL DEFAULT '',
+  playbook_version TEXT NOT NULL DEFAULT '',
+  playbook_digest TEXT NOT NULL DEFAULT '',
   target_asset_id BIGINT,
   target_host TEXT NOT NULL CHECK (length(btrim(target_host)) BETWEEN 1 AND 200),
   idempotency_key TEXT NOT NULL CHECK (length(idempotency_key) BETWEEN 1 AND 120),
-  status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'succeeded', 'dead')),
+  status TEXT NOT NULL DEFAULT 'pending_approval'
+    CHECK (status IN ('pending_approval', 'rejected', 'queued', 'running', 'succeeded', 'dead')),
   requested_by BIGINT NOT NULL,
-  approved_by BIGINT NOT NULL,
-  approved_at TIMESTAMPTZ NOT NULL,
+  approved_by BIGINT,
+  approved_at TIMESTAMPTZ,
   attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
   max_attempts INTEGER NOT NULL DEFAULT 5 CHECK (max_attempts BETWEEN 1 AND 20),
   next_run_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   locked_by TEXT,
   lease_expires_at TIMESTAMPTZ,
-  result JSONB NOT NULL DEFAULT '{}'::jsonb,
-  errors JSONB NOT NULL DEFAULT '[]'::jsonb,
+  result JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(result) = 'object'),
+  errors JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(errors) = 'array'),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (tenant_id, idempotency_key),
   FOREIGN KEY (alert_id, tenant_id) REFERENCES alerts(id, tenant),
   FOREIGN KEY (requested_by, tenant_id) REFERENCES users(id, tenant),
   FOREIGN KEY (approved_by, tenant_id) REFERENCES users(id, tenant),
-  CHECK ((status = 'running') = (locked_by IS NOT NULL AND lease_expires_at IS NOT NULL))
+  CHECK ((status = 'running') = (locked_by IS NOT NULL AND lease_expires_at IS NOT NULL)),
+  CHECK (approved_by IS NULL OR approved_by <> requested_by),
+  CHECK (status <> 'pending_approval' OR approved_by IS NULL),
+  CHECK (status NOT IN ('queued', 'running', 'succeeded', 'dead') OR risk_tier = 'read_only' OR approved_by IS NOT NULL)
 );
 CREATE INDEX IF NOT EXISTS response_jobs_due_idx ON response_jobs(next_run_at)
   WHERE status IN ('queued', 'running');
@@ -631,12 +639,24 @@ ALTER TABLE response_jobs FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS response_jobs_read ON response_jobs;
 CREATE POLICY response_jobs_read ON response_jobs FOR SELECT
   USING (tenant_id = app_tenant() AND app_role() IN ('hospital_admin', 'l1', 'l2', 'viewer'));
-DROP POLICY IF EXISTS response_jobs_enqueue ON response_jobs;
-CREATE POLICY response_jobs_enqueue ON response_jobs FOR INSERT
+-- Requesting: any analyst role, in their own hospital, as themselves. A disruptive job starts pending.
+DROP POLICY IF EXISTS response_jobs_request ON response_jobs;
+CREATE POLICY response_jobs_request ON response_jobs FOR INSERT
+  WITH CHECK (tenant_id = app_tenant() AND app_role() IN ('hospital_admin', 'l1', 'l2')
+    AND attempts = 0 AND requested_by = app_actor_id() AND approved_by IS NULL AND approved_at IS NULL
+    AND (status = 'pending_approval' OR (status = 'queued' AND risk_tier = 'read_only')));
+-- Deciding: a hospital admin or an L2 analyst, never the requester (maker-checker). Only two outcomes exist.
+DROP POLICY IF EXISTS response_jobs_decide ON response_jobs;
+CREATE POLICY response_jobs_decide ON response_jobs FOR UPDATE
+  USING (tenant_id = app_tenant() AND app_role() IN ('hospital_admin', 'l2')
+    AND status = 'pending_approval' AND requested_by <> app_actor_id())
   WITH CHECK (tenant_id = app_tenant() AND app_role() IN ('hospital_admin', 'l2')
-    AND status = 'queued' AND attempts = 0 AND approved_by = app_actor_id() AND requested_by <> approved_by);
+    AND ((status = 'queued' AND approved_by = app_actor_id() AND approved_at IS NOT NULL
+          AND requested_by <> approved_by)
+      OR (status = 'rejected' AND approved_by IS NULL)));
 
 GRANT SELECT, INSERT ON response_jobs TO soc_app;
+GRANT UPDATE (status, approved_by, approved_at, updated_at) ON response_jobs TO soc_app;
 GRANT USAGE, SELECT ON SEQUENCE response_jobs_job_id_seq TO soc_app;
 
 -- Row counts of everything a hospital holds. Used by the export hook and returned by the purge.
@@ -743,10 +763,11 @@ GRANT EXECUTE ON FUNCTION tenant_exported(text) TO soc_app;
 
 -- Claim up to p_limit due jobs for one worker. A job is due when it is queued and its time has come, or when it is
 -- running under a lease that has expired (the worker crashed). A crashed job that has used its last attempt is
--- dead-lettered instead of retried forever.
+-- dead-lettered instead of retried forever. Each claim writes its audit row in the same transaction.
 CREATE OR REPLACE FUNCTION claim_response_jobs(p_worker text, p_limit integer, p_lease_seconds integer)
   RETURNS SETOF response_jobs
   LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE j response_jobs%ROWTYPE;
 BEGIN
   IF p_worker IS NULL OR length(p_worker) NOT BETWEEN 1 AND 120 THEN
     RAISE EXCEPTION 'worker id must be 1 to 120 characters' USING ERRCODE = '22023';
@@ -760,22 +781,33 @@ BEGIN
   UPDATE response_jobs SET status = 'dead', locked_by = NULL, lease_expires_at = NULL, updated_at = now(),
     errors = errors || jsonb_build_array(jsonb_build_object('at', now(), 'error', 'lease expired after the last attempt'))
   WHERE status = 'running' AND lease_expires_at < now() AND attempts >= max_attempts;
-  RETURN QUERY
-  UPDATE response_jobs j SET status = 'running', locked_by = p_worker,
-    lease_expires_at = now() + make_interval(secs => p_lease_seconds),
-    attempts = j.attempts + 1, updated_at = now()
-  WHERE j.job_id IN (
-    SELECT c.job_id FROM response_jobs c
-    WHERE (c.status = 'queued' AND c.next_run_at <= now())
-       OR (c.status = 'running' AND c.lease_expires_at < now())
-    ORDER BY c.next_run_at, c.job_id
-    LIMIT p_limit
-    FOR UPDATE SKIP LOCKED)
-  RETURNING j.*;
+  FOR j IN
+    UPDATE response_jobs SET status = 'running', locked_by = p_worker,
+      lease_expires_at = now() + make_interval(secs => p_lease_seconds),
+      attempts = response_jobs.attempts + 1, updated_at = now()
+    WHERE job_id IN (
+      SELECT c.job_id FROM response_jobs c
+      WHERE (c.status = 'queued' AND c.next_run_at <= now())
+         OR (c.status = 'running' AND c.lease_expires_at < now())
+      ORDER BY c.next_run_at, c.job_id
+      LIMIT p_limit
+      FOR UPDATE SKIP LOCKED)
+    RETURNING response_jobs.*
+  LOOP
+    INSERT INTO audit_events(tenant_id, actor_id, actor_role, auth_context, action, resource_type, resource_id,
+      resource_classification, outcome, metadata, request_id)
+    VALUES (j.tenant_id, NULL, 'worker', 'system', 'response_job.start', 'response_job', j.job_id::text,
+      'security_event', 'allow',
+      jsonb_build_object('attempt', j.attempts, 'action_type', j.action_type,
+        'playbook_id', j.playbook_id, 'playbook_version', j.playbook_version),
+      'response-job-' || j.job_id || '-start-' || j.attempts);
+    RETURN NEXT j;
+  END LOOP;
+  RETURN;
 END $$;
 
--- Record one attempt's outcome. Only the worker that holds the job's lease may write it; if the lease was taken over,
--- the call returns 'lost_lease' and changes nothing.
+-- Record one attempt's outcome, with its audit row, in one transaction. Only the worker that holds the job's lease may
+-- write it; if the lease was taken over the call returns 'lost_lease' and changes nothing.
 -- outcome: succeeded | retry (back off, dead-letter when out of attempts) | dead (permanent) | defer (not run here;
 -- the attempt is not counted).
 CREATE OR REPLACE FUNCTION finish_response_job(p_job bigint, p_worker text, p_outcome text, p_result jsonb,
@@ -783,6 +815,7 @@ CREATE OR REPLACE FUNCTION finish_response_job(p_job bigint, p_worker text, p_ou
   RETURNS text LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE r response_jobs%ROWTYPE;
   err jsonb := NULL;
+  final_status text;
 BEGIN
   IF p_outcome NOT IN ('succeeded', 'retry', 'dead', 'defer') THEN
     RAISE EXCEPTION 'unknown outcome' USING ERRCODE = '22023';
@@ -811,10 +844,33 @@ BEGIN
     UPDATE response_jobs SET status = 'dead', locked_by = NULL, lease_expires_at = NULL,
       errors = errors || COALESCE(err, '[]'::jsonb), updated_at = now() WHERE job_id = p_job;
   END IF;
+  SELECT status INTO final_status FROM response_jobs WHERE job_id = p_job;
+  INSERT INTO audit_events(tenant_id, actor_id, actor_role, auth_context, action, resource_type, resource_id,
+    resource_classification, outcome, metadata, request_id)
+  VALUES (r.tenant_id, NULL, 'worker', 'system', 'response_job.finish', 'response_job', p_job::text,
+    'security_event', CASE WHEN p_outcome = 'succeeded' THEN 'allow' ELSE 'error' END,
+    jsonb_build_object('result', p_outcome, 'status', final_status, 'attempt', r.attempts),
+    'response-job-' || p_job || '-finish-' || r.attempts);
   RETURN 'ok';
 END $$;
 
+-- The asset a job targets, resolved inside the job's own hospital. Used by the executor before it runs anything, so
+-- the check cannot be skipped and never sees another hospital's inventory. Returns NULL when nothing matches.
+CREATE OR REPLACE FUNCTION resolve_job_target(p_job bigint) RETURNS jsonb
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  SELECT CASE WHEN count(a.asset_id) = 0 THEN NULL ELSE jsonb_build_object(
+    'asset_id', min(a.asset_id),
+    'device_name', min(a.device_name),
+    'medical', bool_or(a.asset_class IN ('mri', 'ct', 'x_ray', 'ultrasound', 'ventilator', 'patient_monitor', 'infusion_pump')
+      OR a.monitoring_mode = 'agentless_medical')) END
+  FROM response_jobs j
+  LEFT JOIN assets a ON a.tenant_id = j.tenant_id AND (a.device_name = j.target_host OR a.ip_address = j.target_host)
+  WHERE j.job_id = p_job
+$$;
+
 REVOKE ALL ON FUNCTION claim_response_jobs(text, integer, integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION finish_response_job(bigint, text, text, jsonb, text, integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION resolve_job_target(bigint) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION claim_response_jobs(text, integer, integer) TO soc_app;
 GRANT EXECUTE ON FUNCTION finish_response_job(bigint, text, text, jsonb, text, integer) TO soc_app;
+GRANT EXECUTE ON FUNCTION resolve_job_target(bigint) TO soc_app;

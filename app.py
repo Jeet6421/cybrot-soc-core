@@ -10,6 +10,7 @@ anything else is refused with 403 before a query runs. PostgreSQL row-level secu
 underneath: every transaction carries the identity in transaction-local settings (see db/schema.sql).
 """
 import hashlib, ipaddress, json, os, re, secrets, sys, uuid
+import playbooks
 from datetime import datetime, timedelta, timezone
 
 import psycopg
@@ -228,6 +229,7 @@ _AUDIT_VERDICTS = {"tp", "fp", "unclear"}
 _AUDIT_STATUSES = {"new", "ack", "closed", "pending", "disabled"}
 _AUDIT_DECISIONS = {"approved", "rejected"}
 _AUDIT_SCOPES = {"events:read", "alerts:read", "handoffs:read", "metrics:read"}
+_JOB_STATUSES = {"pending_approval", "rejected", "queued", "running", "succeeded", "dead"}
 
 
 def redact_audit_metadata(metadata):
@@ -265,6 +267,14 @@ def redact_audit_metadata(metadata):
     action = metadata.get("response_action")
     if action in RESPONSE_ACTIONS:
         safe["response_action"] = action
+    if metadata.get("job_status") in _JOB_STATUSES:
+        safe["job_status"] = metadata["job_status"]
+    if metadata.get("risk_tier") in ("read_only", "disruptive"):
+        safe["risk_tier"] = metadata["risk_tier"]
+    for key in ("playbook_id", "playbook_version"):
+        value = metadata.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[a-z0-9_.-]{1,40}", value):
+            safe[key] = value
     for key in ("record_count", "alerts_created", "credential_id",
                 "previous_credential_id", "new_credential_id", "log_source_id", "overlap_minutes",
                 "users_disabled", "keys_revoked", "source_count", "changed_fields", "to_actor_id", "from_actor_id"):
@@ -1483,24 +1493,51 @@ def list_response_approvals(i):
                      for key, value in row.items()} for row in rows])
 
 
+MEDICAL_REFUSAL = "disruptive containment is blocked on medical equipment (IEC 80001)"
+
+
+def _asset_for_target(tenant, action, target):
+    """The hospital's asset that a host or IP target names, or None. Accounts name no asset."""
+    if action not in ("isolate_host", "block_ip"):
+        return None
+    return db().execute(
+        "SELECT asset_id, device_name, asset_class, monitoring_mode FROM assets "
+        "WHERE tenant_id=%s AND (device_name=%s OR ip_address=%s) ORDER BY asset_id LIMIT 1",
+        (tenant, target, target)).fetchone()
+
+
+def _is_medical(asset):
+    return asset["asset_class"] in MEDICAL_CLASSES or asset["monitoring_mode"] == "agentless_medical"
+
+
 @app.post("/api/alerts/<int:i>/response-approvals")
 def request_response_approval(i):
+    """Ask for a response. The server picks the playbook from its allowlist; a disruptive one is queued only after a
+    second person approves it (maker-checker)."""
     tenant = hospital_scope("hospital_admin", "l1", "l2")
     body = _body(required=True)
+    if set(body) - {"action", "target", "reason"}:
+        raise Refuse(400, "only action, target and reason are accepted; the server chooses the playbook")
     action = body.get("action")
-    target_raw = body.get("target")
-    reason_raw = body.get("reason")
-    target = target_raw.strip() if isinstance(target_raw, str) else ""
-    reason = reason_raw.strip() if isinstance(reason_raw, str) else ""
     if action not in RESPONSE_ACTIONS:
         raise Refuse(400, f"action must be one of: {', '.join(sorted(RESPONSE_ACTIONS))}")
-    if not target or len(target) > 200:
-        raise Refuse(400, "target must be 1 to 200 characters")
+    try:
+        target = playbooks.validate_target(action, body.get("target"))
+    except playbooks.TargetRefused as e:
+        raise Refuse(400, str(e))
+    reason_raw = body.get("reason")
+    reason = reason_raw.strip() if isinstance(reason_raw, str) else ""
     if not reason or len(reason) > 500:
         raise Refuse(400, "reason must be 1 to 500 characters")
     alert = _alert_or_404(i)
     if alert["status"] == "closed":
         raise Refuse(409, "cannot request a response for a closed alert")
+    pb = playbooks.playbook_for(action)
+    asset = _asset_for_target(tenant, action, target)
+    if asset is None and action == "isolate_host":
+        raise Refuse(400, "target is not an asset of this hospital")
+    if asset is not None and pb.tier == "disruptive" and _is_medical(asset):
+        raise Refuse(409, MEDICAL_REFUSAL)
     pending = db().execute(
         "SELECT id FROM response_approvals WHERE alert_id=%s AND action=%s AND target=%s AND status='pending'",
         (i, action, target)).fetchone()
@@ -1514,18 +1551,33 @@ def request_response_approval(i):
         (tenant, i, action, target, reason, g.identity["actor_id"])).fetchone()
     if not row:
         raise Refuse(409, "a matching response approval is already pending")
+    job_status = "pending_approval" if pb.tier == "disruptive" else "queued"
+    job = db().execute(
+        "INSERT INTO response_jobs(tenant_id, alert_id, action_type, risk_tier, playbook_id, playbook_version, "
+        "playbook_digest, target_asset_id, target_host, idempotency_key, status, requested_by) "
+        "VALUES(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING job_id",
+        (tenant, i, action, pb.tier, pb.playbook_id, pb.version, pb.sha256,
+         asset["asset_id"] if asset else None, target, f"approval:{row['id']}", job_status,
+         g.identity["actor_id"])).fetchone()
     _record_current_audit(
         db(), action="response_approval.request", resource_type="response_approval", resource_id=row["id"],
         resource_classification="security_event",
         metadata={"response_action": action, "status": row["status"]})
+    _record_current_audit(
+        db(), action="response_job.request", resource_type="response_job", resource_id=job["job_id"],
+        resource_classification="security_event",
+        metadata={"response_action": action, "playbook_id": pb.playbook_id, "playbook_version": pb.version,
+                  "risk_tier": pb.tier, "job_status": job_status})
     audit("response_approval.request", f"approval {row['id']}: {action} for alert {i}")
     commit()
-    return jsonify(id=row["id"], alert_id=i, action=action, target=_redact_text(target), status=row["status"],
-                   execution="not_performed"), 201
+    return jsonify(id=row["id"], job_id=job["job_id"], alert_id=i, action=action, target=_redact_text(target),
+                   status=row["status"], job_status=job_status, playbook_id=pb.playbook_id,
+                   playbook_version=pb.version, execution="not_performed"), 201
 
 
 @app.post("/api/response-approvals/<int:approval_id>/decision")
 def decide_response_approval(approval_id):
+    """A second person decides. Approval queues the job; rejection closes it. The requester can never decide."""
     tenant = hospital_scope("hospital_admin", "l2")
     body = _body(required=True)
     decision = body.get("decision")
@@ -1539,42 +1591,50 @@ def decide_response_approval(approval_id):
         raise Refuse(404, "response approval not found")
     if row["status"] != "pending":
         raise Refuse(409, "response approval has already been decided")
-    if row["requested_by"] == g.identity["actor_id"]:
+    actor = g.identity["actor_id"]
+    if row["requested_by"] == actor:
         raise Refuse(409, "the requester cannot approve their own response")
+    job = db().execute(
+        "SELECT job_id, status FROM response_jobs WHERE tenant_id=%s AND idempotency_key=%s",
+        (tenant, f"approval:{approval_id}")).fetchone()
+    if job is None or job["status"] != "pending_approval":
+        raise Refuse(409, "response job is not awaiting approval")
+    if decision == "approved":
+        asset = _asset_for_target(tenant, row["action"], row["target"])
+        if asset is not None and _is_medical(asset):
+            raise Refuse(409, MEDICAL_REFUSAL)
     decided_at = datetime.now(timezone.utc)
     db().execute(
         "UPDATE response_approvals SET status=%s, approved_by=%s, decided_at=%s, decision_note=%s "
         "WHERE id=%s",
-        (decision, g.identity["actor_id"], decided_at, note, approval_id))
-    job_id = None
+        (decision, actor, decided_at, note, approval_id))
     if decision == "approved":
-        job_id = enqueue_response_job(tenant, row["alert_id"], row["action"], row["target"],
-                                      f"approval:{approval_id}", row["requested_by"],
-                                      g.identity["actor_id"], decided_at)
+        moved = db().execute(
+            "UPDATE response_jobs SET status='queued', approved_by=%s, approved_at=%s, updated_at=now() "
+            "WHERE job_id=%s RETURNING job_id", (actor, decided_at, job["job_id"])).fetchone()
+        job_status = "queued"
+        audit_action = "response_job.queue"
+    else:
+        moved = db().execute(
+            "UPDATE response_jobs SET status='rejected', updated_at=now() WHERE job_id=%s RETURNING job_id",
+            (job["job_id"],)).fetchone()
+        job_status = "rejected"
+        audit_action = "response_job.reject"
+    if not moved:
+        raise Refuse(409, "response job could not be decided")
     _record_current_audit(
         db(), action="response_approval.decision", resource_type="response_approval", resource_id=approval_id,
         resource_classification="security_event",
         metadata={"response_action": row["action"], "decision": decision})
+    _record_current_audit(
+        db(), action=audit_action, resource_type="response_job", resource_id=job["job_id"],
+        resource_classification="security_event",
+        metadata={"response_action": row["action"], "job_status": job_status})
     audit("response_approval.decision", f"approval {approval_id}: {decision}")
     commit()
     return jsonify(id=approval_id, alert_id=row["alert_id"], action=row["action"],
-                   target=_redact_text(row["target"]), status=decision,
-                   job_id=job_id, execution="queued" if job_id else "not_performed")
-
-
-def enqueue_response_job(tenant, alert_id, action, target, idempotency_key, requested_by, approved_by, approved_at):
-    """Put an approved response on the durable queue (response_jobs), in the caller's transaction.
-    A repeat with the same idempotency key returns the job that already exists; it never creates a second one."""
-    c = db()
-    row = c.execute(
-        "INSERT INTO response_jobs(tenant_id, alert_id, action_type, target_host, idempotency_key, "
-        "requested_by, approved_by, approved_at) VALUES(%s, %s, %s, %s, %s, %s, %s, %s) "
-        "ON CONFLICT (tenant_id, idempotency_key) DO NOTHING RETURNING job_id",
-        (tenant, alert_id, action, target, idempotency_key, requested_by, approved_by, approved_at)).fetchone()
-    if row:
-        return row["job_id"]
-    return c.execute("SELECT job_id FROM response_jobs WHERE tenant_id=%s AND idempotency_key=%s",
-                     (tenant, idempotency_key)).fetchone()["job_id"]
+                   target=_redact_text(row["target"]), status=decision, job_id=job["job_id"],
+                   job_status=job_status, execution="queued" if decision == "approved" else "not_performed")
 
 
 # ---- Metrics and exit criteria -----------------------------------------------------------------
