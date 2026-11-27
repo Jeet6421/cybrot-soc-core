@@ -85,7 +85,7 @@ def test_ack_and_verdict_require_sessions_and_record_the_authenticated_actors(wo
         "FROM alerts WHERE id=%s AND tenant=%s",
         (alert_id, CITY))[0]
     assert alert[0] == l1_actor and alert[1] is not None
-    assert alert[2] == l2_actor and alert[3] is not None and alert[4] == "tp"
+    assert alert[2] == l2_actor and alert[3] is not None and alert[4] == "true_positive_malicious"
 
     events = _owner_rows(
         world,

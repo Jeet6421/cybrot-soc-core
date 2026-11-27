@@ -250,7 +250,7 @@ def audit(action, detail=""):
                  (ctx["tenant"], ctx["actor_id"], action, detail[:300]))
 
 
-_AUDIT_VERDICTS = {"tp", "fp", "unclear"}
+_AUDIT_VERDICTS = set(VERDICTS)
 _AUDIT_STATUSES = {"new", "ack", "closed", "pending", "disabled"}
 _AUDIT_DECISIONS = {"approved", "rejected"}
 _AUDIT_SCOPES = {"events:read", "alerts:read", "handoffs:read", "metrics:read"}
