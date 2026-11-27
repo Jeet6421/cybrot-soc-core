@@ -60,7 +60,7 @@ def test_ack_and_verdict_require_sessions_and_record_the_authenticated_actors(wo
     unauthenticated = world.client
     assert unauthenticated.post(f"/api/alerts/{alert_id}/ack").status_code == 401
     assert unauthenticated.post(
-        f"/api/alerts/{alert_id}/verdict", json={"verdict": "tp"}).status_code == 401
+        f"/api/alerts/{alert_id}/verdict", json={"verdict": "true_positive_malicious"}).status_code == 401
     # The ingest/alert flow and denied unauthenticated attempts are audited, but
     # neither rejected request may create a triage mutation audit record.
     assert _owner_rows(
@@ -73,7 +73,7 @@ def test_ack_and_verdict_require_sessions_and_record_the_authenticated_actors(wo
     l2 = Api(world, CITY, "l2")
     assert l1.post(f"/api/alerts/{alert_id}/ack").status_code == 200
     assert l2.post(
-        f"/api/alerts/{alert_id}/verdict", json={"verdict": "tp", "note": "reviewed"}).status_code == 200
+        f"/api/alerts/{alert_id}/verdict", json={"verdict": "true_positive_malicious", "note": "reviewed"}).status_code == 200
 
     l1_actor = _owner_rows(
         world, "SELECT id FROM users WHERE tenant=%s AND username='analyst-l1'", (CITY,))[0][0]
@@ -103,7 +103,7 @@ def test_ack_and_verdict_require_sessions_and_record_the_authenticated_actors(wo
     assert ack[5:10] == ("alert", str(alert_id), "telemetry", "allow",
                         {"status": "ack", "previous_status": "new"})
     assert verdict[5:10] == ("alert", str(alert_id), "telemetry", "allow",
-                             {"previous_verdict": None, "new_verdict": "tp"})
+                             {"previous_verdict": None, "new_verdict": "true_positive_malicious"})
     assert ack[10] and verdict[10] and ack[10] != verdict[10]
     assert ack[11] is not None and verdict[11] is not None
     assert all("reviewed" not in str(row[9]) for row in events)
@@ -111,7 +111,7 @@ def test_ack_and_verdict_require_sessions_and_record_the_authenticated_actors(wo
 
 def test_audit_metadata_strictly_drops_unapproved_secrets_and_phi():
     assert soc.redact_audit_metadata({
-        "verdict": "fp",
+        "verdict": "false_positive",
         "status": "closed",
         "password": "secret",
         "authorization": "Bearer token",
@@ -119,4 +119,4 @@ def test_audit_metadata_strictly_drops_unapproved_secrets_and_phi():
         "mrn": "12345",
         "note": "clinical notes",
         "custom": "arbitrary free text",
-    }) == {"status": "closed", "verdict": "fp"}
+    }) == {"status": "closed", "verdict": "false_positive"}

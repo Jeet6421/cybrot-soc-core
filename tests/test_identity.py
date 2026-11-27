@@ -257,7 +257,7 @@ def test_viewer_reads_but_cannot_change(world):
     viewer = Api(world, CITY, "viewer")
     assert viewer.get("/api/alerts").status_code == 200
     assert viewer.post(f"/api/alerts/{alert_id}/ack").status_code == 403
-    assert viewer.post(f"/api/alerts/{alert_id}/verdict", json={"verdict": "tp"}).status_code == 403
+    assert viewer.post(f"/api/alerts/{alert_id}/verdict", json={"verdict": "true_positive_malicious"}).status_code == 403
     assert viewer.post(f"/api/alerts/{alert_id}/handoff", json={"to_actor_id": 1}).status_code == 403
     assert viewer.post("/api/log-sources", json={"name": "x"}).status_code == 403
     assert viewer.post("/api/credentials", json={"log_source_id": 1}).status_code == 403
@@ -271,7 +271,7 @@ def test_l1_triages_and_hands_off_but_does_not_close_or_administer(world):
     analysts = Api(world, CITY, "viewer").get("/api/analysts").get_json()["analysts"]
     target = next(a["user_id"] for a in analysts if a["username"] == "analyst-l2")
     assert l1.post(f"/api/alerts/{alert_id}/handoff", json={"to_actor_id": target, "note": "check it"}).status_code == 200
-    assert l1.post(f"/api/alerts/{alert_id}/verdict", json={"verdict": "tp"}).status_code == 403
+    assert l1.post(f"/api/alerts/{alert_id}/verdict", json={"verdict": "true_positive_malicious"}).status_code == 403
     assert l1.post("/api/log-sources", json={"name": "x"}).status_code == 403
     assert l1.post("/api/credentials", json={"log_source_id": 1}).status_code == 403
     assert l1.get("/api/users").status_code == 403
@@ -279,10 +279,10 @@ def test_l1_triages_and_hands_off_but_does_not_close_or_administer(world):
 
 def test_l2_closes_alerts_with_a_verdict(world):
     alert_id = new_alert(world, CITY)
-    r = Api(world, CITY, "l2").post(f"/api/alerts/{alert_id}/verdict", json={"verdict": "tp", "note": "confirmed"})
+    r = Api(world, CITY, "l2").post(f"/api/alerts/{alert_id}/verdict", json={"verdict": "true_positive_malicious", "note": "confirmed"})
     assert r.status_code == 200
     row = next(a for a in Api(world, CITY, "viewer").get("/api/alerts").get_json() if a["id"] == alert_id)
-    assert row["status"] == "closed" and row["verdict"] == "tp"
+    assert row["status"] == "closed" and row["verdict"] == "true_positive_malicious"
 
 
 def test_l2_approval_is_required_for_allowlisted_response_actions(world):
@@ -391,7 +391,7 @@ def test_admin_cannot_reach_another_hospitals_records(world):
     before_source = owner_rows(world, "SELECT disabled_at FROM log_sources WHERE id=%s", (ortho_source,))[0][0]
 
     assert city.post(f"/api/alerts/{alert_id}/ack").status_code == 404
-    assert city.post(f"/api/alerts/{alert_id}/verdict", json={"verdict": "tp"}).status_code == 404
+    assert city.post(f"/api/alerts/{alert_id}/verdict", json={"verdict": "true_positive_malicious"}).status_code == 404
     assert city.post(f"/api/alerts/{alert_id}/handoff", json={"to_actor_id": 1}).status_code == 404
     assert city.get(f"/api/alerts/{alert_id}/handoffs").status_code == 404
     assert city.get(f"/api/alerts/{alert_id}/response-approvals").status_code == 404

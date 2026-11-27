@@ -36,7 +36,9 @@ This version follows the internal test plan in the prototype plan document: the 
 | `LAB_DATABASE_URL` | empty | Owner URL for the lab-only endpoints. Empty = `/api/demo`, `/api/autolabel`, `/api/reset` return 503. **Lab VM only.** |
 | `LAB_ENDPOINTS` | `1` | `0` disables `/api/demo`, `/api/autolabel`, `/api/reset` (they return 404) |
 | `ANALYSTS` | `analyst1,analyst2,analyst3` | Owner names for alerts, assigned round-robin per hospital, and the names handoffs can use |
-| `FP_TARGET` | not set | The false-positive ceiling the team agrees, as a fraction (e.g. `0.10`). Until set, the Review gate is `not_measured`. |
+| `FP_TARGET` | not set | The false-positive ceiling the team agrees, as a fraction (e.g. `0.10`). Until set, the Review gate is `not_measured`. See [Detection quality](#detection-quality-fp_target). |
+| `MIN_LABEL_COVERAGE` | `0.80` | A rule and log source group is judged against `FP_TARGET` only when at least this share of its alerts carry a decisive verdict |
+| `MIN_LABELED_SAMPLE` | `30` | ...and only when it has at least this many decisive verdicts |
 | `WORKER_POLL_SECONDS` | `5` | Seconds the response worker waits when the queue is empty (`worker.py`) |
 | `WORKER_LEASE_SECONDS` | `120` | How long a worker holds a job. If it crashes, the job is retried after this lease expires |
 | `WORKER_BATCH` | `10` | Jobs a worker claims per pass |
@@ -80,9 +82,57 @@ These use only the Python standard library. Run them against an instance with no
 | Foundation: logs flow end to end | At least one event is stored |
 | Detection: all planted attacks detected | Every planted attack has an alert |
 | Response: every alert has an owner and a step | Every alert has an owner and a response step |
-| Review: false positives within target | The false-positive rate is at or below `FP_TARGET` |
+| Review: false positives within target | Every rule and log source group is eligible for tuning and within `FP_TARGET` even at its worst case (`fp_max`). Any eligible group above target fails the gate. Groups that are not yet eligible keep it `not_measured`. |
 
-The dashboard shows these at the top. `GET /api/metrics` also returns `false_positive_rate_by_week`, so the weekly
+The dashboard shows these at the top.
+
+## Detection quality (FP_TARGET)
+
+`GET /api/detection-quality` reports one row per **(rule, log source)** for the caller's hospital. Alerts from
+before log sources were recorded fall into an `unattributed` group.
+
+Verdicts (set by `hospital_admin` or `l2` with `POST /api/alerts/<id>/verdict`):
+
+| Verdict | Meaning | Counts as |
+|---|---|---|
+| `true_positive_malicious` | The alert is a real attack | Labeled, not false positive |
+| `true_positive_benign` | The alert is accurate, but the activity was allowed or expected | Labeled, not false positive |
+| `false_positive` | The alert is wrong | Labeled, false positive |
+| `inconclusive` | Review could not decide | Reviewed, not labeled |
+| *(no verdict)* | Not reviewed yet | Unlabeled |
+
+The legacy names `tp`, `fp` and `unclear` are no longer accepted. Existing alerts were migrated once.
+
+Each row reports:
+
+- `total_alerts`, `labeled_alerts`, `label_coverage` (`labeled / total_alerts`) and the verdict breakdown.
+- `observed_fp_rate` = `false_positive / labeled`. Only labeled alerts are in the denominator.
+- `fp_min` = `false_positive / total_alerts`. It assumes every unresolved alert was a true positive.
+- `fp_max` = `(false_positive + unlabeled + inconclusive) / total_alerts`. It assumes every unresolved alert was a false positive.
+  This is the honest ceiling while review is incomplete. A group with 10% of its alerts labeled and no false
+  positives among them still shows `fp_max` of 0.90.
+- `eligible_for_tuning`, which is true only when `label_coverage >= MIN_LABEL_COVERAGE` and `labeled_alerts >= MIN_LABELED_SAMPLE`,
+  with `eligibility_reasons` listing what is missing.
+- `fp_target_status`: `within_target` (`fp_max <= FP_TARGET`), `above_target` (`fp_min > FP_TARGET`), `undetermined`
+  (the bounds straddle the target), `not_eligible`, or `no_target`.
+
+Only eligible groups are judged against `FP_TARGET`. An ineligible group never looks clean because its unreviewed
+alerts are missing from the count.
+
+`GET /api/soc-visibility` reports the SOC's view of the estate: `monitored_assets`, `edr_coverage`, `unmanaged_assets`,
+`unknown_hosts_seen` (event hosts with no matching asset), `unknown_or_unmanaged_assets`, and
+`cross_tenant_or_unauthorized_attempts` (refused requests recorded for this hospital).
+
+### Review workflow before tuning a rule
+
+1. Check `label_coverage` and `labeled_alerts` for the rule. If it is not eligible, label more alerts first.
+   Do not tune on the observed rate alone.
+2. Review the unlabeled alerts in order of severity, and mark the uncertain ones `inconclusive` with a note.
+3. Once eligible, compare the bounds with `FP_TARGET`. Tune groups that are `above_target`. Groups that are
+   `undetermined` need more review before a decision.
+4. After a rule change, bump the rule version and re-check the group. A changed verdict is recorded in the audit
+   log with the previous value.
+ `GET /api/metrics` also returns `false_positive_rate_by_week`, so the weekly
 trend (test plan step 4) can be tracked.
 
 ## Layout
@@ -91,7 +141,7 @@ trend (test plan step 4) can be tracked.
 - `ansible_runner.py` Ansible executor: per-job workspace, one host, shredded in `finally`
 - `ansible/playbooks/` the approved playbooks (they fail until a site configures its modules; see docs/ANSIBLE.md)
 - `worker.py`   durable response-job worker (claims `response_jobs`, leases, backoff, dead-letter); compose service `worker`
-- `app.py`      Flask API + PostgreSQL (psycopg 3, runtime role `soc_app`): identity, roles, `/api/events`, `/api/ingest/wazuh`, `/api/alerts`, `/api/alerts/<id>/handoff`, `/api/metrics`, `/api/exit-criteria`
+- `app.py`      Flask API + PostgreSQL (psycopg 3, runtime role `soc_app`): identity, roles, `/api/events`, `/api/ingest/wazuh`, `/api/alerts`, `/api/alerts/<id>/handoff`, `/api/metrics`, `/api/exit-criteria`, `/api/detection-quality`, `/api/soc-visibility`
 - `auth.py`    scrypt password hashing and token hashing (standard library)
 - `db/schema.sql` tables, row-level security policies, the SECURITY DEFINER lookups and grants (idempotent)
 - `migrate.py` applies `db/schema.sql` as the owner and sets the `soc_app` password (compose service `migrate`)
@@ -169,7 +219,7 @@ The tenant of every request comes from the caller's identity. A `tenant_id` in t
 |---|---|---|
 | `hospital_admin` | Manage its hospital's users, log sources, ingest keys and display name; read events and triage alerts; hand off; close alerts; approve response requests; read audit | See another hospital |
 | `l1` | Read its events and alerts; acknowledge; hand off; request a response approval | Close alerts (verdict); approve response requests; manage users, keys, log sources or settings |
-| `l2` | Everything `l1` can, plus final verdicts (`tp`, `fp`, `unclear`) that close alerts and approve or reject response requests | Manage users, keys, log sources or settings |
+| `l2` | Everything `l1` can, plus final verdicts (`true_positive_malicious`, `true_positive_benign`, `false_positive`, `inconclusive`) that close alerts and approve or reject response requests | Manage users, keys, log sources or settings |
 | `viewer` | Read its hospital's alerts, handoffs and metrics | Change anything |
 | `vendor_admin` (platform account) | Create and list tenants; read one hospital's events, alerts and handoffs with a time-limited **break-glass** grant (read-only, audited) | Routine access to hospital data, users, credentials |
 | ingest key | `POST /api/events` and `POST /api/ingest/*` for its own hospital and log source | Any read or change |
@@ -213,7 +263,7 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 | `GET /api/alerts` | hospital roles; vendor with break-glass | Newest 200 alerts; filter with `status`, `owner` |
 | `GET /api/alerts/<id>` | hospital roles; vendor with break-glass | One tenant-scoped alert with telemetry-safe fields |
 | `POST /api/alerts/<id>/ack` | `hospital_admin`, `l1`, `l2` | Acknowledge an alert |
-| `POST /api/alerts/<id>/verdict` | `hospital_admin`, `l2` | Close with `tp`, `fp` or `unclear`, and an optional `note` |
+| `POST /api/alerts/<id>/verdict` | `hospital_admin`, `l2` | Close with a standard verdict (see Detection quality), and an optional `note` |
 | `POST /api/alerts/<id>/handoff` | `hospital_admin`, `l1`, `l2` | Pass an open alert to an active analyst of the same hospital: `to_actor_id` (a user id from `/api/analysts`), `note`. `to_owner` is retired (400) |
 | `GET /api/assets`, `POST /api/assets`, `PATCH /api/assets/<id>` | read: hospital roles; write: `hospital_admin` | Asset inventory. Clinical classes (`mri`, `ct`, `x_ray`, `ultrasound`, `ventilator`, `patient_monitor`, `infusion_pump`) must be `agentless_medical` |
 | `GET /api/data-flow` | `hospital_admin` | Last event time, accepted and rejected counts (24 h), per-source status, readiness sample |
@@ -223,6 +273,8 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 | `GET /api/analysts` | hospital roles | Analysts that alerts can be handed to |
 | `GET /api/metrics` | hospital roles; vendor with break-glass | Counts, false-positive rate (overall and weekly), detection rate, mean time to ack |
 | `GET /api/exit-criteria` | hospital roles; vendor with break-glass | The four roadmap gates, as `pass`, `fail` or `not_measured` |
+| `GET /api/detection-quality` | hospital roles; vendor with break-glass | Per (rule, log source) label coverage, observed and bounded false-positive rates, tuning eligibility |
+| `GET /api/soc-visibility` | hospital roles; vendor with break-glass | Asset monitoring and EDR coverage, unknown or unmanaged assets, refused requests |
 | `GET/POST /api/users`, `PATCH /api/users/<id>`, `POST /api/users/<id>/disable` | `hospital_admin` | Users of one hospital; role changes and disablement revoke existing sessions |
 | `GET/POST /api/log-sources`, `POST /api/log-sources/<id>/disable` | read: hospital roles; write: `hospital_admin` | Log sources |
 | `GET/POST /api/credentials`, `POST /api/credentials/<id>/revoke` | `hospital_admin` | Ingest keys |
@@ -278,6 +330,14 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 - The dashboard shows each alert's latest handoff under the summary ("Handoff: analyst2 -> analyst1: note").
   Before this, a handoff note was saved in the history only, and the row showed only the closing note.
 - `GET /api/alerts` adds a `last_handoff` field (null when the alert was never handed off).
+
+**PR 12: detection quality and SOC visibility**
+- Standard verdicts: `true_positive_malicious`, `true_positive_benign`, `false_positive`, `inconclusive`, and unlabeled (no verdict). Legacy `tp`/`fp`/`unclear` are migrated once and no longer accepted.
+- Alerts record their log source (`alerts.log_source_id`), enforced to belong to the same hospital.
+- `GET /api/detection-quality`: per (rule, log source) coverage, observed FP rate, `fp_min`/`fp_max` bounds, and the `MIN_LABEL_COVERAGE` / `MIN_LABELED_SAMPLE` tuning gate. Only eligible groups are judged against `FP_TARGET`.
+- The Review gate now uses this evaluation. Any eligible group above target fails it; any ineligible group keeps it `not_measured`.
+- `GET /api/soc-visibility`: monitored assets, EDR coverage, unknown or unmanaged assets, and refused requests for the hospital.
+- Tests: `tests/test_detection_quality.py`. Gate tests set `MIN_LABELED_SAMPLE=1` because their data has too few labels per rule for the default.
 
 **PR 11: maker-checker approval and Ansible execution (`docs/ANSIBLE.md`)**
 - The server picks the playbook from an allowlist pinned by SHA-256 digest. Clients send an action and a target.

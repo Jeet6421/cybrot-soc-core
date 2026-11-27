@@ -50,8 +50,8 @@ def test_ack_verdict_and_fp_rate():
     c.post("/api/reset"); c.post("/api/demo")
     ids = [a["id"] for a in c.get("/api/alerts").get_json()]
     c.post(f"/api/alerts/{ids[0]}/ack")
-    c.post(f"/api/alerts/{ids[0]}/verdict", json={"verdict": "tp"})
-    c.post(f"/api/alerts/{ids[1]}/verdict", json={"verdict": "fp"})
+    c.post(f"/api/alerts/{ids[0]}/verdict", json={"verdict": "true_positive_malicious"})
+    c.post(f"/api/alerts/{ids[1]}/verdict", json={"verdict": "false_positive"})
     m = c.get("/api/metrics").get_json()
     assert m["false_positive_rate"] == 0.5 and m["mean_time_to_ack_s"] is not None
 

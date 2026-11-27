@@ -151,7 +151,7 @@ def test_triage_handoff_verdict_and_approval_decision_are_audited(world):
     assert l2.post(f"/api/response-approvals/{approval_id}/decision",
                    json={"decision": "approved"}).status_code == 200
     assert l2.post(f"/api/alerts/{alert_id}/verdict",
-                   json={"verdict": "tp", "note": "do not copy into audit metadata"}).status_code == 200
+                   json={"verdict": "true_positive_malicious", "note": "do not copy into audit metadata"}).status_code == 200
 
     ack = _audit(world, "alert.ack", alert_id)[-1]
     handoff = _audit(world, "alert.handoff", alert_id)[-1]
@@ -163,7 +163,7 @@ def test_triage_handoff_verdict_and_approval_decision_are_audited(world):
     assert ack[10] == {"previous_status": "new", "status": "ack"}
     l1_actor = _owner_rows(world, "SELECT id FROM users WHERE tenant=%s AND username='analyst-l1'", (CITY,))[0][0]
     assert handoff[10] == {"from_actor_id": l1_actor, "to_actor_id": new_owner}
-    assert verdict[10] == {"previous_verdict": None, "new_verdict": "tp"}
+    assert verdict[10] == {"previous_verdict": None, "new_verdict": "true_positive_malicious"}
     assert requested[10] == {"response_action": "isolate_host", "status": "pending"}
     assert decided[10] == {"response_action": "isolate_host", "decision": "approved"}
     assert "do not copy" not in str(verdict[10])

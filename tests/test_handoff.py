@@ -87,22 +87,22 @@ def test_handoff_unknown_alert_is_404():
 
 def test_closed_alert_cannot_be_handed_off():
     a = one_alert()
-    c.post(f"/api/alerts/{a['id']}/verdict", json={"verdict": "tp"})
+    c.post(f"/api/alerts/{a['id']}/verdict", json={"verdict": "true_positive_malicious"})
     r = c.post(f"/api/alerts/{a['id']}/handoff", json={"to_actor_id": analyst_id(TARGET)})
     assert r.status_code == 409
 
 
 def test_verdict_note_is_not_exposed_in_alert_telemetry():
     a = one_alert()
-    c.post(f"/api/alerts/{a['id']}/verdict", json={"verdict": "fp", "note": "PowerShell policy test file"})
+    c.post(f"/api/alerts/{a['id']}/verdict", json={"verdict": "false_positive", "note": "PowerShell policy test file"})
     after = next(x for x in c.get("/api/alerts").get_json() if x["id"] == a["id"])
-    assert after["verdict"] == "fp" and "resolution" not in after
+    assert after["verdict"] == "false_positive" and "resolution" not in after
 
 
 def test_repeated_verdict_does_not_expose_resolution_note():
     a = one_alert()
-    c.post(f"/api/alerts/{a['id']}/verdict", json={"verdict": "tp", "note": "confirmed"})
-    c.post(f"/api/alerts/{a['id']}/verdict", json={"verdict": "tp"})
+    c.post(f"/api/alerts/{a['id']}/verdict", json={"verdict": "true_positive_malicious", "note": "confirmed"})
+    c.post(f"/api/alerts/{a['id']}/verdict", json={"verdict": "true_positive_malicious"})
     after = next(x for x in c.get("/api/alerts").get_json() if x["id"] == a["id"])
     assert after["status"] == "closed" and "resolution" not in after
 
