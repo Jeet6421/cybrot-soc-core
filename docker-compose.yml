@@ -54,5 +54,17 @@ services:
       DATABASE_URL: "postgresql://soc_app:${SOC_APP_PASSWORD}@db:5432/soc"
       WORKER_POLL_SECONDS: "${WORKER_POLL_SECONDS:-5}"   # idle wait between queue checks
       WORKER_LEASE_SECONDS: "${WORKER_LEASE_SECONDS:-120}" # a crashed job is retried after this lease expires
+      ANSIBLE_CREDENTIAL_DIR: "/var/lib/soc/ansible-creds"   # one folder per hospital: <tenant>/ssh_key, read-only here
+      ANSIBLE_WORKSPACE_DIR: "/var/lib/soc/ansible-work"     # per-job workspaces live on tmpfs and are shredded after each run
+      ANSIBLE_TIMEOUT_SECONDS: "${ANSIBLE_TIMEOUT_SECONDS:-600}"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/lib/soc/ansible-work:mode=0700,uid=10001,gid=10001,size=256m
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ansible-creds:/var/lib/soc/ansible-creds:ro
 volumes:
   pg-data:
+  ansible-creds:   # filled by the operator (never by the app): one folder per hospital holding ssh_key

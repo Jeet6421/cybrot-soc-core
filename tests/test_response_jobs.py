@@ -31,8 +31,11 @@ def approved_job(world):
     Api(world, CITY, "l1").post("/api/events", json=failed_logins(CITY))
     alert_id = next(a["id"] for a in Api(world, CITY, "l1").get("/api/alerts").get_json()
                     if a.get("status") != "closed")
+    host = f"ws-{uuid.uuid4().hex[:8]}"
+    assert Api(world, CITY, "hospital_admin").post("/api/assets", json={
+        "device_name": host, "asset_class": "workstation", "monitoring_mode": "edr_managed"}).status_code == 201
     request = Api(world, CITY, "l1").post(f"/api/alerts/{alert_id}/response-approvals", json={
-        "action": "isolate_host", "target": f"ws-{uuid.uuid4().hex[:8]}", "reason": "queue test"})
+        "action": "isolate_host", "target": host, "reason": "queue test"})
     assert request.status_code == 201
     approval_id = request.get_json()["id"]
     decided = Api(world, CITY, "l2").post(f"/api/response-approvals/{approval_id}/decision",
@@ -79,15 +82,16 @@ def test_approval_queues_exactly_one_job(world):
 
 def test_duplicate_idempotency_key_does_not_create_a_second_job(world):
     _, job_id = approved_job(world)
-    key, tenant_id = owner_rows(world, "SELECT idempotency_key, tenant_id FROM response_jobs WHERE job_id=%s",
-                                (job_id,))[0]
+    key, tenant_id, alert_id, host, playbook = owner_rows(
+        world, "SELECT idempotency_key, tenant_id, alert_id, target_host, playbook_id FROM response_jobs "
+               "WHERE job_id=%s", (job_id,))[0]
     with soc.connect() as conn:
-        soc._bind(conn, CITY, "l2", actor(world, CITY, "analyst-l2"))  # the approver's own session
+        soc._bind(conn, CITY, "l1", actor(world, CITY, "analyst-l1"))  # a requester's own session
         row = conn.execute(
             "INSERT INTO response_jobs(tenant_id, alert_id, action_type, target_host, idempotency_key, "
-            "requested_by, approved_by, approved_at) SELECT tenant_id, alert_id, action_type, target_host, "
-            "idempotency_key, requested_by, approved_by, approved_at FROM response_jobs WHERE job_id=%s "
-            "ON CONFLICT (tenant_id, idempotency_key) DO NOTHING RETURNING job_id", (job_id,)).fetchone()
+            "requested_by, status, playbook_id) VALUES (%s, %s, 'isolate_host', %s, %s, %s, 'pending_approval', %s) "
+            "ON CONFLICT (tenant_id, idempotency_key) DO NOTHING RETURNING job_id",
+            (tenant_id, alert_id, host, key, actor(world, CITY, "analyst-l1"), playbook)).fetchone()
         assert row is None  # the database refused the duplicate and created nothing
     assert owner_rows(world, "SELECT count(*) FROM response_jobs WHERE tenant_id=%s AND idempotency_key=%s",
                       (tenant_id, key))[0][0] == 1

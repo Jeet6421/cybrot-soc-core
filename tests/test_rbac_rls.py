@@ -10,7 +10,7 @@ import pytest
 from psycopg import errors
 
 import app as soc
-from support import (Api, CITY, ORTHO, active_break_glass, failed_logins, request_break_glass,
+from support import (Api, CITY, ORTHO, active_break_glass, failed_logins, request_break_glass, ensure_asset,
                      revoke_break_glass)
 
 HOSPITAL_TABLES = ("events", "alerts", "handoffs", "response_approvals")
@@ -57,6 +57,7 @@ def data(world):
     alert = Api(world, ORTHO, "viewer").get(f"/api/alerts?tenant={ORTHO}").get_json()[0]
     Api(world, ORTHO, "l1").post(f"/api/alerts/{alert['id']}/handoff",
                                  json={"to_actor_id": actor_id(world, ORTHO, "analyst-l2")})
+    ensure_asset(world, ORTHO, "ehr-01")
     approval = Api(world, ORTHO, "l1").post(f"/api/alerts/{alert['id']}/response-approvals", json={
         "action": "isolate_host", "target": "ehr-01", "reason": "Test RLS visibility"})
     assert approval.status_code == 201

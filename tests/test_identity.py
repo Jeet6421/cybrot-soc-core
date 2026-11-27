@@ -8,7 +8,7 @@ import psycopg
 import pytest
 import app as soc
 
-from support import (Api, CITY, ORTHO, PASSWORD, active_break_glass, approve_break_glass, failed_logins,
+from support import (Api, CITY, ORTHO, PASSWORD, active_break_glass, approve_break_glass, failed_logins, ensure_asset,
                      request_break_glass, revoke_break_glass)
 
 
@@ -68,6 +68,7 @@ def test_api_created_l1_and_l2_users_log_in_and_keep_role_permissions(world):
     assert world.client.get("/api/alerts", headers=l1_headers).status_code == 200
     assert world.client.get("/api/users", headers=l1_headers).status_code == 403
     assert world.client.get("/api/credentials", headers=l1_headers).status_code == 403
+    ensure_asset(world, CITY, "vpn-01")
     request_body = {"action": "isolate_host", "target": "vpn-01", "reason": "Investigate failed login burst"}
     created = world.client.post(f"/api/alerts/{alert_id}/response-approvals", json=request_body, headers=l1_headers)
     assert created.status_code == 201
@@ -288,6 +289,7 @@ def test_l2_approval_is_required_for_allowlisted_response_actions(world):
     alert_id = new_alert(world, CITY)
     l1 = Api(world, CITY, "l1")
     l2 = Api(world, CITY, "l2")
+    ensure_asset(world, CITY, "vpn-01")
     request_body = {"action": "isolate_host", "target": "vpn-01", "reason": "Contain confirmed brute force"}
     created = l1.post(f"/api/alerts/{alert_id}/response-approvals", json=request_body)
     assert created.status_code == 201
@@ -371,6 +373,7 @@ def test_admin_cannot_reach_another_hospitals_records(world):
     alert_id = new_alert(world, ORTHO)
     ortho = Api(world, ORTHO, "hospital_admin")
     city = Api(world, CITY, "hospital_admin")
+    ensure_asset(world, ORTHO, "ehr-01")
     ortho_approval = Api(world, ORTHO, "l1").post(
         f"/api/alerts/{alert_id}/response-approvals",
         json={"action": "isolate_host", "target": "ehr-01", "reason": "cross tenant test"})

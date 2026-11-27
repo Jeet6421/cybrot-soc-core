@@ -1,0 +1,12 @@
+# playbook: contain.block_ip   version: 1.0.0   tier: disruptive
+#
+# Blocks one IP address at the site firewall. The address is validated by SOC Core before it reaches here.
+#
+# No firewall module ships in this repository. The task fails until the site configures its approved module.
+- name: Block the verified address
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Refuse until the site firewall module is configured
+      ansible.builtin.fail:
+        msg: "No firewall module is configured for this site. Configure the approved module, then re-approve."

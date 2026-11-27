@@ -40,6 +40,9 @@ This version follows the internal test plan in the prototype plan document: the 
 | `WORKER_POLL_SECONDS` | `5` | Seconds the response worker waits when the queue is empty (`worker.py`) |
 | `WORKER_LEASE_SECONDS` | `120` | How long a worker holds a job. If it crashes, the job is retried after this lease expires |
 | `WORKER_BATCH` | `10` | Jobs a worker claims per pass |
+| `ANSIBLE_CREDENTIAL_DIR` | `/var/lib/soc/ansible-creds` | Read-only folder of per-hospital keys (`<tenant>/ssh_key`). See docs/ANSIBLE.md |
+| `ANSIBLE_WORKSPACE_DIR` | `/var/lib/soc/ansible-work` | Per-job workspaces; removed after each run |
+| `ANSIBLE_TIMEOUT_SECONDS` | `600` | Limit for one playbook run |
 | `PORT` | `5000` | HTTP port when running `python app.py` |
 
 `SOC_API_TOKEN` (the shared operator token) was removed in v1.2. Nothing reads it any more.
@@ -84,6 +87,9 @@ trend (test plan step 4) can be tracked.
 
 ## Layout
 - `docs/RUNBOOKS.md`  Operating procedures: 100-bed onboarding, intra-tenant handoffs, vendor break-glass, hospital offboarding
+- `playbooks.py` server-side playbook allowlist (digest-pinned), target validation, tenant id rules
+- `ansible_runner.py` Ansible executor: per-job workspace, one host, shredded in `finally`
+- `ansible/playbooks/` the approved playbooks (they fail until a site configures its modules; see docs/ANSIBLE.md)
 - `worker.py`   durable response-job worker (claims `response_jobs`, leases, backoff, dead-letter); compose service `worker`
 - `app.py`      Flask API + PostgreSQL (psycopg 3, runtime role `soc_app`): identity, roles, `/api/events`, `/api/ingest/wazuh`, `/api/alerts`, `/api/alerts/<id>/handoff`, `/api/metrics`, `/api/exit-criteria`
 - `auth.py`    scrypt password hashing and token hashing (standard library)
@@ -272,6 +278,17 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 - The dashboard shows each alert's latest handoff under the summary ("Handoff: analyst2 -> analyst1: note").
   Before this, a handoff note was saved in the history only, and the row showed only the closing note.
 - `GET /api/alerts` adds a `last_handoff` field (null when the alert was never handed off).
+
+**PR 11: maker-checker approval and Ansible execution (`docs/ANSIBLE.md`)**
+- The server picks the playbook from an allowlist pinned by SHA-256 digest. Clients send an action and a target.
+- Disruptive actions wait in `pending_approval`. An L2 analyst or hospital admin approves; the requester cannot.
+  Approval queues the job and rejection closes it. An L1 analyst cannot decide.
+- Targets are validated and resolved inside the requesting hospital. Disruptive actions are refused for medical
+  equipment (IEC 80001) when requested, approved and executed.
+- The Ansible executor runs one playbook against one host (`--limit`) in a private workspace that is shredded afterwards.
+  Results keep the PLAY RECAP counts, not raw output.
+- Every request, approval, rejection, start and finish writes an audit row in the same transaction.
+- Tests: `tests/test_response_actions.py`.
 
 **PR 10: durable response queue (`response_jobs`); the outbound webhook is removed**
 - Approving a response now queues one job in `response_jobs` (same transaction). A repeat with the same

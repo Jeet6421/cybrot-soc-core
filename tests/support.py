@@ -80,3 +80,11 @@ def revoke_break_glass(world, tenant):
                       (tenant,))
         owner.commit()
 
+
+
+def ensure_asset(world, tenant, name, asset_class="workstation", mode="edr_managed"):
+    """Create the hospital's asset if it is not there yet. A response can only target an asset of its own hospital."""
+    created = Api(world, tenant, "hospital_admin").post("/api/assets", json={
+        "device_name": name, "asset_class": asset_class, "monitoring_mode": mode})
+    assert created.status_code in (201, 409), created.get_json()
+    return name
