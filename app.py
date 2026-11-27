@@ -73,6 +73,8 @@ ROUTE_ROLES = {
     ("POST", "/api/response-approvals/<int:approval_id>/decision"): {"hospital_admin", "l2"},
     ("GET", "/api/metrics"): set(HOSPITAL_READ) | {"vendor_admin"},
     ("GET", "/api/exit-criteria"): set(HOSPITAL_READ) | {"vendor_admin"},
+    ("GET", "/api/detection-quality"): set(HOSPITAL_READ) | {"vendor_admin"},
+    ("GET", "/api/soc-visibility"): set(HOSPITAL_READ) | {"vendor_admin"},
     ("POST", "/api/demo"): {"vendor_admin"},
     ("POST", "/api/autolabel"): {"vendor_admin"},
     ("POST", "/api/reset"): {"vendor_admin"},
@@ -218,6 +220,29 @@ def _fp_target():
         return None
 
 
+# Standard analytical verdicts. An alert with no verdict is "unlabeled" and is stored as NULL, never as a label.
+TP_MALICIOUS = "true_positive_malicious"
+TP_BENIGN = "true_positive_benign"
+FALSE_POSITIVE = "false_positive"
+INCONCLUSIVE = "inconclusive"
+VERDICTS = (TP_MALICIOUS, TP_BENIGN, FALSE_POSITIVE, INCONCLUSIVE)
+DECISIVE = (TP_MALICIOUS, TP_BENIGN, FALSE_POSITIVE)
+
+
+def _quality_thresholds():
+    """Tuning gate: a rule and log source group is evaluated against FP_TARGET only when it has this much label
+    coverage and this many decisive labels. Invalid values fall back to the defaults."""
+    try:
+        coverage = float(os.environ.get("MIN_LABEL_COVERAGE", "0.80") or "0.80")
+    except ValueError:
+        coverage = 0.80
+    try:
+        sample = int(os.environ.get("MIN_LABELED_SAMPLE", "30") or "30")
+    except ValueError:
+        sample = 30
+    return (coverage if 0 <= coverage <= 1 else 0.80), (sample if sample >= 1 else 30)
+
+
 def audit(action, detail=""):
     """One row in the legacy audit log, for the identity that is currently bound."""
     ctx = g.ctx
@@ -225,7 +250,7 @@ def audit(action, detail=""):
                  (ctx["tenant"], ctx["actor_id"], action, detail[:300]))
 
 
-_AUDIT_VERDICTS = {"tp", "fp", "unclear"}
+_AUDIT_VERDICTS = set(VERDICTS)
 _AUDIT_STATUSES = {"new", "ack", "closed", "pending", "disabled"}
 _AUDIT_DECISIONS = {"approved", "rejected"}
 _AUDIT_SCOPES = {"events:read", "alerts:read", "handoffs:read", "metrics:read"}
@@ -335,7 +360,7 @@ def _record_current_audit(db_session, *, action, resource_type, resource_id=None
 
 
 def raise_alert(c, tenant, rule, sev, summary, key, event_ts, attack_id=None, source="builtin",
-                detail="", step=None):
+                detail="", step=None, log_source_id=None):
     dup = c.execute("SELECT 1 FROM alerts WHERE rule=%s AND tenant=%s AND dkey=%s AND event_ts>=%s",
                     (rule, tenant, key, detect._ago(event_ts, 10))).fetchone() if event_ts else None
     if dup:
@@ -343,9 +368,10 @@ def raise_alert(c, tenant, rule, sev, summary, key, event_ts, attack_id=None, so
     n = c.execute("SELECT COUNT(*) FROM alerts WHERE tenant=%s", (tenant,)).fetchone()[0]
     owner = ANALYSTS[n % len(ANALYSTS)]
     step = step or detect.PLAYBOOK.get(rule, "Review the alert details and decide: escalate, fix, or close as benign.")
-    cur = c.execute("INSERT INTO alerts(created,event_ts,tenant,rule,rule_version,severity,summary,dkey,owner,step,attack_id,source,detail) "
-                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-                    (now(), event_ts, tenant, rule, detect.rule_version(rule), sev, summary, key, owner, step, attack_id, source, detail))
+    cur = c.execute("INSERT INTO alerts(created,event_ts,tenant,rule,rule_version,severity,summary,dkey,owner,step,attack_id,source,detail,log_source_id) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    (now(), event_ts, tenant, rule, detect.rule_version(rule), sev, summary, key, owner, step, attack_id, source, detail,
+                     log_source_id))
     return cur.fetchone()["id"]
 
 
@@ -461,6 +487,8 @@ _VENDOR_READ_SCOPES = {
     ("GET", "/api/alerts/<int:i>/handoffs"): "handoffs:read",
     ("GET", "/api/metrics"): "metrics:read",
     ("GET", "/api/exit-criteria"): "metrics:read",
+    ("GET", "/api/detection-quality"): "metrics:read",
+    ("GET", "/api/soc-visibility"): "metrics:read",
 }
 
 
@@ -714,7 +742,8 @@ def _store_events(c, evs):
                   "%(destination)s,%(data_classification)s,%(destination_approved)s,%(src_zone)s,%(dst_zone)s,%(boundary_violation)s,%(approved_change)s,%(log_source_id)s)", e)
         hit = detect.evaluate(c, e)
         if hit:
-            i = raise_alert(c, e["tenant"], *hit[:3], hit[3], e["ts"], e["attack_id"])
+            i = raise_alert(c, e["tenant"], *hit[:3], hit[3], e["ts"], e["attack_id"],
+                            log_source_id=e.get("log_source_id"))
             if i:
                 made_ids.append(i)
     return made_ids
@@ -797,7 +826,7 @@ def ingest_wazuh():
     c = db()
     i = raise_alert(c, ident["tenant"], f"WAZUH:{rid}", sev, f"{rule.get('description', 'Wazuh alert')} ({agent})",
                     key, a.get("timestamp", now())[:19], None, "wazuh",
-                    detail=detail, step=detect.wazuh_step(rid, lvl))
+                    detail=detail, step=detect.wazuh_step(rid, lvl), log_source_id=ident["log_source_id"])
     commit()
     return jsonify(alert_id=i)
 
@@ -1402,8 +1431,8 @@ def verdict(i):
     actor = _session_audit_actor()
     body = _body(required=True)
     v = body.get("verdict")
-    if v not in ("tp", "fp", "unclear"):
-        raise Refuse(400, "verdict must be tp, fp or unclear")
+    if v not in VERDICTS:
+        raise Refuse(400, "verdict must be one of: " + ", ".join(VERDICTS))
     note = _text(body, "note", 500)  # optional closing note, kept with the alert
     row = _alert_or_404(i)
     c = db()
@@ -1648,16 +1677,18 @@ def _metrics(tenant=None):
     def one(sql):
         return c.execute(sql.format(s=scope), p).fetchone()[0]
 
-    tp = one("SELECT COUNT(*) FROM alerts WHERE verdict='tp' AND {s}")
-    fp = one("SELECT COUNT(*) FROM alerts WHERE verdict='fp' AND {s}")
+    tp = one("SELECT COUNT(*) FROM alerts WHERE verdict IN ('true_positive_malicious', 'true_positive_benign') AND {s}")
+    fp = one("SELECT COUNT(*) FROM alerts WHERE verdict='false_positive' AND {s}")
     planted = one("SELECT COUNT(DISTINCT attack_id) FROM events WHERE attack_id IS NOT NULL AND {s}")
     caught = one("SELECT COUNT(DISTINCT attack_id) FROM alerts WHERE attack_id IS NOT NULL AND {s}")
     mtta = one("SELECT CAST(AVG(EXTRACT(EPOCH FROM (CAST(ack_at AS timestamp) - CAST(created AS timestamp)))) "
                "AS DOUBLE PRECISION) FROM alerts WHERE ack_at IS NOT NULL AND {s}")
     weekly = []
     for r in c.execute("SELECT to_char(CAST(created AS timestamp), 'IYYY-\"W\"IW') AS week, "
-                       "COUNT(*) FILTER (WHERE verdict='tp') AS tp, COUNT(*) FILTER (WHERE verdict='fp') AS fp "
-                       "FROM alerts WHERE verdict IN ('tp','fp') AND " + scope + " GROUP BY week ORDER BY week", p):
+                       "COUNT(*) FILTER (WHERE verdict IN ('true_positive_malicious', 'true_positive_benign')) AS tp, "
+                       "COUNT(*) FILTER (WHERE verdict='false_positive') AS fp "
+                       "FROM alerts WHERE verdict IN ('true_positive_malicious', 'true_positive_benign', 'false_positive') "
+                       "AND " + scope + " GROUP BY week ORDER BY week", p):
         weekly.append({"week": r["week"], "tp": r["tp"], "fp": r["fp"],
                        "false_positive_rate": round(r["fp"] / (r["tp"] + r["fp"]), 3)})
     by_sev = {r[0]: r[1] for r in c.execute(
@@ -1677,6 +1708,116 @@ def _metrics(tenant=None):
 @app.get("/api/metrics")
 def metrics():
     return jsonify(_metrics(hospital_scope(*HOSPITAL_READ, "vendor_admin")))
+
+
+# ---- Detection quality (FP_TARGET) and SOC visibility -------------------------------------------------
+
+QUALITY_DEFINITIONS = {
+    "label_coverage": "labeled / total_alerts. Labeled means a decisive verdict: true_positive_malicious, "
+                      "true_positive_benign or false_positive.",
+    "observed_fp_rate": "false_positive / labeled. Both true-positive labels count as not false positive. "
+                        "Null when nothing is labeled.",
+    "fp_min": "false_positive / total_alerts. Assumes every unlabeled or inconclusive alert was a true positive.",
+    "fp_max": "(false_positive + unlabeled + inconclusive) / total_alerts. Assumes every unresolved alert "
+              "was a false positive. The honest ceiling while review is incomplete.",
+    "eligible_for_tuning": "True only when label_coverage >= MIN_LABEL_COVERAGE and labeled >= MIN_LABELED_SAMPLE. "
+                           "Ineligible groups are never judged against FP_TARGET.",
+    "fp_target_status": "within_target (fp_max <= FP_TARGET), above_target (fp_min > FP_TARGET), "
+                        "undetermined (the bounds straddle the target), not_eligible, or no_target.",
+}
+
+
+def _quality_row(r, min_cov, min_n, target):
+    total = r["total_alerts"]
+    fp = r["false_positive"]
+    labeled = r["tp_malicious"] + r["tp_benign"] + fp
+    unresolved = total - labeled  # unlabeled and inconclusive alerts
+    coverage = labeled / total if total else 0.0
+    reasons = []
+    if coverage < min_cov:
+        reasons.append(f"label coverage {coverage:.0%} is below {min_cov:.0%}")
+    if labeled < min_n:
+        reasons.append(f"{labeled} labeled alerts, need {min_n}")
+    eligible = not reasons
+    observed = round(fp / labeled, 3) if labeled else None
+    fp_min = round(fp / total, 3) if total else None
+    fp_max = round((fp + unresolved) / total, 3) if total else None
+    if target is None:
+        status = "no_target"
+    elif not eligible:
+        status = "not_eligible"
+    elif fp_max <= target:
+        status = "within_target"
+    elif fp_min > target:
+        status = "above_target"
+    else:
+        status = "undetermined"
+    return {
+        "tenant_id": r["tenant"], "rule_id": r["rule_id"],
+        "log_source_id": r["log_source_id"],
+        "log_source": r["log_source"] or ("unattributed" if r["log_source_id"] is None else None),
+        "total_alerts": total, "labeled_alerts": labeled, "label_coverage": round(coverage, 3),
+        "verdicts": {TP_MALICIOUS: r["tp_malicious"], TP_BENIGN: r["tp_benign"], FALSE_POSITIVE: fp,
+                     INCONCLUSIVE: r["inconclusive"], "unlabeled": r["unlabeled"]},
+        "observed_fp_rate": observed, "fp_min": fp_min, "fp_max": fp_max,
+        "eligible_for_tuning": eligible, "eligibility_reasons": reasons,
+        "fp_target": target, "fp_target_status": status,
+    }
+
+
+def _detection_quality(tenant):
+    """One row per (rule, log source) for this hospital. Unattributed alerts form their own group."""
+    min_cov, min_n = _quality_thresholds()
+    target = _fp_target()
+    rows = db().execute(
+        "SELECT a.tenant, a.rule AS rule_id, a.log_source_id, ls.name AS log_source, "
+        "COUNT(*) AS total_alerts, "
+        "COUNT(*) FILTER (WHERE a.verdict = 'true_positive_malicious') AS tp_malicious, "
+        "COUNT(*) FILTER (WHERE a.verdict = 'true_positive_benign') AS tp_benign, "
+        "COUNT(*) FILTER (WHERE a.verdict = 'false_positive') AS false_positive, "
+        "COUNT(*) FILTER (WHERE a.verdict = 'inconclusive') AS inconclusive, "
+        "COUNT(*) FILTER (WHERE a.verdict IS NULL) AS unlabeled "
+        "FROM alerts a LEFT JOIN log_sources ls ON ls.id = a.log_source_id AND ls.tenant = a.tenant "
+        "WHERE a.tenant = %(t)s "
+        "GROUP BY a.tenant, a.rule, a.log_source_id, ls.name "
+        "ORDER BY a.rule, a.log_source_id NULLS FIRST",
+        {"t": tenant}).fetchall()
+    return [_quality_row(dict(r), min_cov, min_n, target) for r in rows]
+
+
+def _soc_visibility(tenant):
+    """What the SOC can see of this hospital's estate, from its own inventory, events and refusal records."""
+    c = db()
+    p = {"t": tenant}
+    a = c.execute("SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE monitoring_mode = 'edr_managed') AS edr, "
+                  "COUNT(*) FILTER (WHERE monitoring_mode = 'agentless_medical') AS agentless_medical, "
+                  "COUNT(*) FILTER (WHERE monitoring_mode = 'unmanaged') AS unmanaged "
+                  "FROM assets WHERE tenant_id = %(t)s", p).fetchone()
+    unknown = c.execute(
+        "SELECT COUNT(DISTINCT e.host) FROM events e WHERE e.tenant = %(t)s AND COALESCE(e.host, '') <> '' "
+        "AND NOT EXISTS (SELECT 1 FROM assets x WHERE x.tenant_id = e.tenant "
+        "AND (x.device_name = e.host OR x.ip_address = e.host))", p).fetchone()[0]
+    refused = c.execute("SELECT COUNT(*) FROM audit_events WHERE tenant_id = %(t)s AND outcome = 'deny'",
+                        p).fetchone()[0]
+    total = a["total"]
+    return {
+        "total_assets": total,
+        "monitored_assets": total - a["unmanaged"],
+        "edr_managed_assets": a["edr"],
+        "agentless_medical_assets": a["agentless_medical"],
+        "edr_coverage": round(a["edr"] / total, 3) if total else None,
+        "unmanaged_assets": a["unmanaged"],
+        "unknown_hosts_seen": unknown,
+        "unknown_or_unmanaged_assets": a["unmanaged"] + unknown,
+        "cross_tenant_or_unauthorized_attempts": refused,
+        "definitions": {
+            "monitored_assets": "assets whose monitoring_mode is not unmanaged",
+            "edr_coverage": "edr_managed / total_assets",
+            "unknown_hosts_seen": "distinct event hosts with no matching asset by device name or IP",
+            "cross_tenant_or_unauthorized_attempts": "refused requests recorded for this hospital "
+                                                     "(authorization denials and rejected ingest)",
+        },
+    }
 
 
 def _gate_results(m, tenant=None):
@@ -1706,14 +1847,21 @@ def _gate_results(m, tenant=None):
              f"{m['alerts'] - missing} of {m['alerts']} alerts have an owner and a step")
 
     target = _fp_target()
+    groups = _detection_quality(tenant) if tenant else []
     if target is None:
         gate("review", "not_measured", "set FP_TARGET to the false-positive ceiling the team agrees")
-    elif not m["labeled_alerts"]:
-        gate("review", "not_measured", "no alerts labeled tp or fp yet")
+    elif not groups:
+        gate("review", "not_measured", "no alerts yet")
+    elif any(x["fp_target_status"] == "above_target" for x in groups):
+        bad = sum(1 for x in groups if x["fp_target_status"] == "above_target")
+        gate("review", "fail", f"{bad} of {len(groups)} rule and log source groups exceed target {target:.1%}")
+    elif all(x["fp_target_status"] == "within_target" for x in groups):
+        gate("review", "pass", f"all {len(groups)} rule and log source groups are within target {target:.1%} "
+                               "even at their worst case")
     else:
-        rate = m["false_positive_rate"]
-        gate("review", "pass" if rate <= target else "fail",
-             f"false-positive rate {rate:.1%} against target {target:.1%}")
+        waiting = sum(1 for x in groups if x["fp_target_status"] != "within_target")
+        gate("review", "not_measured", f"{waiting} of {len(groups)} groups need more label coverage, more "
+                                       "labeled alerts, or a decisive result before the target can be judged")
     return out
 
 
@@ -1723,6 +1871,20 @@ def exit_criteria():
     m = _metrics(tenant)
     gates = _gate_results(m, tenant)
     return jsonify(gates=gates, all_pass=all(g["status"] == "pass" for g in gates), fp_target=_fp_target())
+
+
+@app.get("/api/detection-quality")
+def detection_quality():
+    tenant = hospital_scope(*HOSPITAL_READ, "vendor_admin")
+    min_cov, min_n = _quality_thresholds()
+    return jsonify(fp_target=_fp_target(), min_label_coverage=min_cov, min_labeled_sample=min_n,
+                   definitions=QUALITY_DEFINITIONS, rules=_detection_quality(tenant))
+
+
+@app.get("/api/soc-visibility")
+def soc_visibility():
+    tenant = hospital_scope(*HOSPITAL_READ, "vendor_admin")
+    return jsonify(_soc_visibility(tenant))
 
 
 # ---- Lab-only endpoints (owner role, vendor admin only) ---------------------------------------------
@@ -1755,7 +1917,7 @@ def autolabel():
     _require_vendor()
     c = _lab_connection()
     try:
-        c.execute("UPDATE alerts SET verdict=CASE WHEN attack_id IS NOT NULL THEN 'tp' ELSE 'fp' END WHERE verdict IS NULL AND source='builtin'")
+        c.execute("UPDATE alerts SET verdict=CASE WHEN attack_id IS NOT NULL THEN 'true_positive_malicious' ELSE 'false_positive' END WHERE verdict IS NULL AND source='builtin'")
         c.commit()
     finally:
         c.close()

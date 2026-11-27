@@ -63,6 +63,7 @@ def test_exit_criteria_start_not_measured(monkeypatch):
 def test_exit_criteria_pass_after_simulations(monkeypatch):
     c.post("/api/reset")
     monkeypatch.setenv("FP_TARGET", "0.5")
+    monkeypatch.setenv("MIN_LABELED_SAMPLE", "1")  # the simulation labels too few alerts per rule for the default 30
     attack_sim.run(post, get)
     post("/api/autolabel", {})
     g = gates()
@@ -76,10 +77,11 @@ def test_exit_criteria_pass_after_simulations(monkeypatch):
 def test_review_fails_when_false_positives_exceed_target(monkeypatch):
     c.post("/api/reset")
     monkeypatch.setenv("FP_TARGET", "0.10")
+    monkeypatch.setenv("MIN_LABELED_SAMPLE", "1")
     attack_sim.run(post, get)
     post("/api/autolabel", {})
     first = get("/api/alerts")[0]["id"]
-    c.post(f"/api/alerts/{first}/verdict", json={"verdict": "fp"})  # 1 fp out of 3 labeled = 33%
+    c.post(f"/api/alerts/{first}/verdict", json={"verdict": "false_positive"})  # 1 fp out of 3 labeled = 33%
     assert gates()["review"] == "fail"
 
 
@@ -88,7 +90,7 @@ def test_weekly_false_positive_rate():
     attack_sim.run(post, get)
     post("/api/autolabel", {})
     first = get("/api/alerts")[0]["id"]
-    c.post(f"/api/alerts/{first}/verdict", json={"verdict": "fp"})
+    c.post(f"/api/alerts/{first}/verdict", json={"verdict": "false_positive"})
     weeks = get("/api/metrics")["false_positive_rate_by_week"]
     assert len(weeks) >= 1
     assert sum(w["tp"] for w in weeks) == 2 and sum(w["fp"] for w in weeks) == 1

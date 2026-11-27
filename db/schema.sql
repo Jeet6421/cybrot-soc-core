@@ -198,6 +198,33 @@ END $constraint$;
 CREATE UNIQUE INDEX IF NOT EXISTS alerts_id_tenant_uidx ON alerts(id, tenant);
 CREATE INDEX IF NOT EXISTS alerts_tenant_id_idx ON alerts(tenant, id);
 
+-- PR 12: which log source produced the alert (NULL = unattributed, e.g. older alerts or break-glass alerts).
+-- The composite key makes an alert unable to name another hospital's log source.
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS log_source_id BIGINT;
+CREATE UNIQUE INDEX IF NOT EXISTS log_sources_id_tenant_uidx ON log_sources(id, tenant);
+DO $alert_source$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'alerts_log_source_tenant_fk') THEN
+    ALTER TABLE alerts ADD CONSTRAINT alerts_log_source_tenant_fk
+      FOREIGN KEY (log_source_id, tenant) REFERENCES log_sources(id, tenant);
+  END IF;
+END $alert_source$;
+
+-- PR 12: standard analytical verdicts. Legacy labels (tp, fp, unclear) are migrated once; an unlabeled
+-- alert keeps verdict NULL and is never stored under a label of its own.
+UPDATE alerts SET verdict = CASE verdict WHEN 'tp' THEN 'true_positive_malicious'
+                                         WHEN 'fp' THEN 'false_positive'
+                                         WHEN 'unclear' THEN 'inconclusive' END
+  WHERE verdict IN ('tp', 'fp', 'unclear');
+DO $verdict_check$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'alerts_verdict_check') THEN
+    ALTER TABLE alerts ADD CONSTRAINT alerts_verdict_check
+      CHECK (verdict IS NULL OR verdict IN ('true_positive_malicious', 'true_positive_benign',
+                                            'false_positive', 'inconclusive'));
+  END IF;
+END $verdict_check$;
+
 CREATE TABLE IF NOT EXISTS handoffs(id BIGSERIAL PRIMARY KEY, alert_id BIGINT, at TEXT, from_owner TEXT,
   to_owner TEXT, note TEXT);
 ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS tenant TEXT;

@@ -113,9 +113,10 @@ async function load(){
   $("#t").innerHTML=a.map(x=>`<tr><td>${x.id}</td><td class="sev ${x.severity}">${x.severity}</td><td>${esc(x.rule)}</td>
    <td>${esc(x.summary)}${x.detail?`<br><small>${esc(x.detail)}</small>`:""}${x.resolution?`<br><small>Note: ${esc(x.resolution)}</small>`:""}${x.last_handoff?`<br><small>Handoff: ${esc(x.last_handoff)}</small>`:""}</td><td>${esc(x.owner)}</td><td><small>${esc(x.step)}</small></td><td>${x.status}</td><td>${x.verdict||"-"}</td>
    <td>${can&&x.status=="new"?`<button onclick="act('/api/alerts/${x.id}/ack')">Ack</button> `:""}
-   ${isL2?`<button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'tp'})">TP</button>
-   <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'fp'})">FP</button>
-   <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'unclear'})">?</button>`:""}
+   ${isL2?`<button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'true_positive_malicious'})">TP malicious</button>
+   <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'true_positive_benign'})">TP benign</button>
+   <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'false_positive'})">FP</button>
+   <button onclick="act('/api/alerts/${x.id}/verdict',{verdict:'inconclusive'})">Inconclusive</button>`:""}
    ${can&&x.status!="closed"?`<button onclick="handoff(${x.id})">Hand off</button>`:""}</td></tr>`).join("");
 }
 async function handoff(id){

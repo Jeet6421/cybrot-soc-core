@@ -66,7 +66,7 @@ def test_key_cannot_read_or_change_anything(world):
     assert c.get("/api/tenants", headers=key).status_code == 403
     assert c.get("/api/credentials", headers=key).status_code == 403
     assert c.post(f"/api/alerts/{alert_id}/ack", headers=key).status_code == 403
-    assert c.post(f"/api/alerts/{alert_id}/verdict", json={"verdict": "tp"}, headers=key).status_code == 403
+    assert c.post(f"/api/alerts/{alert_id}/verdict", json={"verdict": "true_positive_malicious"}, headers=key).status_code == 403
     assert c.post(f"/api/alerts/{alert_id}/handoff", json={"to_owner": "analyst2"}, headers=key).status_code == 403
     assert c.get(f"/api/alerts/{alert_id}/handoffs", headers=key).status_code == 403
 
