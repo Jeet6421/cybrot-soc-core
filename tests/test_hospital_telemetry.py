@@ -157,7 +157,8 @@ def test_data_flow_flags_a_skewed_source_and_passes_a_synchronised_one(world, mo
 
 # ---- SLA and tenant isolation -----------------------------------------------------------------------
 
-def test_an_open_critical_alert_past_its_fifteen_minutes_is_breached(world):
+def test_an_open_critical_alert_past_its_fifteen_minutes_is_breached(world, monkeypatch):
+    monkeypatch.setenv("MEDICAL_NET_CIDRS", "10.20.0.0/16")
     sid = random.randint(2_000_000, 2_999_999)
     _, headers = _source(world, "suricata_ids")
     world.client.post("/api/ingest/suricata", json=_suricata_alert("10.20.7.7", "93.184.216.50", sid=sid),

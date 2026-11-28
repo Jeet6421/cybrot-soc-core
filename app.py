@@ -859,6 +859,7 @@ def _store_events(c, evs):
         hit = detect.evaluate(c, e)
         if hit:
             i = raise_alert(c, e["tenant"], *hit[:3], hit[3], e["ts"], e.get("attack_id"),
+                            source="suricata" if e.get("type") == "suricata_alert" else "builtin",
                             log_source_id=e.get("log_source_id"),
                             threat_category=hit[4] if len(hit) > 4 else None)
             if i:
@@ -1118,7 +1119,7 @@ def create_log_source():
     name = _text(body, "name")
     if not name or len(name) > 80:
         raise Refuse(400, "name must be 1 to 80 characters")
-    kind = _text(body, "kind", 40)
+    kind = _text(body, "kind", 40) or "custom"  # a missing kind is a custom source; an unknown one is refused
     if kind not in hospital.LOG_SOURCE_KINDS:
         raise Refuse(400, "kind must be one of: " + ", ".join(hospital.LOG_SOURCE_KINDS))
     c = db()
