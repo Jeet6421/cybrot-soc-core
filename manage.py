@@ -14,7 +14,7 @@ import argparse, getpass, hashlib, os, sys
 
 import psycopg
 
-import auth
+import auth, hospital
 
 MIGRATE_ENV = "MIGRATE_DATABASE_URL"
 
@@ -64,8 +64,11 @@ def create_log_source(conn, tenant, name, kind=""):
         raise ValueError("log source name must be 1 to 80 characters")
     if not conn.execute("SELECT 1 FROM tenants WHERE id = %s", (tenant,)).fetchone():
         raise ValueError("tenant not found")
+    kind = (kind or "").strip() or "custom"
+    if kind not in hospital.LOG_SOURCE_KINDS:
+        raise ValueError("kind must be one of: " + ", ".join(hospital.LOG_SOURCE_KINDS))
     row = conn.execute("INSERT INTO log_sources(tenant, name, kind) VALUES (%s, %s, %s) RETURNING id",
-                       (tenant, name, (kind or "").strip()[:40])).fetchone()
+                       (tenant, name, kind)).fetchone()
     return row[0]
 
 

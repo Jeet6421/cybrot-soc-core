@@ -93,6 +93,11 @@ def evaluate(db, ev):
                        (tenant, ev["ip"], _ago(ts, 5), ts)).fetchone()[0]
         if n >= 5:
             return ("FAILED_LOGIN_BURST", "high", f"{n} failed logins from {ev['ip']} in 5 min", ev["ip"])
+    elif t == "suricata_alert" and ev.get("sid") is not None:
+        # PR 16: a Suricata signature hit. The category and severity were set by hospital.normalize_suricata.
+        summary = f"{ev['signature']} from {ev['host']} to {ev['ip']}"
+        return (f"SURICATA:{ev['sid']}", ev["severity"], summary, f"{ev['host']}|{ev['ip']}|{ev['sid']}",
+                ev["threat_category"])
     elif t == "ehr_access":
         n = db.execute('SELECT COUNT(DISTINCT patient) FROM events WHERE tenant=%s AND "user"=%s AND type=\'ehr_access\' '
                        "AND ts>=%s AND ts<=%s", (tenant, ev["user"], _ago(ts, 10), ts)).fetchone()[0]

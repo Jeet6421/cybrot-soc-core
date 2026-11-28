@@ -1126,5 +1126,42 @@ GRANT EXECUTE ON FUNCTION auth_mfa_consume(bigint, bigint) TO soc_app;
 GRANT EXECUTE ON FUNCTION auth_mfa_store_pending(bigint, text) TO soc_app;
 GRANT EXECUTE ON FUNCTION auth_mfa_enable(bigint, bigint) TO soc_app;
 
+-- PR 16: clock-skew tracking per log source (CERT-In NTP check), threat categories on alerts, and the kind an ingest
+-- key's source was registered with. Ingest keys cannot read log_sources under RLS, so the reads and writes go through
+-- SECURITY DEFINER functions.
+ALTER TABLE log_sources ADD COLUMN IF NOT EXISTS skew_last_seconds DOUBLE PRECISION;
+ALTER TABLE log_sources ADD COLUMN IF NOT EXISTS skew_checked_at TIMESTAMPTZ;
+ALTER TABLE log_sources ADD COLUMN IF NOT EXISTS skew_window_start TIMESTAMPTZ;
+ALTER TABLE log_sources ADD COLUMN IF NOT EXISTS skew_window_max_seconds DOUBLE PRECISION;
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS threat_category TEXT;
+ALTER TABLE alerts DROP CONSTRAINT IF EXISTS alerts_threat_category_check;
+ALTER TABLE alerts ADD CONSTRAINT alerts_threat_category_check
+  CHECK (threat_category IS NULL OR threat_category IN ('ransomware', 'phishing', 'credential_abuse_impossible_travel', 'patient_record_snooping', 'medical_device_unexpected_egress', 'unknown_network_asset', 'tampering', 'other'));
+
+CREATE OR REPLACE FUNCTION ingest_source_kind(p_log_source_id bigint) RETURNS text
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  SELECT kind FROM log_sources WHERE id = p_log_source_id
+$$;
+
+-- Records the latest drift and the largest drift in the last 24 hours. The window restarts after 24 hours.
+CREATE OR REPLACE FUNCTION record_ingest_skew(p_log_source_id bigint, p_last double precision,
+                                             p_batch_max double precision) RETURNS void
+  LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  UPDATE log_sources SET
+    skew_last_seconds = p_last,
+    skew_checked_at = now(),
+    skew_window_max_seconds = CASE WHEN skew_window_start IS NULL OR skew_window_start < now() - interval '24 hours'
+                                   THEN p_batch_max
+                                   ELSE greatest(skew_window_max_seconds, p_batch_max) END,
+    skew_window_start = CASE WHEN skew_window_start IS NULL OR skew_window_start < now() - interval '24 hours'
+                             THEN now() ELSE skew_window_start END
+  WHERE id = p_log_source_id
+$$;
+
+REVOKE ALL ON FUNCTION ingest_source_kind(bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION record_ingest_skew(bigint, double precision, double precision) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION ingest_source_kind(bigint) TO soc_app;
+GRANT EXECUTE ON FUNCTION record_ingest_skew(bigint, double precision, double precision) TO soc_app;
+
 -- Create the partitions this database needs now (idempotent; the worker repeats it hourly).
 SELECT ensure_time_partitions();
