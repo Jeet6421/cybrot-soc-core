@@ -1,0 +1,11 @@
+# Keep secrets and local state out of the build context, so they can never be baked into an image.
+.env
+.env.*
+.git
+**/__pycache__
+*.pyc
+.pytest_cache
+*.db
+nginx/tls
+**/*.pem
+**/*.key

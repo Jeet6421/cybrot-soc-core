@@ -1,5 +1,7 @@
-FROM python:3.12-slim
+FROM python:3.12.16-slim
 WORKDIR /app
+# Read-only root filesystems are used at runtime, so do not write .pyc files into the image or the mounts.
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .

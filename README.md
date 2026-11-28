@@ -18,12 +18,38 @@ This version follows the internal test plan in the prototype plan document: the 
     python generate.py            # or push synthetic logs with a hospital's ingest key
 
 ## Run with Docker
-    docker compose up -d --build  # http://localhost:5000
+    docker compose up -d --build  # https://localhost (after the TLS setup below)
     # Settings are read from a .env file next to docker-compose.yml. Never commit .env.
-    # Three services: db (PostgreSQL), migrate (runs once as the owner, then exits), soc-core (runs as soc_app).
-    # .env must set POSTGRES_PASSWORD (letters and digits only, so it fits in the connection URL).
-    # The database runs in its own container with a named volume (pg-data) and is not published to the host.
-    # The Docker build runs in GitHub Actions on every push (see .github/workflows/tests.yml).
+    # Services: db (PostgreSQL), migrate (runs once as the owner, then exits), soc-core (runs as soc_app),
+    # worker (response jobs) and nginx (the only published service: HTTPS on 443, HTTP on 80 redirects to HTTPS).
+    # .env must set POSTGRES_PASSWORD and SOC_APP_PASSWORD (letters and digits only, so they fit in the connection URLs).
+    # The database has a named volume (pg-data) and is not published to the host.
+    # Networks: soc_internal is internal (no route to the host or the internet) and carries db, migrate, soc-core and
+    # worker. soc_edge is the only network with a route in and out, and nginx is the only service on it.
+    # Images are pinned (postgres:16.16, nginx:1.28.2-alpine, python:3.12.16-slim). Bump them deliberately, with a test run.
+    # The Docker build and `docker compose config` run in GitHub Actions on every push (see .github/workflows/tests.yml).
+
+### TLS for the edge (local or VM)
+nginx reads the certificate and key from `nginx/tls/` (git-ignored). Put two files there:
+`fullchain.pem` (certificate chain) and `privkey.pem` (private key). The key must be readable by the nginx user
+(uid 101 in the image), so set its owner and mode on the host:
+
+    mkdir -p nginx/tls
+    # Local test only: a self-signed certificate. Browsers and curl will warn; use curl -k.
+    openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=localhost" \
+      -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+      -keyout nginx/tls/privkey.pem -out nginx/tls/fullchain.pem
+    # On a VM: use a certificate from your CA or Let's Encrypt (copy its fullchain and key here) instead.
+    sudo chown 0:101 nginx/tls/privkey.pem && sudo chmod 0640 nginx/tls/privkey.pem
+    docker compose up -d --build
+
+Edge settings are in `nginx/default.conf`: TLS 1.2 and 1.3 only, HSTS, `X-Content-Type-Options`, `X-Frame-Options: DENY`,
+a Content-Security-Policy, a 1 MB request body limit (the app's own default), and `server_tokens off`.
+The CSP allows `'unsafe-inline'` scripts and styles because `static/index.html` uses inline handlers. Remove that once the
+page moves to external files. The app trusts exactly one proxy hop (`ProxyFix`), so per-source login limits see the
+real client address. Do not publish the app or the database on any other port.
+
+Wazuh and other senders: point them at `https://<host>/api/ingest/wazuh` (or `/api/events`). Use a certificate they trust.
 
 ## Configuration
 | Variable | Default | Purpose |
@@ -62,7 +88,7 @@ This version follows the internal test plan in the prototype plan document: the 
 Tests need a PostgreSQL server. Each test session creates its own database, migrates it as the owner, and drops it
 at the end, so the tests never touch your data. Access checks connect as `soc_app`, never as the owner.
 
-    pip install -r requirements.txt pytest
+    pip install -r requirements.txt pytest pyyaml
     TEST_ADMIN_URL=postgresql://soc:soc@localhost:5432/postgres pytest -q tests   # defaults shown
     # optional: TEST_APP_PASSWORD (the soc_app password the tests use; a fixed default is set)
 
@@ -146,6 +172,7 @@ trend (test plan step 4) can be tracked.
 
 ## Layout
 - `docs/STORAGE.md`  Partitions, 180-day retention, idempotent ingest, rate limits, backup and PITR, the recovery drill, Kafka triggers
+- `nginx/nginx.conf` and `nginx/default.conf`  TLS edge: HTTPS, security headers, body limit (certificates go in `nginx/tls/`, git-ignored)
 - `routes/mfa.py`  TOTP enrolment endpoints (`/api/mfa/setup`, `/api/mfa/verify`), registered as a blueprint in `app.py`
 - `scripts/partition_migrate.py` one-time conversion of an existing database to partitioned tables (owner role)
 - `scripts/recovery_drill.py` snapshot and verify a restored database (owner, then runtime role)
@@ -343,6 +370,14 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 - The dashboard shows each alert's latest handoff under the summary ("Handoff: analyst2 -> analyst1: note").
   Before this, a handoff note was saved in the history only, and the row showed only the closing note.
 - `GET /api/alerts` adds a `last_handoff` field (null when the alert was never handed off).
+
+**PR 15: container and edge hardening (OWASP Docker Cheat Sheet)**
+- Compose networks: `soc_internal` is `internal: true` and carries db, migrate, soc-core and worker. `soc_edge` carries nginx only.
+- nginx is the only published service: HTTPS (443) and an HTTP redirect (80). The app and database publish no ports.
+- Pinned images: `postgres:16.16`, `nginx:1.28.2-alpine`, `python:3.12.16-slim`. Read-only root filesystems, `cap_drop: ALL` and `no-new-privileges` on every app and edge service.
+- `app.py` trusts one proxy hop (`ProxyFix`) so the per-source login limit from PR 14 sees real client addresses.
+- `.dockerignore` keeps `.env` and TLS keys out of the build context. `tests/test_container_hardening.py` fails on `latest` tags, privileged services, the Docker socket, a root app user, or an externally routed database network.
+- Tests: `tests/test_container_hardening.py`. CI runs `docker compose config`.
 
 **PR 14: TOTP MFA, login rate limits and account lockout**
 - TOTP secrets are encrypted with `SOC_SECRET_KEY`. `POST /api/mfa/setup` returns a secret and an `otpauth://` URI once; `POST /api/mfa/verify` turns MFA on after a valid code.

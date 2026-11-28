@@ -27,7 +27,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r requirements.txt pytest
+      - run: pip install -r requirements.txt pytest pyyaml
       - run: pytest -q tests
 
   docker-build:
@@ -35,3 +35,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t soc-core-ci .
+      - run: POSTGRES_PASSWORD=ci-postgres SOC_APP_PASSWORD=ci-app docker compose config -q
+      - run: docker compose -f docker-compose.yml config --images
