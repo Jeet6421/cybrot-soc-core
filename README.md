@@ -39,6 +39,12 @@ This version follows the internal test plan in the prototype plan document: the 
 | `FP_TARGET` | not set | The false-positive ceiling the team agrees, as a fraction (e.g. `0.10`). Until set, the Review gate is `not_measured`. See [Detection quality](#detection-quality-fp_target). |
 | `MIN_LABEL_COVERAGE` | `0.80` | A rule and log source group is judged against `FP_TARGET` only when at least this share of its alerts carry a decisive verdict |
 | `MIN_LABELED_SAMPLE` | `30` | ...and only when it has at least this many decisive verdicts |
+| `RETENTION_DAYS` | `180` | Days of events and audit history kept (whole monthly partitions are dropped after this). Values below 180 stop the app from starting (CERT-In). See docs/STORAGE.md |
+| `INGEST_EVENTS_PER_MINUTE` | `60000` | Events per hospital log source per minute. Over the limit: `429` with `Retry-After` |
+| `INGEST_BYTES_PER_MINUTE` | `60000000` | Payload bytes per hospital log source per minute |
+| `INGEST_MAX_BATCH` | `1000` | Events in one ingest request (`413` above) |
+| `INGEST_MAX_BODY_BYTES` | `1000000` | Request body size (`413` above) |
+| `STORAGE_MAINTENANCE_SECONDS` | `3600` | How often the worker creates upcoming partitions and drops expired ones |
 | `WORKER_POLL_SECONDS` | `5` | Seconds the response worker waits when the queue is empty (`worker.py`) |
 | `WORKER_LEASE_SECONDS` | `120` | How long a worker holds a job. If it crashes, the job is retried after this lease expires |
 | `WORKER_BATCH` | `10` | Jobs a worker claims per pass |
@@ -136,6 +142,9 @@ alerts are missing from the count.
 trend (test plan step 4) can be tracked.
 
 ## Layout
+- `docs/STORAGE.md`  Partitions, 180-day retention, idempotent ingest, rate limits, backup and PITR, the recovery drill, Kafka triggers
+- `scripts/partition_migrate.py` one-time conversion of an existing database to partitioned tables (owner role)
+- `scripts/recovery_drill.py` snapshot and verify a restored database (owner, then runtime role)
 - `docs/RUNBOOKS.md`  Operating procedures: 100-bed onboarding, intra-tenant handoffs, vendor break-glass, hospital offboarding
 - `playbooks.py` server-side playbook allowlist (digest-pinned), target validation, tenant id rules
 - `ansible_runner.py` Ansible executor: per-job workspace, one host, shredded in `finally`
@@ -330,6 +339,15 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 - The dashboard shows each alert's latest handoff under the summary ("Handoff: analyst2 -> analyst1: note").
   Before this, a handoff note was saved in the history only, and the row showed only the closing note.
 - `GET /api/alerts` adds a `last_handoff` field (null when the alert was never handed off).
+
+**PR 13: PostgreSQL boundaries, 180-day retention and the recovery drill (`docs/STORAGE.md`)**
+- `events` and `audit_events` are monthly range partitions on `occurred_at`. Retention drops whole partitions older than `RETENTION_DAYS` (default and minimum 180), never individual rows.
+- Idempotent ingest: an event is stored once, keyed by its `source_event_id` or a SHA-256 of its canonical payload. `POST /api/events` now reports `stored` and `duplicates`.
+- Per (tenant, log source) minute quotas for events and bytes, with `429` and `Retry-After`. A noisy source cannot use another hospital's quota. Batch and body caps return `413`. Events outside the retention window return `400`.
+- The worker creates and drops partitions hourly. `scripts/partition_migrate.py` converts an existing database once, in one transaction.
+- `scripts/recovery_drill.py` snapshots a database and verifies a restored copy: counts, RLS, constraints, partitions, audit triggers and tenant isolation as the runtime role.
+- Kafka is deferred. `docs/STORAGE.md` lists the triggers to measure first.
+- Tests: `tests/test_ingest_limits.py`, `tests/test_idempotent_ingest.py`, `tests/test_retention.py`, `tests/test_recovery_drill.py`.
 
 **PR 12: detection quality and SOC visibility**
 - Standard verdicts: `true_positive_malicious`, `true_positive_benign`, `false_positive`, `inconclusive`, and unlabeled (no verdict). Legacy `tp`/`fp`/`unclear` are migrated once and no longer accepted.

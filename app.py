@@ -85,6 +85,92 @@ SAFE_ALERT_FIELDS = ("id", "created", "event_ts", "tenant", "rule", "rule_versio
 app = Flask(__name__, static_folder="static")
 
 
+def _int_setting(name, default):
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+# CERT-In Directions (2022) require logs and records to be kept for at least 180 days. Lower values are refused.
+RETENTION_DAYS = _int_setting("RETENTION_DAYS", 180)
+if RETENTION_DAYS < 180:
+    raise RuntimeError("RETENTION_DAYS must be at least 180 (CERT-In Directions 2022)")
+app.config["MAX_CONTENT_LENGTH"] = _int_setting("INGEST_MAX_BODY_BYTES", 1_000_000)
+
+
+def _ingest_limits():
+    """Quotas per (tenant, log source) per minute, and the largest batch. Read on each request."""
+    return {"events": _int_setting("INGEST_EVENTS_PER_MINUTE", 60000),
+            "bytes": _int_setting("INGEST_BYTES_PER_MINUTE", 60_000_000),
+            "max_batch": _int_setting("INGEST_MAX_BATCH", 1000)}
+
+
+class RateLimited(Exception):
+    def __init__(self, retry_after):
+        super().__init__("ingest rate limit reached")
+        self.retry_after = retry_after
+
+
+@app.errorhandler(RateLimited)
+def _rate_limited(e):
+    response = jsonify(error="ingest rate limit reached for this log source; retry after the window",
+                       retry_after=e.retry_after)
+    response.status_code = 429
+    response.headers["Retry-After"] = str(e.retry_after)
+    return response
+
+
+@app.errorhandler(413)
+def _body_too_large(_e):
+    return jsonify(error="request body is too large"), 413
+
+
+def _spend_ingest_quota(c, tenant, log_source_id, events, payload_bytes, limits):
+    """Charge one request to its (tenant, log source) minute window in one atomic statement. A refused request writes
+    nothing, so a noisy source cannot use up another hospital's quota."""
+    retry_after = max(1, 60 - datetime.now(timezone.utc).second)
+    if events > limits["events"] or payload_bytes > limits["bytes"]:
+        raise RateLimited(retry_after)
+    row = c.execute(
+        "INSERT INTO ingest_rate(tenant_id, log_source_id, window_start, events, payload_bytes) "
+        "VALUES (%(t)s, %(s)s, date_trunc('minute', now()), %(e)s, %(b)s) "
+        "ON CONFLICT (tenant_id, log_source_id, window_start) DO UPDATE SET "
+        "events = ingest_rate.events + EXCLUDED.events, "
+        "payload_bytes = ingest_rate.payload_bytes + EXCLUDED.payload_bytes "
+        "WHERE ingest_rate.events + EXCLUDED.events <= %(max_e)s "
+        "AND ingest_rate.payload_bytes + EXCLUDED.payload_bytes <= %(max_b)s "
+        "RETURNING events",
+        {"t": tenant, "s": log_source_id or 0, "e": events, "b": payload_bytes,
+         "max_e": limits["events"], "max_b": limits["bytes"]}).fetchone()
+    if row is None:
+        raise RateLimited(retry_after)
+
+
+def _occurred_at(ts):
+    """The event's own time as an aware UTC datetime. A time with no zone is read as UTC."""
+    if not isinstance(ts, str) or not ts.strip():
+        raise Refuse(400, "each event needs a ts in ISO 8601 form")
+    try:
+        parsed = datetime.fromisoformat(ts.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise Refuse(400, "ts must be an ISO 8601 date and time")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _dedupe_key(e):
+    """Identity of an event for idempotent ingest: the sender's source event id when it has one, otherwise a SHA-256
+    of the canonical payload. Server-assigned fields are excluded, so a replay gets the same key."""
+    source_id = e.get("source_event_id")
+    if isinstance(source_id, str) and source_id.strip():
+        return "id:" + source_id.strip()[:200]
+    payload = {k: v for k, v in e.items() if k not in ("tenant", "log_source_id", "occurred_at", "dedupe_key")}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def endpoint_allows(method, route, identity):
     allowed = ROUTE_ROLES.get((method, route))
     if not allowed or not identity:
@@ -727,52 +813,77 @@ def _alert_or_404(i):
 # ---- Events ingest ------------------------------------------------------------------------------
 
 def _store_events(c, evs):
-    """Store events and run the detection rules. Returns the new alert ids. The caller commits."""
-    made_ids = []
+    """Store new events, skip identical ones, and run the detection rules on what was stored.
+    Returns (alert ids, stored count, duplicate count). The caller commits."""
+    made_ids, stored, duplicates = [], 0, 0
     for e in sorted(evs, key=lambda x: x["ts"]):
+        e.setdefault("occurred_at", _occurred_at(e["ts"]))
+        e.setdefault("dedupe_key", _dedupe_key(e))
         e.setdefault("attack_id", None)
         for k in ("user", "host", "ip", "patient", "detail", "source"):
             e.setdefault(k, "")
         for k in ("destination", "data_classification", "destination_approved", "src_zone", "dst_zone",
                   "boundary_violation", "approved_change", "log_source_id"):
             e.setdefault(k, None)
-        c.execute('INSERT INTO events(ts,tenant,source,type,"user",host,ip,patient,detail,attack_id, '
-                  'destination,data_classification,destination_approved,src_zone,dst_zone,boundary_violation,approved_change,log_source_id) '
-                  "VALUES(%(ts)s,%(tenant)s,%(source)s,%(type)s,%(user)s,%(host)s,%(ip)s,%(patient)s,%(detail)s,%(attack_id)s, "
-                  "%(destination)s,%(data_classification)s,%(destination_approved)s,%(src_zone)s,%(dst_zone)s,%(boundary_violation)s,%(approved_change)s,%(log_source_id)s)", e)
+        row = c.execute('INSERT INTO events(ts,tenant,source,type,"user",host,ip,patient,detail,attack_id, '
+                        'destination,data_classification,destination_approved,src_zone,dst_zone,boundary_violation,approved_change,log_source_id,'
+                        'occurred_at,dedupe_key) '
+                        "VALUES(%(ts)s,%(tenant)s,%(source)s,%(type)s,%(user)s,%(host)s,%(ip)s,%(patient)s,%(detail)s,%(attack_id)s, "
+                        "%(destination)s,%(data_classification)s,%(destination_approved)s,%(src_zone)s,%(dst_zone)s,%(boundary_violation)s,%(approved_change)s,%(log_source_id)s,"
+                        "%(occurred_at)s,%(dedupe_key)s) "
+                        "ON CONFLICT (tenant, (COALESCE(log_source_id, 0)), dedupe_key, occurred_at) DO NOTHING RETURNING id",
+                        e).fetchone()
+        if row is None:
+            duplicates += 1  # the same event was already stored: no second row and no second alert
+            continue
+        stored += 1
         hit = detect.evaluate(c, e)
         if hit:
             i = raise_alert(c, e["tenant"], *hit[:3], hit[3], e["ts"], e["attack_id"],
                             log_source_id=e.get("log_source_id"))
             if i:
                 made_ids.append(i)
-    return made_ids
+    return made_ids, stored, duplicates
 
 
 @app.post("/api/events")
 def ingest():
     ident = _require_ingest()
+    raw_bytes = len(request.get_data(cache=True))
     body = request.get_json(force=True)
     evs = body if isinstance(body, list) else [body]
+    limits = _ingest_limits()
+    if len(evs) > limits["max_batch"]:
+        raise Refuse(413, f"send at most {limits['max_batch']} events per request")
+    now_utc = datetime.now(timezone.utc)
     for e in evs:
         if not isinstance(e, dict):
             raise Refuse(400, "each event must be a JSON object")
         # An ingest key is bound to one hospital and one log source. Events for any other hospital are refused.
         if e.get("tenant") not in (None, "", ident["tenant"]):
             raise Refuse(403, "event tenant does not match this ingest key")
+        occurred = _occurred_at(e.get("ts"))
+        if occurred < now_utc - timedelta(days=RETENTION_DAYS):
+            raise Refuse(400, f"event is older than the {RETENTION_DAYS}-day retention window")
+        if occurred > now_utc + timedelta(days=1):
+            raise Refuse(400, "event time is more than a day in the future")
         e["tenant"] = ident["tenant"]
         e["log_source_id"] = ident["log_source_id"]
+        e["occurred_at"] = occurred
     c = db()
-    made_ids = _store_events(c, evs)
+    _spend_ingest_quota(c, ident["tenant"], ident["log_source_id"], len(evs), raw_bytes, limits)
+    made_ids, stored, duplicates = _store_events(c, evs)
     _record_current_audit(
         c, action="event.ingest", resource_type="event_batch", resource_id=None,
-        resource_classification="telemetry", metadata={"record_count": len(evs), "alerts_created": len(made_ids)})
+        resource_classification="telemetry",
+        metadata={"record_count": len(evs), "stored": stored, "duplicates": duplicates,
+                  "alerts_created": len(made_ids)})
     for alert_id in made_ids:
         _record_current_audit(
             c, action="alert.create", resource_type="alert", resource_id=alert_id,
             resource_classification="telemetry", metadata={"status": "new"})
     commit()
-    return jsonify(events=len(evs), alerts_created=len(made_ids))
+    return jsonify(events=len(evs), stored=stored, duplicates=duplicates, alerts_created=len(made_ids))
 
 
 @app.get("/api/events")
@@ -814,6 +925,8 @@ def list_events():
 def ingest_wazuh():
     """Accepts a Wazuh integration (webhook) alert and drops it in the same triage queue."""
     ident = _require_ingest()
+    _spend_ingest_quota(db(), ident["tenant"], ident["log_source_id"], 1,
+                        len(request.get_data(cache=True)), _ingest_limits())
     a = request.get_json(force=True)
     rule = a.get("rule") or {}
     rid = str(rule.get("id", "0"))
@@ -1904,7 +2017,7 @@ def demo():
     evs = generated if isinstance(generated, list) else [generated]
     c = _lab_connection()
     try:
-        made_ids = _store_events(c, evs)
+        made_ids, _, _ = _store_events(c, evs)
         c.commit()
     finally:
         c.close()

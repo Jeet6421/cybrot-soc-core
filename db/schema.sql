@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS audit_log(id BIGSERIAL PRIMARY KEY, at TIMESTAMPTZ NO
 -- Append-only, tenant-scoped evidence for authenticated actions. Free-form clinical or credential
 -- content must never be placed in metadata; app.py applies a strict metadata allowlist before insert.
 CREATE TABLE IF NOT EXISTS audit_events(
-  audit_id BIGSERIAL PRIMARY KEY,
+  audit_id BIGSERIAL,
   occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   tenant_id TEXT NOT NULL REFERENCES tenants(id),
   actor_id BIGINT,
@@ -91,8 +91,9 @@ CREATE TABLE IF NOT EXISTS audit_events(
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata) = 'object'),
   request_id TEXT NOT NULL,
   source_ip TEXT,
-  device_id TEXT
-);
+  device_id TEXT,
+  PRIMARY KEY (audit_id, occurred_at)
+) PARTITION BY RANGE (occurred_at);
 CREATE INDEX IF NOT EXISTS audit_events_tenant_time_idx ON audit_events(tenant_id, occurred_at DESC, audit_id DESC);
 CREATE INDEX IF NOT EXISTS audit_events_request_id_idx ON audit_events(request_id);
 
@@ -158,12 +159,19 @@ BEGIN
   END IF;
 END $grant_scope_constraint$;
 
-CREATE TABLE IF NOT EXISTS events(id BIGSERIAL PRIMARY KEY, ts TEXT, tenant TEXT, source TEXT, type TEXT,
+CREATE TABLE IF NOT EXISTS events(id BIGSERIAL, ts TEXT, tenant TEXT, source TEXT, type TEXT,
   "user" TEXT, host TEXT, ip TEXT, patient TEXT, detail TEXT, attack_id TEXT,
   destination TEXT, data_classification TEXT, destination_approved BOOLEAN,
-  src_zone TEXT, dst_zone TEXT, boundary_violation BOOLEAN, approved_change BOOLEAN);
+  src_zone TEXT, dst_zone TEXT, boundary_violation BOOLEAN, approved_change BOOLEAN,
+  log_source_id BIGINT, occurred_at TIMESTAMPTZ NOT NULL, dedupe_key TEXT,
+  PRIMARY KEY (id, occurred_at)) PARTITION BY RANGE (occurred_at);
 CREATE INDEX IF NOT EXISTS ev_idx ON events(tenant, type, ts);
 CREATE INDEX IF NOT EXISTS ev_host_type_idx ON events(tenant, host, type, ts);
+-- PR 13: an identical event (same source id, or same canonical payload) is stored once. The partition key is part of
+-- the index, so a replay of the same event (same occurred_at) always lands in the same partition and conflicts there.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS occurred_at TIMESTAMPTZ;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS events_dedupe_uidx ON events(tenant, (COALESCE(log_source_id, 0)), dedupe_key, occurred_at);
 ALTER TABLE events ADD COLUMN IF NOT EXISTS destination TEXT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS data_classification TEXT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS destination_approved BOOLEAN;
@@ -722,6 +730,7 @@ BEGIN
   DELETE FROM assets WHERE tenant_id = p_tenant;
   DELETE FROM ingest_keys WHERE tenant = p_tenant;
   DELETE FROM log_sources WHERE tenant = p_tenant;
+  DELETE FROM ingest_rate WHERE tenant_id = p_tenant;
   DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE tenant = p_tenant);
   UPDATE users SET username = 'purged-' || id::text, email = 'purged+' || id::text || '@invalid.local',
     is_active = FALSE, status = 'disabled', token_version = token_version + 1, password_hash = 'purged'
@@ -901,3 +910,104 @@ REVOKE ALL ON FUNCTION resolve_job_target(bigint) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION claim_response_jobs(text, integer, integer) TO soc_app;
 GRANT EXECUTE ON FUNCTION finish_response_job(bigint, text, text, jsonb, text, integer) TO soc_app;
 GRANT EXECUTE ON FUNCTION resolve_job_target(bigint) TO soc_app;
+
+-- ---- PR 13: time partitions, 180-day retention, ingest rate windows -----------------------------------------------
+-- events and audit_events are monthly range partitions on occurred_at. Retention never deletes rows: it drops whole
+-- partitions once they end before the cutoff, so every row newer than the cutoff is kept. CERT-In Directions 2022
+-- require logs to be kept at least 180 days. The retention floor below is enforced in the database too.
+CREATE TABLE IF NOT EXISTS partition_catalog(
+  parent TEXT NOT NULL CHECK (parent IN ('events', 'audit_events')),
+  partition_name TEXT PRIMARY KEY,
+  range_start TIMESTAMPTZ NOT NULL,
+  range_end TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  dropped_at TIMESTAMPTZ,
+  dropped_rows BIGINT);
+
+-- Creates monthly partitions from the start of the retention window (or from p_from when earlier) through two months
+-- ahead. Idempotent. Skips a parent that is not partitioned yet (a legacy database; see scripts/partition_migrate.py).
+CREATE OR REPLACE FUNCTION ensure_time_partitions(p_from timestamptz DEFAULT NULL) RETURNS integer
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public SET timezone = 'UTC' AS $$
+DECLARE
+  parent text;
+  m timestamptz;
+  first_m timestamptz := date_trunc('month', now() - interval '200 days');
+  last_m timestamptz := date_trunc('month', now()) + interval '3 months';
+  pname text;
+  made integer := 0;
+BEGIN
+  IF p_from IS NOT NULL AND date_trunc('month', p_from) < first_m THEN
+    first_m := date_trunc('month', p_from);
+  END IF;
+  FOREACH parent IN ARRAY ARRAY['events', 'audit_events'] LOOP
+    IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = parent AND relkind = 'p') THEN
+      RAISE NOTICE 'skipping partitions for %: the table is not partitioned yet', parent;
+      CONTINUE;
+    END IF;
+    m := first_m;
+    WHILE m < last_m LOOP
+      pname := parent || '_p' || to_char(m, 'YYYYMM');
+      IF to_regclass('public.' || pname) IS NULL THEN
+        EXECUTE format('CREATE TABLE public.%I PARTITION OF public.%I FOR VALUES FROM (%L) TO (%L)',
+                       pname, parent, m, m + interval '1 month');
+        INSERT INTO partition_catalog(parent, partition_name, range_start, range_end)
+          VALUES (parent, pname, m, m + interval '1 month') ON CONFLICT (partition_name) DO NOTHING;
+        made := made + 1;
+      END IF;
+      m := m + interval '1 month';
+    END LOOP;
+  END LOOP;
+  RETURN made;
+END $$;
+
+-- Drops every catalogued partition that ends at or before now() - p_retention_days, and prunes ingest rate windows
+-- older than two days. Refuses any retention below 180 days. Returns each dropped partition and its row count.
+CREATE OR REPLACE FUNCTION drop_expired_partitions(p_retention_days integer DEFAULT 180)
+  RETURNS TABLE(partition_name text, rows_dropped bigint)
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public SET timezone = 'UTC' AS $$
+DECLARE
+  r record;
+  n bigint;
+  cutoff timestamptz;
+BEGIN
+  IF p_retention_days IS NULL OR p_retention_days < 180 THEN
+    RAISE EXCEPTION 'retention must be at least 180 days (CERT-In)' USING ERRCODE = '22023';
+  END IF;
+  cutoff := now() - make_interval(days => p_retention_days);
+  FOR r IN SELECT c.partition_name AS pname, c.range_end FROM partition_catalog c
+           WHERE c.dropped_at IS NULL AND c.range_end <= cutoff ORDER BY c.range_end LOOP
+    EXECUTE format('SELECT count(*) FROM public.%I', r.pname) INTO n;
+    EXECUTE format('DROP TABLE public.%I', r.pname);
+    UPDATE partition_catalog c SET dropped_at = now(), dropped_rows = n WHERE c.partition_name = r.pname;
+    partition_name := r.pname;
+    rows_dropped := n;
+    RETURN NEXT;
+  END LOOP;
+  DELETE FROM ingest_rate WHERE window_start < now() - interval '2 days';
+  RETURN;
+END $$;
+
+-- Ingest quota per (tenant, log source) and minute. Written by the app in the same transaction as the ingest, so one
+-- noisy source cannot use another hospital's quota. The row lock is per window.
+CREATE TABLE IF NOT EXISTS ingest_rate(
+  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  log_source_id BIGINT NOT NULL DEFAULT 0,
+  window_start TIMESTAMPTZ NOT NULL,
+  events BIGINT NOT NULL DEFAULT 0 CHECK (events >= 0),
+  payload_bytes BIGINT NOT NULL DEFAULT 0 CHECK (payload_bytes >= 0),
+  PRIMARY KEY (tenant_id, log_source_id, window_start));
+ALTER TABLE ingest_rate ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ingest_rate FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS ingest_rate_tenant ON ingest_rate;
+CREATE POLICY ingest_rate_tenant ON ingest_rate FOR ALL
+  USING (tenant_id = app_tenant()) WITH CHECK (tenant_id = app_tenant());
+
+REVOKE ALL ON ingest_rate FROM PUBLIC;
+GRANT SELECT, INSERT, UPDATE ON ingest_rate TO soc_app;
+REVOKE ALL ON FUNCTION ensure_time_partitions(timestamptz) FROM PUBLIC;
+REVOKE ALL ON FUNCTION drop_expired_partitions(integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION ensure_time_partitions(timestamptz) TO soc_app;
+GRANT EXECUTE ON FUNCTION drop_expired_partitions(integer) TO soc_app;
+
+-- Create the partitions this database needs now (idempotent; the worker repeats it hourly).
+SELECT ensure_time_partitions();
