@@ -44,6 +44,9 @@ This version follows the internal test plan in the prototype plan document: the 
 | `INGEST_BYTES_PER_MINUTE` | `60000000` | Payload bytes per hospital log source per minute |
 | `INGEST_MAX_BATCH` | `1000` | Events in one ingest request (`413` above) |
 | `INGEST_MAX_BODY_BYTES` | `1000000` | Request body size (`413` above) |
+| `SOC_SECRET_KEY` | (unset) | Encrypts TOTP secrets at rest. Required for MFA: without it, MFA setup and sign-in with MFA fail closed (`503`) |
+| `SOC_REQUIRE_PRIVILEGED_MFA` | `0` | `1`: `hospital_admin`, `l2` and `vendor_admin` must enrol MFA. Until they do, they can only reach the enrolment routes, sign-out and `/api/me` |
+| `SOC_LOGIN_RATE_LIMIT` | `20` | Sign-in attempts per (source address, tenant, username) per 15 minutes. Over the limit: `429` with `Retry-After` |
 | `STORAGE_MAINTENANCE_SECONDS` | `3600` | How often the worker creates upcoming partitions and drops expired ones |
 | `WORKER_POLL_SECONDS` | `5` | Seconds the response worker waits when the queue is empty (`worker.py`) |
 | `WORKER_LEASE_SECONDS` | `120` | How long a worker holds a job. If it crashes, the job is retried after this lease expires |
@@ -143,6 +146,7 @@ trend (test plan step 4) can be tracked.
 
 ## Layout
 - `docs/STORAGE.md`  Partitions, 180-day retention, idempotent ingest, rate limits, backup and PITR, the recovery drill, Kafka triggers
+- `routes/mfa.py`  TOTP enrolment endpoints (`/api/mfa/setup`, `/api/mfa/verify`), registered as a blueprint in `app.py`
 - `scripts/partition_migrate.py` one-time conversion of an existing database to partitioned tables (owner role)
 - `scripts/recovery_drill.py` snapshot and verify a restored database (owner, then runtime role)
 - `docs/RUNBOOKS.md`  Operating procedures: 100-bed onboarding, intra-tenant handoffs, vendor break-glass, hospital offboarding
@@ -339,6 +343,14 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 - The dashboard shows each alert's latest handoff under the summary ("Handoff: analyst2 -> analyst1: note").
   Before this, a handoff note was saved in the history only, and the row showed only the closing note.
 - `GET /api/alerts` adds a `last_handoff` field (null when the alert was never handed off).
+
+**PR 14: TOTP MFA, login rate limits and account lockout**
+- TOTP secrets are encrypted with `SOC_SECRET_KEY`. `POST /api/mfa/setup` returns a secret and an `otpauth://` URI once; `POST /api/mfa/verify` turns MFA on after a valid code.
+- When MFA is on, `POST /api/login` requires `totp_code`. A code works once: the time step is recorded atomically, so a replay fails.
+- Five consecutive failures lock the account for 15 minutes (`423` while locked, after the right password). Failures and lockouts are written to `audit_events` with `priority: high`.
+- Sign-in attempts are rate-limited per (source address, tenant, username). Every failure gives the same message, so a caller cannot tell which factor was wrong.
+- `SOC_REQUIRE_PRIVILEGED_MFA=1` confines unenrolled privileged accounts to enrolment, sign-out and `/api/me`.
+- Tests: `tests/test_mfa_lockout.py`.
 
 **PR 13: PostgreSQL boundaries, 180-day retention and the recovery drill (`docs/STORAGE.md`)**
 - `events` and `audit_events` are monthly range partitions on `occurred_at`. Retention drops whole partitions older than `RETENTION_DAYS` (default and minimum 180), never individual rows.
