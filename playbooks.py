@@ -28,6 +28,11 @@ class Playbook:
     target: str      # host | ip | account
     file: str        # path under ansible/playbooks/
     sha256: str      # pinned digest of the approved file
+    # medical_safe: a disruptive action that SOC Core still allows on medical equipment because it cannot interrupt
+    # the device (egress filtering only). Every other disruptive action is refused there (IEC 80001).
+    medical_safe: bool = False
+    # features: service-tier features the action needs (see tiers.py). A read_only snapshot needs none.
+    features: tuple = ("automated_containment",)
 
 
 ALLOWLIST = {
@@ -40,7 +45,31 @@ ALLOWLIST = {
     "block_ip": Playbook("block_ip", "contain.block_ip", "1.0.0", "disruptive", "ip",
                          "contain/block_ip.yml",
                          "3467af64855eabee15cd5e8b4fa28520ae961d52af1338cc81834a2e701f4ed6"),
+    # PR 17: the five core Indian hospital scenarios. Ransomware workstation -> isolate_host; phishing or a stolen
+    # account -> disable_account; patient data leak or snooping -> revoke_sessions; a medical device talking out
+    # -> medical_device_block_egress (block_ip covers other addresses); enrichment -> collect_triage_snapshot.
+    "revoke_sessions": Playbook("revoke_sessions", "contain.revoke_sessions", "1.0.0", "disruptive", "account",
+                                "contain/revoke_sessions.yml",
+                                "57533f1176d0a732b8ad15972c652a25311dc1c58d44b5986bf400a9a538977f"),
+    "medical_device_block_egress": Playbook(
+        "medical_device_block_egress", "contain.medical_device_block_egress", "1.0.0", "disruptive", "host",
+        "contain/medical_device_block_egress.yml",
+        "0773bc54abd98618131575a314820f168ba16d78f176b66c9019581ad1628643",
+        medical_safe=True, features=("automated_containment", "medical_device_containment")),
+    "collect_triage_snapshot": Playbook(
+        "collect_triage_snapshot", "contain.collect_triage_snapshot", "1.0.0", "read_only", "host",
+        "contain/collect_triage_snapshot.yml",
+        "41a6525b8b41b5f8ea8f55f6f2505a04d2e1baba38b49638b32cd740b957b051", features=()),
 }
+
+# Actions whose target must be an inventoried asset of the hospital (they name a host or device).
+def targets_asset(pb):
+    return pb.target == "host"
+
+
+def blocked_on_medical(pb):
+    """True when this playbook must be refused on medical equipment: disruptive and not egress-only."""
+    return pb.tier == "disruptive" and not pb.medical_safe
 
 
 class TargetRefused(ValueError):

@@ -17,7 +17,7 @@ import psycopg
 from flask import Flask, g, request, jsonify, send_from_directory
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-import auth, detect, generate, hospital
+import auth, detect, generate, hospital, tiers
 
 # Runtime connection, as the soc_app role (never the owner). Read at call time.
 ANALYSTS = os.environ.get("ANALYSTS", "analyst1,analyst2,analyst3").split(",")
@@ -79,6 +79,9 @@ ROUTE_ROLES = {
     ("GET", "/api/exit-criteria"): set(HOSPITAL_READ) | {"vendor_admin"},
     ("GET", "/api/detection-quality"): set(HOSPITAL_READ) | {"vendor_admin"},
     ("GET", "/api/soc-visibility"): set(HOSPITAL_READ) | {"vendor_admin"},
+    ("GET", "/api/executive-summary"): {"hospital_admin", "viewer", "vendor_admin"},
+    ("GET", "/api/service-tier"): set(HOSPITAL_READ),
+    ("PUT", "/api/tenants/<tid>/service"): {"vendor_admin"},
     ("POST", "/api/demo"): {"vendor_admin"},
     ("POST", "/api/autolabel"): {"vendor_admin"},
     ("POST", "/api/reset"): {"vendor_admin"},
@@ -387,13 +390,17 @@ def redact_audit_metadata(metadata):
         safe["response_action"] = action
     if metadata.get("job_status") in _JOB_STATUSES:
         safe["job_status"] = metadata["job_status"]
+    if metadata.get("service_tier") in tiers.SERVICE_TIERS:
+        safe["service_tier"] = metadata["service_tier"]
+    if metadata.get("feature") in tiers.FEATURE_MIN_TIER:
+        safe["feature"] = metadata["feature"]
     if metadata.get("risk_tier") in ("read_only", "disruptive"):
         safe["risk_tier"] = metadata["risk_tier"]
     for key in ("playbook_id", "playbook_version"):
         value = metadata.get(key)
         if isinstance(value, str) and re.fullmatch(r"[a-z0-9_.-]{1,40}", value):
             safe[key] = value
-    for key in ("record_count", "alerts_created", "credential_id",
+    for key in ("record_count", "retention_days", "alerts_created", "credential_id",
                 "previous_credential_id", "new_credential_id", "log_source_id", "overlap_minutes",
                 "users_disabled", "keys_revoked", "source_count", "changed_fields", "to_actor_id", "from_actor_id"):
         value = metadata.get(key)
@@ -594,6 +601,7 @@ _VENDOR_READ_SCOPES = {
     ("GET", "/api/exit-criteria"): "metrics:read",
     ("GET", "/api/detection-quality"): "metrics:read",
     ("GET", "/api/soc-visibility"): "metrics:read",
+    ("GET", "/api/executive-summary"): "metrics:read",
 }
 
 
@@ -644,6 +652,22 @@ def hospital_scope(*allowed):
     if request.method != "GET" and _lifecycle(ident["tenant"]) != "active":
         raise Refuse(409, "this hospital is being offboarded; no new changes are accepted")
     return ident["tenant"]
+
+
+def tenant_service_tier(tenant):
+    """The hospital's service tier, read on every call so a change takes effect at once. None when it has no row."""
+    row = db().execute("SELECT service_tier FROM tenants WHERE id=%s", (tenant,)).fetchone()
+    return row["service_tier"] if row else None
+
+
+def require_feature(tenant, feature):
+    """403 unless the hospital's service tier includes the feature (tiers.py). The message names the needed tier,
+    never another hospital's data."""
+    tier = tenant_service_tier(tenant)
+    if not tiers.allows(tier, feature):
+        raise Refuse(403, f"your service tier ({tier or 'unknown'}) does not include this; "
+                          f"it needs the {tiers.min_tier_for(feature)} tier or higher")
+    return tier
 
 
 def _grant_state(row):
@@ -991,7 +1015,8 @@ def ingest_wazuh():
 @app.get("/api/tenants")
 def list_tenants():
     _require_vendor()
-    rows = db().execute("SELECT id, name, created, lifecycle_state FROM tenants ORDER BY id").fetchall()
+    rows = db().execute("SELECT id, name, created, lifecycle_state, service_tier, retention_days "
+                        "FROM tenants ORDER BY id").fetchall()
     return jsonify([dict(r) for r in rows])
 
 
@@ -1739,7 +1764,8 @@ def handoffs(i):
     return jsonify([dict(r) for r in rows])
 
 
-RESPONSE_ACTIONS = {"isolate_host", "disable_account", "block_ip"}
+# The server-side allowlist (playbooks.py) is the single source of truth for what can be requested.
+RESPONSE_ACTIONS = set(playbooks.ALLOWLIST)
 
 
 @app.get("/api/alerts/<int:i>/response-approvals")
@@ -1763,7 +1789,7 @@ MEDICAL_REFUSAL = "disruptive containment is blocked on medical equipment (IEC 8
 
 def _asset_for_target(tenant, action, target):
     """The hospital's asset that a host or IP target names, or None. Accounts name no asset."""
-    if action not in ("isolate_host", "block_ip"):
+    if playbooks.playbook_for(action).target not in ("host", "ip"):
         return None
     return db().execute(
         "SELECT asset_id, device_name, asset_class, monitoring_mode FROM assets "
@@ -1786,6 +1812,9 @@ def request_response_approval(i):
     action = body.get("action")
     if action not in RESPONSE_ACTIONS:
         raise Refuse(400, f"action must be one of: {', '.join(sorted(RESPONSE_ACTIONS))}")
+    pb = playbooks.playbook_for(action)
+    for feature in pb.features:  # essential hospitals may not request automated or medical-device containment
+        require_feature(tenant, feature)
     try:
         target = playbooks.validate_target(action, body.get("target"))
     except playbooks.TargetRefused as e:
@@ -1797,43 +1826,50 @@ def request_response_approval(i):
     alert = _alert_or_404(i)
     if alert["status"] == "closed":
         raise Refuse(409, "cannot request a response for a closed alert")
-    pb = playbooks.playbook_for(action)
     asset = _asset_for_target(tenant, action, target)
-    if asset is None and action == "isolate_host":
+    if asset is None and playbooks.targets_asset(pb):
         raise Refuse(400, "target is not an asset of this hospital")
-    if asset is not None and pb.tier == "disruptive" and _is_medical(asset):
+    if asset is not None and playbooks.blocked_on_medical(pb) and _is_medical(asset):
         raise Refuse(409, MEDICAL_REFUSAL)
-    pending = db().execute(
-        "SELECT id FROM response_approvals WHERE alert_id=%s AND action=%s AND target=%s AND status='pending'",
-        (i, action, target)).fetchone()
-    if pending:
-        raise Refuse(409, "a matching response approval is already pending")
-    row = db().execute(
-        "INSERT INTO response_approvals(tenant, alert_id, action, target, reason, requested_by) "
-        "VALUES(%s, %s, %s, %s, %s, %s) "
-        "ON CONFLICT (alert_id, action, target) WHERE status='pending' DO NOTHING "
-        "RETURNING id, status",
-        (tenant, i, action, target, reason, g.identity["actor_id"])).fetchone()
-    if not row:
-        raise Refuse(409, "a matching response approval is already pending")
+    if pb.tier == "read_only":
+        # A read-only action changes nothing, so it needs no second approver and leaves no pending approval behind.
+        row = {"id": None, "status": "not_required"}
+        idempotency_key = f"read-only:{uuid.uuid4().hex}"
+    else:
+        pending = db().execute(
+            "SELECT id FROM response_approvals WHERE alert_id=%s AND action=%s AND target=%s AND status='pending'",
+            (i, action, target)).fetchone()
+        if pending:
+            raise Refuse(409, "a matching response approval is already pending")
+        row = db().execute(
+            "INSERT INTO response_approvals(tenant, alert_id, action, target, reason, requested_by) "
+            "VALUES(%s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (alert_id, action, target) WHERE status='pending' DO NOTHING "
+            "RETURNING id, status",
+            (tenant, i, action, target, reason, g.identity["actor_id"])).fetchone()
+        if not row:
+            raise Refuse(409, "a matching response approval is already pending")
+        idempotency_key = f"approval:{row['id']}"
     job_status = "pending_approval" if pb.tier == "disruptive" else "queued"
     job = db().execute(
         "INSERT INTO response_jobs(tenant_id, alert_id, action_type, risk_tier, playbook_id, playbook_version, "
         "playbook_digest, target_asset_id, target_host, idempotency_key, status, requested_by) "
         "VALUES(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING job_id",
         (tenant, i, action, pb.tier, pb.playbook_id, pb.version, pb.sha256,
-         asset["asset_id"] if asset else None, target, f"approval:{row['id']}", job_status,
+         asset["asset_id"] if asset else None, target, idempotency_key, job_status,
          g.identity["actor_id"])).fetchone()
-    _record_current_audit(
-        db(), action="response_approval.request", resource_type="response_approval", resource_id=row["id"],
-        resource_classification="security_event",
-        metadata={"response_action": action, "status": row["status"]})
+    if row["id"] is not None:
+        _record_current_audit(
+            db(), action="response_approval.request", resource_type="response_approval", resource_id=row["id"],
+            resource_classification="security_event",
+            metadata={"response_action": action, "status": row["status"]})
     _record_current_audit(
         db(), action="response_job.request", resource_type="response_job", resource_id=job["job_id"],
         resource_classification="security_event",
         metadata={"response_action": action, "playbook_id": pb.playbook_id, "playbook_version": pb.version,
                   "risk_tier": pb.tier, "job_status": job_status})
-    audit("response_approval.request", f"approval {row['id']}: {action} for alert {i}")
+    audit("response_approval.request", f"approval {row['id']}: {action} for alert {i}"
+          if row["id"] is not None else f"read-only {action} for alert {i}")
     commit()
     return jsonify(id=row["id"], job_id=job["job_id"], alert_id=i, action=action, target=_redact_text(target),
                    status=row["status"], job_status=job_status, playbook_id=pb.playbook_id,
@@ -1865,8 +1901,11 @@ def decide_response_approval(approval_id):
     if job is None or job["status"] != "pending_approval":
         raise Refuse(409, "response job is not awaiting approval")
     if decision == "approved":
+        pb = playbooks.playbook_for(row["action"])
+        for feature in pb.features:  # the hospital may have been downgraded since the request was made
+            require_feature(tenant, feature)
         asset = _asset_for_target(tenant, row["action"], row["target"])
-        if asset is not None and _is_medical(asset):
+        if asset is not None and playbooks.blocked_on_medical(pb) and _is_medical(asset):
             raise Refuse(409, MEDICAL_REFUSAL)
     decided_at = datetime.now(timezone.utc)
     db().execute(
@@ -2180,9 +2219,11 @@ def home():
 # Registered last: routes/mfa.py imports this module for the shared helpers (db, Refuse, commit, audit).
 from routes.mfa import bp as mfa_bp  # noqa: E402
 from routes.telemetry import bp as telemetry_bp  # noqa: E402
+from routes.executive import bp as executive_bp  # noqa: E402
 
 app.register_blueprint(mfa_bp)
 app.register_blueprint(telemetry_bp)
+app.register_blueprint(executive_bp)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

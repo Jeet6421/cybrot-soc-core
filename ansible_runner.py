@@ -91,7 +91,7 @@ def run_job(job, *, conn, runner=default_runner, cred_dir=None, workspace_root=N
     target = resolve_target(conn, job["job_id"])
     if pb.target == "host" and target is None:
         raise Permanent("target is not an asset of this hospital")
-    if target is not None and target["medical"] and pb.tier == "disruptive":
+    if target is not None and target["medical"] and playbooks.blocked_on_medical(pb):
         raise Permanent("blocked: disruptive action on medical equipment (IEC 80001)")
 
     key = credential_file(job["tenant_id"], cred_dir)

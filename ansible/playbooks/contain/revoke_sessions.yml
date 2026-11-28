@@ -1,0 +1,14 @@
+# playbook: contain.revoke_sessions   version: 1.0.0   tier: disruptive
+#
+# Revokes every active sign-in session and token of one directory account (patient data leak, anomalous record
+# snooping). The account name comes from extra-vars (soc_target), never from a shell string. It does not disable the
+# account; use contain.disable_account for that.
+#
+# No identity-provider module ships in this repository. The task fails until the site configures its approved module.
+- name: Revoke the sessions of the approved account
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Refuse until the site identity module is configured
+      ansible.builtin.fail:
+        msg: "No identity module is configured for this site. Configure the approved module, then re-approve."

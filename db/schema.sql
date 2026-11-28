@@ -1163,5 +1163,67 @@ REVOKE ALL ON FUNCTION record_ingest_skew(bigint, double precision, double preci
 GRANT EXECUTE ON FUNCTION ingest_source_kind(bigint) TO soc_app;
 GRANT EXECUTE ON FUNCTION record_ingest_skew(bigint, double precision, double precision) TO soc_app;
 
+-- ---- PR 17: service tiers, per-hospital retention, and the five core response playbooks -------------------------
+-- service_tier decides which features a hospital has (see tiers.py). Only a vendor admin changes it, through
+-- set_tenant_service() below; the hospital's own UPDATE grant still covers the name column only.
+-- retention_days is the hospital's agreed log retention. CERT-In Directions 2022 set the floor at 180 days.
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS service_tier TEXT NOT NULL DEFAULT 'essential';
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS retention_days INTEGER NOT NULL DEFAULT 180;
+DO $service$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'tenants_service_tier_check') THEN
+    ALTER TABLE tenants ADD CONSTRAINT tenants_service_tier_check
+      CHECK (service_tier IN ('essential', 'advanced', 'enterprise'));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'tenants_retention_days_check') THEN
+    ALTER TABLE tenants ADD CONSTRAINT tenants_retention_days_check CHECK (retention_days >= 180);
+  END IF;
+END $service$;
+
+-- The allowlisted response actions (playbooks.py). A new playbook needs a reviewed change here too.
+ALTER TABLE response_approvals DROP CONSTRAINT IF EXISTS response_approvals_action_check;
+ALTER TABLE response_approvals ADD CONSTRAINT response_approvals_action_check
+  CHECK (action IN ('isolate_host', 'disable_account', 'block_ip', 'revoke_sessions',
+                    'medical_device_block_egress', 'collect_triage_snapshot'));
+ALTER TABLE response_jobs DROP CONSTRAINT IF EXISTS response_jobs_action_type_check;
+ALTER TABLE response_jobs ADD CONSTRAINT response_jobs_action_type_check
+  CHECK (action_type IN ('isolate_host', 'disable_account', 'block_ip', 'revoke_sessions',
+                         'medical_device_block_egress', 'collect_triage_snapshot'));
+
+-- The only way a hospital's tier or retention changes. Vendor admin only; NULL leaves a value as it is.
+CREATE OR REPLACE FUNCTION set_tenant_service(p_tenant text, p_tier text, p_retention integer) RETURNS boolean
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+BEGIN
+  IF app_role() IS DISTINCT FROM 'vendor_admin' THEN
+    RAISE EXCEPTION 'only a vendor admin can change a hospital service tier' USING ERRCODE = '42501';
+  END IF;
+  IF p_tenant IS NULL OR p_tenant = 'platform' THEN
+    RETURN false;
+  END IF;
+  IF p_tier IS NOT NULL AND p_tier NOT IN ('essential', 'advanced', 'enterprise') THEN
+    RAISE EXCEPTION 'unknown service tier' USING ERRCODE = '22023';
+  END IF;
+  IF p_retention IS NOT NULL AND p_retention < 180 THEN
+    RAISE EXCEPTION 'retention must be at least 180 days (CERT-In)' USING ERRCODE = '22023';
+  END IF;
+  UPDATE tenants SET service_tier = COALESCE(p_tier, service_tier),
+                     retention_days = COALESCE(p_retention, retention_days)
+    WHERE id = p_tenant AND lifecycle_state = 'active';
+  RETURN FOUND;
+END $$;
+
+-- Partitions are shared by every hospital, so the storage job may only drop what the longest-retaining hospital
+-- has finished with. p_floor is the deployment-wide RETENTION_DAYS; the result is never below it or below 180.
+CREATE OR REPLACE FUNCTION effective_retention_days(p_floor integer) RETURNS integer
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  SELECT GREATEST(COALESCE(p_floor, 180), 180,
+                  COALESCE((SELECT max(retention_days) FROM tenants WHERE lifecycle_state <> 'purged'), 180))
+$$;
+
+REVOKE ALL ON FUNCTION set_tenant_service(text, text, integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION effective_retention_days(integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION set_tenant_service(text, text, integer) TO soc_app;
+GRANT EXECUTE ON FUNCTION effective_retention_days(integer) TO soc_app;
+
 -- Create the partitions this database needs now (idempotent; the worker repeats it hourly).
 SELECT ensure_time_partitions();

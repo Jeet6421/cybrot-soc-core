@@ -1,0 +1,16 @@
+# playbook: contain.medical_device_block_egress   version: 1.0.0   tier: disruptive
+#
+# Blocks OUTBOUND traffic from one medical device at the site firewall or VLAN ACL. Inbound clinical traffic (imaging
+# requests, monitoring feeds) is left alone, and the device is never powered off, isolated from its own VLAN or
+# touched over the network. That is why this is the one disruptive action SOC Core allows on agentless_medical
+# equipment (IEC 80001). The device is passed with --limit after SOC Core has checked it is an asset of the hospital.
+#
+# No firewall module ships in this repository. The task fails until the site configures its approved module, which
+# must filter egress only.
+- name: Block egress from the verified medical device
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Refuse until the site egress-filter module is configured
+      ansible.builtin.fail:
+        msg: "No egress filter module is configured for this site. Configure the approved module, then re-approve."
