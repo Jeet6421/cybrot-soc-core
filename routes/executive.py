@@ -237,9 +237,10 @@ def build_report(soc, tenant, now=None):
     since = now - timedelta(days=REPORT_DAYS)
     visibility = soc._soc_visibility(tenant)
     judged, unjudged, mttd, mttr = _alert_times(soc, tenant, since, now)
-    denied = soc.db().execute(
-        "SELECT COUNT(*) AS n FROM audit_events WHERE tenant_id = %s AND outcome = 'deny' AND occurred_at >= %s",
-        (tenant, since)).fetchone()["n"]
+    # Read through a narrow SECURITY DEFINER function (db/schema.sql) that returns only a count for the hospital bound
+    # to this request, so a viewer, whom row-level security keeps away from raw audit rows, still gets the number.
+    denied = soc.db().execute("SELECT executive_refused_count(%s::text, %s::timestamptz) AS n",
+                              (tenant, since)).fetchone()["n"]
     groups = [g["fp_target_status"] for g in soc._detection_quality(tenant)]
     sections = [
         assess_edr_coverage(visibility["total_assets"], visibility["edr_managed_assets"],
