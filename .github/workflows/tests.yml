@@ -35,5 +35,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t soc-core-ci .
-      - run: POSTGRES_PASSWORD=ci-postgres SOC_APP_PASSWORD=ci-app docker compose config -q
-      - run: docker compose -f docker-compose.yml config --images
+      - name: Validate compose file (pinned images, interpolation)
+        env:
+          POSTGRES_PASSWORD: ci-postgres
+          SOC_APP_PASSWORD: ci-app
+        run: |
+          docker compose config -q
+          docker compose config --images
