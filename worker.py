@@ -89,7 +89,9 @@ def maintain_storage(conn):
     """Create the upcoming monthly partitions, then drop partitions that have passed the retention window. Both are
     SECURITY DEFINER functions, so the runtime role can call them and nothing else. Returns what changed."""
     created = conn.execute("SELECT ensure_time_partitions()").fetchone()[0]
-    dropped = conn.execute("SELECT partition_name, rows_dropped FROM drop_expired_partitions(%s)",
+    # Partitions are shared, so keep them as long as the longest-retaining hospital needs (tenants.retention_days).
+    dropped = conn.execute("SELECT partition_name, rows_dropped "
+                           "FROM drop_expired_partitions(effective_retention_days(%s))",
                            (soc.RETENTION_DAYS,)).fetchall()
     conn.commit()
     return created, [(row[0], row[1]) for row in dropped]

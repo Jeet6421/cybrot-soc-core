@@ -40,6 +40,12 @@ Disruptive containment is refused for any asset whose class is `mri`, `ct`, `x_r
 
 The second and third checks catch an inventory change made after the request.
 
+One disruptive action is allowed on this equipment: `medical_device_block_egress` (PR 17). It filters the device's
+outbound traffic only. It never powers off, isolates or touches the device, and clinical inbound traffic keeps working,
+so the playbook is marked `medical_safe` in `playbooks.py`. It is still disruptive, so it needs a second approver, and
+`isolate_host` and `block_ip` on the same device stay refused. `collect_triage_snapshot` is `read_only`: it needs no
+approver and is allowed on medical equipment through the site's approved passive collector.
+
 ## Maker-checker
 
 - A disruptive action is created as `pending_approval`.

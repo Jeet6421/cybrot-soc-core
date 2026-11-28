@@ -326,7 +326,36 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 | `GET/PUT /api/settings` | `hospital_admin` | Read or update its hospital display name |
 | `GET/POST /api/alerts/<id>/response-approvals` | `hospital_admin`, `l1`, `l2` | List or request an allowlisted response action approval |
 | `POST /api/response-approvals/<id>/decision` | `hospital_admin`, `l2` | Approve or reject another user's request; no action is executed |
+| `GET /api/executive-summary` | `hospital_admin`, `viewer`; vendor with `metrics:read` break-glass | Monthly RED/AMBER/GREEN report in plain language (advanced tier and up; see below) |
+| `GET /api/service-tier` | hospital roles | The hospital's tier, retention days, included features and response actions |
+| `PUT /api/tenants/<id>/service` | `vendor_admin` | Set `service_tier` and/or `retention_days` (>= 180) |
 | `POST /api/demo`, `/api/autolabel`, `/api/reset` | `vendor_admin`, lab only | Synthetic data; need `LAB_DATABASE_URL` |
+
+## Service tiers, response playbooks and the executive report (PR 17)
+**Tiers** (`tenants.service_tier`, default `essential`; `tenants.retention_days`, default and minimum 180). Only a vendor
+admin changes them. `essential` has detection, triage and the read-only `collect_triage_snapshot`. `advanced` and
+`enterprise` add automated containment (maker-checker response approvals, including `medical_device_block_egress`) and
+`GET /api/executive-summary`. An `essential` hospital gets `403` for those, and a request waiting for approval is also
+refused (`403`) if the hospital is downgraded before it is approved. Set `EXECUTIVE_SUMMARY_MIN_TIER` to `essential`,
+`advanced` or `enterprise` to move the report to another tier. The storage job keeps shared partitions for the
+longest `retention_days` of any hospital (`effective_retention_days()`).
+
+**Response playbooks** (`playbooks.py`, each pinned by SHA-256, files in `ansible/playbooks/contain/`):
+
+| Scenario | Action | Tier | Medical equipment |
+|---|---|---|---|
+| Ransomware on a workstation | `isolate_host` | disruptive | refused (409) |
+| Phishing or stolen account | `disable_account` | disruptive | n/a (account) |
+| Patient data leak or snooping | `revoke_sessions` | disruptive | n/a (account) |
+| Unwanted traffic | `block_ip`; `medical_device_block_egress` for a device | disruptive | `block_ip` on a device's address is refused; egress-only block is allowed |
+| Triage enrichment | `collect_triage_snapshot` | read_only (no approver) | allowed |
+
+As before, no playbook ships a site module: each fails until the site configures its approved one.
+
+**Executive report.** Six lights over the last 30 days for one hospital: asset and EDR coverage, unmanaged or unknown
+assets, critical/high SLA compliance, MTTD and MTTR, refused (unauthorized or cross-hospital) requests, and
+`FP_TARGET` review readiness. The overall light is the worst of the six. Thresholds are returned in `methodology`.
+The report holds counts, percentages and times only.
 
 ## Changes
 **PR 2 (deny-by-default RBAC, account classification and telemetry boundaries)**

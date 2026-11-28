@@ -98,6 +98,9 @@ def world():
     with psycopg.connect(SESSION_OWNER_URL) as owner:
         manage.create_tenant(owner, "city-hospital", "City Hospital")
         manage.create_tenant(owner, "ortho-clinic", "Ortho Clinic")
+        # PR 17: automated containment needs the advanced tier. The shared hospitals are advanced so the response
+        # tests keep exercising it; tests/test_service_tiers.py builds its own essential hospitals for the gate.
+        owner.execute("UPDATE tenants SET service_tier = 'advanced' WHERE id IN ('city-hospital', 'ortho-clinic')")
         manage.create_user(owner, "platform", USERNAME["vendor_admin"], "vendor_admin", PASSWORD, "vendor@example.test")
         keys = {}
         for tenant in HOSPITALS:

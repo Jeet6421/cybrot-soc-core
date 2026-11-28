@@ -27,6 +27,9 @@ the next step (Kafka or anything else). Kafka is deferred. PostgreSQL is validat
   raises if `days < 180`. Because each dropped partition is entirely older than the cutoff, every row newer than
   the cutoff is kept. Rows are kept for at least the retention window, and at most the window plus one month.
 - Both functions run as the owner (`SECURITY DEFINER`). The runtime role may execute them and nothing else.
+- `tenants.retention_days` (PR 17, default and minimum 180) is each hospital's agreed retention. Partitions are shared,
+  so the worker calls `drop_expired_partitions(effective_retention_days(RETENTION_DAYS))`, which never drops data a
+  longer-retaining hospital still needs.
 
 Retention applies to `audit_events` too, on the same window. Confirm with your compliance owner that 180 days of
 audit history is acceptable, since CERT-In requires at least that much.

@@ -1,0 +1,15 @@
+# playbook: contain.collect_triage_snapshot   version: 1.0.0   tier: read_only
+#
+# Collects a read-only triage snapshot of one host (running processes, network connections, logged-in users) for an
+# analyst. It changes nothing on the host, so it needs no second approver and is allowed on medical equipment only
+# through the site's approved passive collector.
+#
+# The snapshot belongs in the hospital's evidence store, never in the job result: SOC Core records only the PLAY RECAP
+# counts. No collector ships in this repository, so the task fails until the site configures its approved one.
+- name: Collect a read-only snapshot from the verified host
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Refuse until the site collector is configured
+      ansible.builtin.fail:
+        msg: "No triage collector is configured for this site. Configure the approved collector, then re-run."
