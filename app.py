@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg
 from flask import Flask, g, request, jsonify, send_from_directory
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 import auth, detect, generate
 
@@ -85,6 +86,9 @@ SAFE_ALERT_FIELDS = ("id", "created", "event_ts", "tenant", "rule", "rule_versio
                      "summary", "owner", "step", "status", "ack_at", "verdict", "source",
                      "last_handoff")
 app = Flask(__name__, static_folder="static")
+# PR 15: nginx is the only route to the app, so trust exactly one proxy hop. request.remote_addr then holds the real
+# client address, which PR 14's per-source login limit needs. Nothing else can reach the app directly.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 
 
 def _int_setting(name, default):

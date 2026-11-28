@@ -1,19 +1,28 @@
-# SOC Core app + PostgreSQL. Run Wazuh separately (see wazuh/README.md) and point its webhook here.
+# SOC Core app + PostgreSQL + TLS edge. Run Wazuh separately (see wazuh/README.md) and point its webhook at this host's HTTPS port.
 # Settings come from a .env file next to this file (see README). Never commit .env.
 #
-# Three roles, least privilege:
+# Roles, least privilege:
 #   db       the PostgreSQL server. The owner role 'soc' exists only for migrations and bootstrap.
 #   migrate  one-shot: applies the schema, row-level security and grants as the owner, then exits.
 #   soc-core the app. It connects as 'soc_app': no DDL, no superuser, no BYPASSRLS. It never sees the owner password.
+#   worker   the response worker. It runs playbooks, so it gets no network route outside the cluster.
+#   nginx    the only published service: TLS on the host (443), plain HTTP redirected (80).
+#
+# Networks (PR 15):
+#   soc_internal  internal: true. Docker gives it no route to the host network or the internet. db, migrate,
+#                 soc-core and worker live only here, so they cannot be reached from outside and cannot reach out.
+#   soc_edge      the only network with a route in and out. nginx joins it to receive HTTPS from clients.
 services:
   db:
-    image: postgres:16
+    image: postgres:16.16
     restart: unless-stopped
     environment:
       POSTGRES_DB: soc
       POSTGRES_USER: soc
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (letters and digits only)}"
-    volumes: ["pg-data:/var/lib/postgresql/data"]   # the database is not exposed to the host network
+    volumes: ["pg-data:/var/lib/postgresql/data"]   # no ports: the database is not reachable from the host
+    networks: [soc_internal]
+    security_opt: ["no-new-privileges:true"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U soc -d soc"]
       interval: 5s
@@ -26,16 +35,23 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    networks: [soc_internal]
     environment:
       MIGRATE_DATABASE_URL: "postgresql://soc:${POSTGRES_PASSWORD}@db:5432/soc"
       SOC_APP_PASSWORD: "${SOC_APP_PASSWORD:?set SOC_APP_PASSWORD in .env (letters and digits only)}"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
   soc-core:
     build: .
-    ports: ["5000:5000"]
     restart: unless-stopped
+    expose: ["5000"]   # reachable only through nginx, on soc_internal; nothing is published to the host
     depends_on:
       migrate:
         condition: service_completed_successfully
+    networks: [soc_internal]
     environment:
       DATABASE_URL: "postgresql://soc_app:${SOC_APP_PASSWORD}@db:5432/soc"
       ANALYSTS: "analyst1,analyst2,analyst3"
@@ -43,6 +59,14 @@ services:
       LAB_ENDPOINTS: "${LAB_ENDPOINTS:-1}"   # set to 0 before any real data goes in
       LAB_DATABASE_URL: "${LAB_DATABASE_URL:-}"  # lab VM only: owner URL for demo/reset/autolabel. Never set it with real data.
       FP_TARGET: "${FP_TARGET:-}"            # agreed false-positive ceiling, e.g. 0.10; empty = not set
+      SOC_SECRET_KEY: "${SOC_SECRET_KEY:-}"  # PR 14: encrypts TOTP secrets. Required before MFA can be enabled
+      SOC_REQUIRE_PRIVILEGED_MFA: "${SOC_REQUIRE_PRIVILEGED_MFA:-0}"
+      SOC_LOGIN_RATE_LIMIT: "${SOC_LOGIN_RATE_LIMIT:-20}"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
   worker:
     build: .
     restart: unless-stopped
@@ -50,6 +74,7 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+    networks: [soc_internal]
     environment:
       DATABASE_URL: "postgresql://soc_app:${SOC_APP_PASSWORD}@db:5432/soc"
       WORKER_POLL_SECONDS: "${WORKER_POLL_SECONDS:-5}"   # idle wait between queue checks
@@ -65,6 +90,30 @@ services:
     security_opt: ["no-new-privileges:true"]
     volumes:
       - ansible-creds:/var/lib/soc/ansible-creds:ro
+  nginx:
+    image: nginx:1.28.2-alpine
+    restart: unless-stopped
+    depends_on:
+      soc-core:
+        condition: service_started
+    ports:
+      - "443:8443"   # HTTPS
+      - "80:8080"    # redirects to HTTPS
+    networks: [soc_edge, soc_internal]
+    user: "101:101"   # the image's unprivileged nginx user; ports 8443 and 8080 need no capability
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/tls:/etc/nginx/tls:ro   # operator-provided certificate and key; never committed (see README)
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+networks:
+  soc_internal:
+    internal: true
+  soc_edge: {}
 volumes:
   pg-data:
   ansible-creds:   # filled by the operator (never by the app): one folder per hospital holding ssh_key
