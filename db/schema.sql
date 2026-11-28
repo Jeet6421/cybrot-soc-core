@@ -1225,5 +1225,18 @@ REVOKE ALL ON FUNCTION effective_retention_days(integer) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION set_tenant_service(text, text, integer) TO soc_app;
 GRANT EXECUTE ON FUNCTION effective_retention_days(integer) TO soc_app;
 
+-- PR 17 fix: let the executive report count a hospital's refused requests without reading raw audit rows.
+-- Returns a number only, and only for the hospital bound to the current request (app.current_tenant_id).
+CREATE OR REPLACE FUNCTION executive_refused_count(p_tenant text, p_since timestamptz) RETURNS bigint
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  SELECT count(*) FROM audit_events
+   WHERE tenant_id = p_tenant
+     AND outcome = 'deny'
+     AND occurred_at >= p_since
+     AND p_tenant = current_setting('app.current_tenant_id', true)
+$$;
+
+REVOKE ALL ON FUNCTION executive_refused_count(text, timestamptz) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION executive_refused_count(text, timestamptz) TO soc_app;
 -- Create the partitions this database needs now (idempotent; the worker repeats it hourly).
 SELECT ensure_time_partitions();
