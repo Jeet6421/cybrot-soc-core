@@ -1010,5 +1010,121 @@ REVOKE ALL ON FUNCTION drop_expired_partitions(integer) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION ensure_time_partitions(timestamptz) TO soc_app;
 GRANT EXECUTE ON FUNCTION drop_expired_partitions(integer) TO soc_app;
 
+-- PR 14: TOTP MFA state, account lockout and login rate limits. The runtime role never updates these columns
+-- directly. Every read and write goes through a SECURITY DEFINER function, which runs as the owner.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_secret_enc TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_last_counter BIGINT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER NOT NULL DEFAULT 0
+  CHECK (failed_login_attempts >= 0);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ;
+
+-- One row per (source address, tenant, username): a fixed window, counted on every attempt.
+CREATE TABLE IF NOT EXISTS login_rate(ip TEXT NOT NULL, tenant TEXT NOT NULL, username TEXT NOT NULL,
+  window_start TIMESTAMPTZ NOT NULL, attempts INTEGER NOT NULL CHECK (attempts >= 0),
+  PRIMARY KEY (ip, tenant, username));
+
+CREATE OR REPLACE FUNCTION auth_login_rate_spend(p_ip text, p_tenant text, p_username text,
+                                                 p_limit integer, p_window_seconds integer)
+  RETURNS TABLE(allowed boolean, retry_after integer)
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE
+  w timestamptz;
+BEGIN
+  INSERT INTO login_rate AS l(ip, tenant, username, window_start, attempts)
+  VALUES (p_ip, p_tenant, p_username, now(), 1)
+  ON CONFLICT (ip, tenant, username) DO UPDATE
+    SET window_start = CASE WHEN l.window_start <= now() - make_interval(secs => p_window_seconds)
+                            THEN now() ELSE l.window_start END,
+        attempts = CASE WHEN l.window_start <= now() - make_interval(secs => p_window_seconds)
+                        THEN 1 ELSE l.attempts + 1 END
+    WHERE l.window_start <= now() - make_interval(secs => p_window_seconds) OR l.attempts < p_limit;
+  IF FOUND THEN
+    RETURN QUERY SELECT true, 0;
+    RETURN;
+  END IF;
+  SELECT l.window_start INTO w FROM login_rate l
+    WHERE l.ip = p_ip AND l.tenant = p_tenant AND l.username = p_username;
+  RETURN QUERY SELECT false,
+    greatest(1, ceil(extract(epoch FROM (w + make_interval(secs => p_window_seconds) - now())))::integer);
+END
+$$;
+
+CREATE OR REPLACE FUNCTION auth_user_security(p_user_id bigint)
+  RETURNS TABLE(mfa_enabled boolean, mfa_secret_enc text, mfa_last_counter bigint, locked boolean,
+                lock_seconds integer)
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  SELECT u.mfa_enabled, u.mfa_secret_enc, u.mfa_last_counter,
+         (u.locked_until IS NOT NULL AND u.locked_until > now()),
+         greatest(0, ceil(extract(epoch FROM (u.locked_until - now())))::integer)
+  FROM users u WHERE u.id = p_user_id
+$$;
+
+-- Counts one failure. The fifth consecutive failure locks the account and resets the count.
+CREATE OR REPLACE FUNCTION auth_login_failed(p_user_id bigint, p_max integer, p_lock_seconds integer)
+  RETURNS TABLE(locked boolean, failed integer)
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+BEGIN
+  RETURN QUERY
+  UPDATE users u SET
+    failed_login_attempts = CASE WHEN u.failed_login_attempts + 1 >= p_max THEN 0
+                                 ELSE u.failed_login_attempts + 1 END,
+    locked_until = CASE WHEN u.failed_login_attempts + 1 >= p_max
+                        THEN now() + make_interval(secs => p_lock_seconds) ELSE u.locked_until END
+  WHERE u.id = p_user_id
+  RETURNING (u.locked_until IS NOT NULL AND u.locked_until > now()), u.failed_login_attempts;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION auth_login_succeeded(p_user_id bigint) RETURNS void
+  LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  UPDATE users SET failed_login_attempts = 0, locked_until = NULL
+  WHERE id = p_user_id AND (failed_login_attempts <> 0 OR locked_until IS NOT NULL)
+$$;
+
+-- Anti-replay: a time step is accepted once. The update is atomic, so two concurrent requests cannot both win.
+CREATE OR REPLACE FUNCTION auth_mfa_consume(p_user_id bigint, p_step bigint) RETURNS boolean
+  LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  WITH done AS (
+    UPDATE users SET mfa_last_counter = p_step
+    WHERE id = p_user_id AND mfa_enabled AND (mfa_last_counter IS NULL OR mfa_last_counter < p_step)
+    RETURNING 1)
+  SELECT EXISTS (SELECT 1 FROM done)
+$$;
+
+-- Stores a pending (not yet confirmed) secret. Refused once MFA is on, so a stolen session cannot reset it.
+CREATE OR REPLACE FUNCTION auth_mfa_store_pending(p_user_id bigint, p_secret_enc text) RETURNS boolean
+  LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  WITH done AS (
+    UPDATE users SET mfa_secret_enc = p_secret_enc, mfa_last_counter = NULL
+    WHERE id = p_user_id AND NOT mfa_enabled RETURNING 1)
+  SELECT EXISTS (SELECT 1 FROM done)
+$$;
+
+CREATE OR REPLACE FUNCTION auth_mfa_enable(p_user_id bigint, p_step bigint) RETURNS boolean
+  LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  WITH done AS (
+    UPDATE users SET mfa_enabled = TRUE, mfa_last_counter = p_step
+    WHERE id = p_user_id AND NOT mfa_enabled AND mfa_secret_enc IS NOT NULL
+      AND (mfa_last_counter IS NULL OR mfa_last_counter < p_step)
+    RETURNING 1)
+  SELECT EXISTS (SELECT 1 FROM done)
+$$;
+
+REVOKE ALL ON FUNCTION auth_login_rate_spend(text, text, text, integer, integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION auth_user_security(bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION auth_login_failed(bigint, integer, integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION auth_login_succeeded(bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION auth_mfa_consume(bigint, bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION auth_mfa_store_pending(bigint, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION auth_mfa_enable(bigint, bigint) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION auth_login_rate_spend(text, text, text, integer, integer) TO soc_app;
+GRANT EXECUTE ON FUNCTION auth_user_security(bigint) TO soc_app;
+GRANT EXECUTE ON FUNCTION auth_login_failed(bigint, integer, integer) TO soc_app;
+GRANT EXECUTE ON FUNCTION auth_login_succeeded(bigint) TO soc_app;
+GRANT EXECUTE ON FUNCTION auth_mfa_consume(bigint, bigint) TO soc_app;
+GRANT EXECUTE ON FUNCTION auth_mfa_store_pending(bigint, text) TO soc_app;
+GRANT EXECUTE ON FUNCTION auth_mfa_enable(bigint, bigint) TO soc_app;
+
 -- Create the partitions this database needs now (idempotent; the worker repeats it hourly).
 SELECT ensure_time_partitions();

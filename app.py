@@ -50,6 +50,8 @@ ROUTE_ROLES = {
     ("POST", "/api/credentials/<int:kid>/revoke"): {"hospital_admin"},
     ("POST", "/api/credentials/<int:kid>/rotate"): {"hospital_admin"},
     ("POST", "/api/logout"): {"session"},
+    ("POST", "/api/mfa/setup"): {"session"},
+    ("POST", "/api/mfa/verify"): {"session"},
     ("GET", "/api/me"): {"session"},
     ("GET", "/api/settings"): {"hospital_admin"},
     ("PUT", "/api/settings"): {"hospital_admin"},
@@ -528,6 +530,12 @@ def authenticate():
                   "account_type": sess["user_account_type"], "token_version": sess["user_token_version"],
                   "actor_id": sess["user_id"], "name": sess["user_name"], "token_hash": h}
     set_context(tenant, sess["user_role"], sess["user_id"])
+    if (os.environ.get("SOC_REQUIRE_PRIVILEGED_MFA") == "1" and sess["user_role"] in PRIVILEGED_MFA_ROLES
+            and request.path not in MFA_ENROLMENT_PATHS):
+        security = conn.execute("SELECT mfa_enabled FROM auth_user_security(%s)", (sess["user_id"],)).fetchone()
+        if not security["mfa_enabled"]:
+            raise Refuse(403, "MFA is required for this account: enrol with POST /api/mfa/setup, "
+                              "then POST /api/mfa/verify")
     return None
 
 
@@ -1412,23 +1420,94 @@ def purge_tenant(tid):
 
 # ---- Sessions ------------------------------------------------------------------------------------
 
+# PR 14: login lockout, login rate limits and TOTP MFA.
+LOCKOUT_FAILURES = 5
+LOCKOUT_SECONDS = 15 * 60
+LOGIN_WINDOW_SECONDS = 15 * 60
+PRIVILEGED_MFA_ROLES = ("hospital_admin", "l2", "vendor_admin")
+# Routes an account may use before it enrols when SOC_REQUIRE_PRIVILEGED_MFA=1: enrolment itself, sign-out, identity.
+MFA_ENROLMENT_PATHS = {"/api/mfa/setup", "/api/mfa/verify", "/api/logout", "/api/me"}
+# One message for every failed sign-in, so a caller cannot tell which factor was wrong.
+INVALID_LOGIN = "invalid tenant, username, password or code"
+
+
+def mfa_key():
+    """SOC_SECRET_KEY encrypts TOTP secrets. Without it no MFA route or login check runs: the request fails closed."""
+    key = os.environ.get("SOC_SECRET_KEY", "")
+    if not key:
+        raise Refuse(503, "MFA is not configured: SOC_SECRET_KEY is not set")
+    return key
+
+
+def _auth_event(c, tenant, role, user_id, action, outcome, reason=None):
+    """A high-priority auth record in audit_events. The identity is bound first, because the table's policy checks it."""
+    set_context(tenant, role, user_id)
+    metadata = {"priority": "high"} | ({"reason": reason} if reason else {})
+    record_audit_event(c, tenant_id=tenant, actor_id=user_id, actor_role=role, action=action,
+                       resource_type="auth", resource_id=user_id, resource_classification="security_event",
+                       outcome=outcome, auth_context="system", metadata=metadata, source_ip=request.remote_addr)
+
+
+def _count_login_failure(c, row, tenant, reason):
+    """Counts one failed password or code against a real account, audits it, and commits. The caller then refuses."""
+    state = c.execute("SELECT locked, failed FROM auth_login_failed(%s, %s, %s)",
+                      (row["user_id"], LOCKOUT_FAILURES, LOCKOUT_SECONDS)).fetchone()
+    action = "auth.lockout" if state["locked"] else ("auth.mfa.fail" if reason == "mfa" else "auth.password.fail")
+    _auth_event(c, tenant, row["user_role"], row["user_id"], action, "deny", reason)
+    commit()
+
+
 @app.post("/api/login")
 def login():
     body = _body(required=True)
     tenant = _text(body, "tenant")
     username = _text(body, "username").lower()
     password = body.get("password") if isinstance(body.get("password"), str) else ""
+    code = body.get("totp_code") if isinstance(body.get("totp_code"), str) else ""
     if not (tenant and username and password):
         raise Refuse(400, "tenant, username and password are required")
     c = db()
+    # Every attempt counts, right or wrong, against (source address, tenant, username).
+    spend = c.execute(
+        "SELECT allowed, retry_after FROM auth_login_rate_spend(%s, %s, %s, %s, %s)",
+        (request.remote_addr or "", tenant, username, _int_setting("SOC_LOGIN_RATE_LIMIT", 20),
+         LOGIN_WINDOW_SECONDS)).fetchone()
+    if not spend["allowed"]:
+        commit()
+        response = jsonify(error="too many login attempts; retry after the window")
+        response.status_code = 429
+        response.headers["Retry-After"] = str(spend["retry_after"])
+        return response
     row = c.execute("SELECT * FROM auth_user_for_login(%s, %s)", (tenant, username)).fetchone()
     stored = row["user_password_hash"] if row else auth.DUMMY_HASH
-    if (not auth.verify_password(password, stored) or not row or row["user_status"] != "active"
-            or not row["user_is_active"]):
+    password_ok = auth.verify_password(password, stored)
+    if not row or row["user_status"] != "active" or not row["user_is_active"]:
         print(f"login refused for tenant {tenant}", file=sys.stderr, flush=True)
-        raise Refuse(401, "invalid tenant, username or password")
-    token = auth.new_token()
+        raise Refuse(401, INVALID_LOGIN)
     context_tenant = auth.PLATFORM_TENANT if row["user_role"] == "vendor_admin" else row["user_tenant"]
+    if not password_ok:
+        _count_login_failure(c, row, context_tenant, "password")
+        raise Refuse(401, INVALID_LOGIN)
+    security = c.execute("SELECT * FROM auth_user_security(%s)", (row["user_id"],)).fetchone()
+    if security["locked"]:
+        _auth_event(c, context_tenant, row["user_role"], row["user_id"], "auth.lockout.refused", "deny", "locked")
+        commit()
+        raise Refuse(423, f"account is locked after repeated failures; try again in {security['lock_seconds']} seconds")
+    if security["mfa_enabled"]:
+        if not code.strip():
+            response = jsonify(error="enter the 6-digit code from your authenticator app", mfa_required=True)
+            response.status_code = 401
+            return response
+        secret = auth.decrypt_secret(security["mfa_secret_enc"] or "", mfa_key())
+        if secret is None:
+            raise Refuse(503, "MFA secret cannot be read: SOC_SECRET_KEY does not match the key it was saved with")
+        step = auth.verify_totp(secret, code, last_counter=security["mfa_last_counter"])
+        if step is None or not c.execute("SELECT auth_mfa_consume(%s, %s)", (row["user_id"], step)).fetchone()[0]:
+            _count_login_failure(c, row, context_tenant, "mfa")
+            raise Refuse(401, INVALID_LOGIN)
+        _auth_event(c, context_tenant, row["user_role"], row["user_id"], "auth.mfa.verify", "allow")
+    c.execute("SELECT auth_login_succeeded(%s)", (row["user_id"],))
+    token = auth.new_token()
     set_context(context_tenant, row["user_role"], row["user_id"])
     c.execute("INSERT INTO sessions(token_hash, user_id, token_version, expires_at) "
               "VALUES (%s, %s, %s, now() + make_interval(secs => %s))",
@@ -2055,6 +2134,11 @@ def reset():
 def home():
     return send_from_directory("static", "index.html")
 
+
+# Registered last: routes/mfa.py imports this module for the shared helpers (db, Refuse, commit, audit).
+from routes.mfa import bp as mfa_bp  # noqa: E402
+
+app.register_blueprint(mfa_bp)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
