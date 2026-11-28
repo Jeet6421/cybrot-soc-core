@@ -22,6 +22,7 @@ import app as soc
 LEASE_SECONDS = int(os.environ.get("WORKER_LEASE_SECONDS", "120"))
 BATCH = int(os.environ.get("WORKER_BATCH", "10"))
 POLL_SECONDS = float(os.environ.get("WORKER_POLL_SECONDS", "5"))
+MAINTENANCE_SECONDS = float(os.environ.get("STORAGE_MAINTENANCE_SECONDS", "3600"))
 BACKOFF_BASE = 5      # seconds before the first retry
 BACKOFF_CAP = 900     # longest wait between attempts
 
@@ -84,13 +85,33 @@ def run_once(conn, worker_id, executors=None, limit=None, lease=None, rng=None):
     return len(rows)
 
 
+def maintain_storage(conn):
+    """Create the upcoming monthly partitions, then drop partitions that have passed the retention window. Both are
+    SECURITY DEFINER functions, so the runtime role can call them and nothing else. Returns what changed."""
+    created = conn.execute("SELECT ensure_time_partitions()").fetchone()[0]
+    dropped = conn.execute("SELECT partition_name, rows_dropped FROM drop_expired_partitions(%s)",
+                           (soc.RETENTION_DAYS,)).fetchall()
+    conn.commit()
+    return created, [(row[0], row[1]) for row in dropped]
+
+
 def main():
     # Register the Ansible executors. Imported here, after the exception classes exist, to avoid a cycle.
     import ansible_runner
     EXECUTORS.update(ansible_runner.executors())
     worker_id = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
     print(f"worker {worker_id} started", flush=True)
+    next_maintenance = 0.0
     while True:
+        if time.monotonic() >= next_maintenance:
+            try:
+                with soc.connect() as conn:
+                    created, dropped = maintain_storage(conn)
+                print(f"storage maintenance: {created} partitions created; dropped {dropped}", flush=True)
+                next_maintenance = time.monotonic() + MAINTENANCE_SECONDS
+            except Exception as e:  # maintenance must never stop the worker; retry in five minutes
+                print(f"storage maintenance failed: {type(e).__name__}; retrying in 300 seconds", flush=True)
+                next_maintenance = time.monotonic() + 300
         try:
             with soc.connect() as conn:
                 claimed = run_once(conn, worker_id)

@@ -103,7 +103,7 @@ def test_spoofed_tenant_inserts_are_rejected(runtime, world, data):
          "VALUES (%s, 'rls-spoof', 'rls-spoof@example.invalid', 'l1', 'hash')", (ORTHO,)),
         ("INSERT INTO ingest_keys(tenant, label, key_hash) VALUES (%s, 'spoof', 'rls-spoof-key')", (ORTHO,)),
         ("INSERT INTO log_sources(tenant, name, kind) VALUES (%s, 'rls-spoof', 'test')", (ORTHO,)),
-        ("INSERT INTO events(ts, tenant, type) VALUES ('2026-11-25T10:00:00', %s, 'auth_fail')", (ORTHO,)),
+        ("INSERT INTO events(ts, tenant, type, occurred_at) VALUES ('2026-11-25T10:00:00', %s, 'auth_fail', '2026-11-25T10:00:00Z')", (ORTHO,)),
         ("INSERT INTO alerts(tenant, rule) VALUES (%s, 'RLS_SPOOF')", (ORTHO,)),
         ("INSERT INTO handoffs(alert_id, at, from_owner, to_owner, note, tenant) "
          "VALUES (%s, '2026-11-25T10:00:00', 'a', 'b', '', %s)", (ortho_alert, ORTHO)),
@@ -169,7 +169,9 @@ def test_tenant_leading_indexes_exist(runtime):
     assert set(found) == set(expected)
     for table, index_name in expected.items():
         assert index_name in found[table]
-        assert f"ON public.{table} USING btree (tenant" in found[table], found[table]
+        # A partitioned parent (events) reports its index as "ON ONLY public.<table>".
+        assert (f"ON public.{table} USING btree (tenant" in found[table]
+                or f"ON ONLY public.{table} USING btree (tenant" in found[table]), found[table]
 
 
 
@@ -231,7 +233,7 @@ def test_unset_context_sees_no_rows(runtime, data):
 def test_unset_context_cannot_write(runtime, data, world):
     with pytest.raises(errors.InsufficientPrivilege):
         with runtime.transaction():
-            runtime.execute("INSERT INTO events(ts, tenant, type) VALUES ('2026-11-25T10:00:00', %s, 'x')", (CITY,))
+            runtime.execute("INSERT INTO events(ts, tenant, type, occurred_at) VALUES ('2026-11-25T10:00:00', %s, 'x', '2026-11-25T10:00:00Z')", (CITY,))
     with pytest.raises(errors.InsufficientPrivilege):
         with runtime.transaction():
             runtime.execute("INSERT INTO alerts(tenant, rule) VALUES (%s, 'R')", (CITY,))
@@ -319,10 +321,10 @@ def test_hospital_admin_cannot_read_another_hospitals_tenant_row(runtime, data):
 
 def test_ingest_role_writes_its_own_hospital_only(runtime, data):
     as_identity(runtime, CITY, "ingest", None)
-    runtime.execute("INSERT INTO events(ts, tenant, type) VALUES ('2026-11-25T10:00:00', %s, 'auth_fail')", (CITY,))
+    runtime.execute("INSERT INTO events(ts, tenant, type, occurred_at) VALUES ('2026-11-25T10:00:00', %s, 'auth_fail', '2026-11-25T10:00:00Z')", (CITY,))
     with pytest.raises(errors.InsufficientPrivilege):
         with runtime.transaction():
-            runtime.execute("INSERT INTO events(ts, tenant, type) VALUES ('2026-11-25T10:00:00', %s, 'auth_fail')", (ORTHO,))
+            runtime.execute("INSERT INTO events(ts, tenant, type, occurred_at) VALUES ('2026-11-25T10:00:00', %s, 'auth_fail', '2026-11-25T10:00:00Z')", (ORTHO,))
 
 
 def test_l2_cannot_approve_own_response_request_inside_postgres(runtime, world, data):
