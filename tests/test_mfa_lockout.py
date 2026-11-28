@@ -153,20 +153,20 @@ def test_login_rate_limit_returns_429_with_retry_after_and_other_users_are_unaff
 # ---- Privileged MFA gate ---------------------------------------------------------------------------
 
 def test_privileged_account_without_mfa_is_confined_to_enrolment_when_required(world, monkeypatch):
-    monkeypatch.setenv("SOC_REQUIRE_PRIVILEGED_MFA", "1")
-    monkeypatch.setenv("SOC_SECRET_KEY", SECRET_KEY)
+    # The seeded admin is not enrolled, so the gate would refuse it too: create the account before the flag is on.
     username = f"adm-{uuid.uuid4().hex[:8]}"
     r = world.client.post("/api/users", json={"username": username, "email": f"{username}@example.test",
                                               "role": "hospital_admin", "password": PASSWORD},
                           headers=world.session(CITY, "hospital_admin"))
     assert r.status_code == 201
+    monkeypatch.setenv("SOC_REQUIRE_PRIVILEGED_MFA", "1")
     headers = {"Authorization": f"Bearer {sign_in(world, username).get_json()['token']}"}
     assert world.client.get("/api/users", headers=headers).status_code == 403
     assert world.client.get("/api/me", headers=headers).status_code == 200
 
 
 def test_non_privileged_account_is_not_affected_by_the_mfa_requirement(world, monkeypatch):
-    monkeypatch.setenv("SOC_REQUIRE_PRIVILEGED_MFA", "1")
     username = new_username(world)  # role l1
+    monkeypatch.setenv("SOC_REQUIRE_PRIVILEGED_MFA", "1")
     headers = {"Authorization": f"Bearer {sign_in(world, username).get_json()['token']}"}
     assert world.client.get("/api/alerts", headers=headers).status_code == 200
