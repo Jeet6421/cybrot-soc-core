@@ -17,7 +17,7 @@ import psycopg
 from flask import Flask, g, request, jsonify, send_from_directory
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-import auth, detect, generate
+import auth, detect, generate, hospital
 
 # Runtime connection, as the soc_app role (never the owner). Read at call time.
 ANALYSTS = os.environ.get("ANALYSTS", "analyst1,analyst2,analyst3").split(",")
@@ -52,6 +52,7 @@ ROUTE_ROLES = {
     ("POST", "/api/credentials/<int:kid>/rotate"): {"hospital_admin"},
     ("POST", "/api/logout"): {"session"},
     ("POST", "/api/mfa/setup"): {"session"},
+    ("POST", "/api/ingest/suricata"): {"ingest"},
     ("POST", "/api/mfa/verify"): {"session"},
     ("GET", "/api/me"): {"session"},
     ("GET", "/api/settings"): {"hospital_admin"},
@@ -84,7 +85,7 @@ ROUTE_ROLES = {
 }
 SAFE_ALERT_FIELDS = ("id", "created", "event_ts", "tenant", "rule", "rule_version", "severity",
                      "summary", "owner", "step", "status", "ack_at", "verdict", "source",
-                     "last_handoff")
+                     "last_handoff", "threat_category", "sla_target_minutes", "sla_breached")
 app = Flask(__name__, static_folder="static")
 # PR 15: nginx is the only route to the app, so trust exactly one proxy hop. request.remote_addr then holds the real
 # client address, which PR 14's per-source login limit needs. Nothing else can reach the app directly.
@@ -452,7 +453,7 @@ def _record_current_audit(db_session, *, action, resource_type, resource_id=None
 
 
 def raise_alert(c, tenant, rule, sev, summary, key, event_ts, attack_id=None, source="builtin",
-                detail="", step=None, log_source_id=None):
+                detail="", step=None, log_source_id=None, threat_category=None):
     dup = c.execute("SELECT 1 FROM alerts WHERE rule=%s AND tenant=%s AND dkey=%s AND event_ts>=%s",
                     (rule, tenant, key, detect._ago(event_ts, 10))).fetchone() if event_ts else None
     if dup:
@@ -460,10 +461,11 @@ def raise_alert(c, tenant, rule, sev, summary, key, event_ts, attack_id=None, so
     n = c.execute("SELECT COUNT(*) FROM alerts WHERE tenant=%s", (tenant,)).fetchone()[0]
     owner = ANALYSTS[n % len(ANALYSTS)]
     step = step or detect.PLAYBOOK.get(rule, "Review the alert details and decide: escalate, fix, or close as benign.")
-    cur = c.execute("INSERT INTO alerts(created,event_ts,tenant,rule,rule_version,severity,summary,dkey,owner,step,attack_id,source,detail,log_source_id) "
-                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+    category = threat_category or hospital.categorize(rule, summary, detail)
+    cur = c.execute("INSERT INTO alerts(created,event_ts,tenant,rule,rule_version,severity,summary,dkey,owner,step,attack_id,source,detail,log_source_id,threat_category) "
+                    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                     (now(), event_ts, tenant, rule, detect.rule_version(rule), sev, summary, key, owner, step, attack_id, source, detail,
-                     log_source_id))
+                     log_source_id, category))
     return cur.fetchone()["id"]
 
 
@@ -487,6 +489,11 @@ def _safe_alert(row):
     for key in ("summary", "step", "last_handoff"):
         if key in result:
             result[key] = _redact_text(result[key])
+    # Alerts raised before PR 16 have no stored category: derive it from the rule, as raise_alert would have.
+    result["threat_category"] = row.get("threat_category") or hospital.categorize(row.get("rule") or "", row.get("summary") or "")
+    result["sla_target_minutes"], result["sla_breached"] = hospital.sla_status(
+        row.get("severity"), row.get("created"), row.get("status"), row.get("verdict_at"),
+        datetime.now(timezone.utc))
     return result
 
 
@@ -851,11 +858,45 @@ def _store_events(c, evs):
         stored += 1
         hit = detect.evaluate(c, e)
         if hit:
-            i = raise_alert(c, e["tenant"], *hit[:3], hit[3], e["ts"], e["attack_id"],
-                            log_source_id=e.get("log_source_id"))
+            i = raise_alert(c, e["tenant"], *hit[:3], hit[3], e["ts"], e.get("attack_id"),
+                            log_source_id=e.get("log_source_id"),
+                            threat_category=hit[4] if len(hit) > 4 else None)
             if i:
                 made_ids.append(i)
     return made_ids, stored, duplicates
+
+
+def _stamp_events(evs, ident, now_utc, suricata=False):
+    """Check each event's hospital and time window, then bind it to the ingest key's hospital and log source.
+    Returns each event's clock drift in seconds, abs(now - event time), in batch order."""
+    drifts = []
+    for e in evs:
+        if not isinstance(e, dict):
+            raise Refuse(400, "each event must be a JSON object")
+        # An ingest key is bound to one hospital and one log source. Events for any other hospital are refused.
+        if e.get("tenant") not in (None, "", ident["tenant"]):
+            raise Refuse(403, "event tenant does not match this ingest key")
+        if e.get("type") == "suricata_alert" and not suricata:
+            raise Refuse(400, "send Suricata alerts to /api/ingest/suricata")
+        occurred = _occurred_at(e.get("ts"))
+        if occurred < now_utc - timedelta(days=RETENTION_DAYS):
+            raise Refuse(400, f"event is older than the {RETENTION_DAYS}-day retention window")
+        if occurred > now_utc + timedelta(days=1):
+            raise Refuse(400, "event time is more than a day in the future")
+        e["tenant"] = ident["tenant"]
+        e["log_source_id"] = ident["log_source_id"]
+        e["occurred_at"] = occurred
+        # Detection compares timestamps as text in detect.FMT, so store the canonical UTC form, whatever the sender sent.
+        e["ts"] = occurred.strftime(detect.FMT)
+        drifts.append(abs((now_utc - occurred).total_seconds()))
+    return drifts
+
+
+def _record_skew(c, log_source_id, drifts):
+    """CERT-In clock check (PR 16): keep the latest drift and the largest drift in the last 24 hours for the source.
+    This measures event age as well as clock error, so a source that batches its logs will show lag as skew."""
+    if drifts:
+        c.execute("SELECT record_ingest_skew(%s, %s, %s)", (log_source_id, drifts[-1], max(drifts)))
 
 
 @app.post("/api/events")
@@ -868,25 +909,11 @@ def ingest():
     if len(evs) > limits["max_batch"]:
         raise Refuse(413, f"send at most {limits['max_batch']} events per request")
     now_utc = datetime.now(timezone.utc)
-    for e in evs:
-        if not isinstance(e, dict):
-            raise Refuse(400, "each event must be a JSON object")
-        # An ingest key is bound to one hospital and one log source. Events for any other hospital are refused.
-        if e.get("tenant") not in (None, "", ident["tenant"]):
-            raise Refuse(403, "event tenant does not match this ingest key")
-        occurred = _occurred_at(e.get("ts"))
-        if occurred < now_utc - timedelta(days=RETENTION_DAYS):
-            raise Refuse(400, f"event is older than the {RETENTION_DAYS}-day retention window")
-        if occurred > now_utc + timedelta(days=1):
-            raise Refuse(400, "event time is more than a day in the future")
-        e["tenant"] = ident["tenant"]
-        e["log_source_id"] = ident["log_source_id"]
-        e["occurred_at"] = occurred
-        # Detection compares timestamps as text in detect.FMT, so store the canonical UTC form, whatever the sender sent.
-        e["ts"] = occurred.strftime(detect.FMT)
+    drifts = _stamp_events(evs, ident, now_utc)
     c = db()
     _spend_ingest_quota(c, ident["tenant"], ident["log_source_id"], len(evs), raw_bytes, limits)
     made_ids, stored, duplicates = _store_events(c, evs)
+    _record_skew(c, ident["log_source_id"], drifts)
     _record_current_audit(
         c, action="event.ingest", resource_type="event_batch", resource_id=None,
         resource_classification="telemetry",
@@ -1092,6 +1119,8 @@ def create_log_source():
     if not name or len(name) > 80:
         raise Refuse(400, "name must be 1 to 80 characters")
     kind = _text(body, "kind", 40)
+    if kind not in hospital.LOG_SOURCE_KINDS:
+        raise Refuse(400, "kind must be one of: " + ", ".join(hospital.LOG_SOURCE_KINDS))
     c = db()
     if c.execute("SELECT 1 FROM log_sources WHERE name=%s", (name,)).fetchone():
         raise Refuse(409, "log source already exists in this hospital")
@@ -1309,6 +1338,9 @@ def data_flow():
     since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime(detect.FMT)
     sources = c.execute(
         "SELECT ls.id, ls.name, ls.kind, ls.disabled_at IS NOT NULL AS disabled, "
+        "ls.skew_last_seconds AS last_skew_seconds, ls.skew_checked_at AS skew_checked_at, "
+        "CASE WHEN ls.skew_window_start >= now() - interval '24 hours' THEN ls.skew_window_max_seconds END "
+        "AS max_skew_seconds, "
         "(SELECT max(e.ts) FROM events e WHERE e.tenant = ls.tenant AND e.log_source_id = ls.id) AS last_seen_event_ts, "
         "(SELECT count(*) FROM events e WHERE e.tenant = ls.tenant AND e.log_source_id = ls.id AND e.ts >= %s) "
         "AS accepted_24h FROM log_sources ls WHERE ls.tenant = %s ORDER BY ls.id", (since, tenant)).fetchall()
@@ -1323,6 +1355,11 @@ def data_flow():
         resource_classification="telemetry", metadata={"source_count": len(sources)})
     commit()
     last_seen = max((s_["last_seen_event_ts"] for s_ in sources if s_["last_seen_event_ts"]), default=None)
+    limit = hospital.max_ntp_skew_seconds()
+    for s_ in sources:
+        # None until the source has sent an event: the check cannot say yet.
+        s_["ntp_threshold_seconds"] = limit
+        s_["ntp_in_sync"] = None if s_["max_skew_seconds"] is None else s_["max_skew_seconds"] <= limit
     return jsonify(
         last_seen_event_ts=last_seen,
         accepted_24h=sum(s_["accepted_24h"] for s_ in sources),
@@ -1577,7 +1614,7 @@ def alerts():
     tenant = hospital_scope(*HOSPITAL_READ, "vendor_admin")
     # Keep alert responses to a telemetry allowlist; free-form detail and resolution can carry secrets or PHI.
     q = ("SELECT id, created, event_ts, tenant, rule, rule_version, severity, summary, owner, step, status, ack_at, "
-         "verdict, source, (SELECT from_owner || ' -> ' || to_owner "
+         "verdict, verdict_at, threat_category, source, (SELECT from_owner || ' -> ' || to_owner "
          "FROM handoffs h WHERE h.alert_id = alerts.id ORDER BY h.id DESC LIMIT 1) AS last_handoff "
          "FROM alerts WHERE tenant=%s")
     args = [tenant]
@@ -1595,7 +1632,7 @@ def alert_detail(i):
     tenant = hospital_scope(*HOSPITAL_READ, "vendor_admin")
     row = db().execute(
         "SELECT id, created, event_ts, tenant, rule, rule_version, severity, summary, owner, step, status, ack_at, "
-        "verdict, source, (SELECT from_owner || ' -> ' || to_owner "
+        "verdict, verdict_at, threat_category, source, (SELECT from_owner || ' -> ' || to_owner "
         "FROM handoffs h WHERE h.alert_id = alerts.id ORDER BY h.id DESC LIMIT 1) AS last_handoff "
         "FROM alerts WHERE id=%s AND tenant=%s", (i, tenant)).fetchone()
     if not row:
@@ -2141,8 +2178,10 @@ def home():
 
 # Registered last: routes/mfa.py imports this module for the shared helpers (db, Refuse, commit, audit).
 from routes.mfa import bp as mfa_bp  # noqa: E402
+from routes.telemetry import bp as telemetry_bp  # noqa: E402
 
 app.register_blueprint(mfa_bp)
+app.register_blueprint(telemetry_bp)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

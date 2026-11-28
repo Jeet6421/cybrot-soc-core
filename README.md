@@ -72,6 +72,8 @@ Wazuh and other senders: point them at `https://<host>/api/ingest/wazuh` (or `/a
 | `INGEST_MAX_BODY_BYTES` | `1000000` | Request body size (`413` above) |
 | `SOC_SECRET_KEY` | (unset) | Encrypts TOTP secrets at rest. Required for MFA: without it, MFA setup and sign-in with MFA fail closed (`503`) |
 | `SOC_REQUIRE_PRIVILEGED_MFA` | `0` | `1`: `hospital_admin`, `l2` and `vendor_admin` must enrol MFA. Until they do, they can only reach the enrolment routes, sign-out and `/api/me` |
+| `MAX_NTP_SKEW_SECONDS` | `5` | Clock check (CERT-In): a source whose events drift further than this from the server clock in the last 24 hours shows `ntp_in_sync: false` in `GET /api/data-flow` |
+| `MEDICAL_NET_CIDRS` | (unset) | Comma-separated medical device networks monitored passively by Suricata, e.g. `10.20.0.0/16`. A device sending to a public address is an `medical_device_unexpected_egress` alert |
 | `SOC_LOGIN_RATE_LIMIT` | `20` | Sign-in attempts per (source address, tenant, username) per 15 minutes. Over the limit: `429` with `Retry-After` |
 | `STORAGE_MAINTENANCE_SECONDS` | `3600` | How often the worker creates upcoming partitions and drops expired ones |
 | `WORKER_POLL_SECONDS` | `5` | Seconds the response worker waits when the queue is empty (`worker.py`) |
@@ -173,6 +175,8 @@ trend (test plan step 4) can be tracked.
 ## Layout
 - `docs/STORAGE.md`  Partitions, 180-day retention, idempotent ingest, rate limits, backup and PITR, the recovery drill, Kafka triggers
 - `nginx/nginx.conf` and `nginx/default.conf`  TLS edge: HTTPS, security headers, body limit (certificates go in `nginx/tls/`, git-ignored)
+- `hospital.py`  log source catalog, threat taxonomy and SLAs, Suricata normalization, clock-check settings (no Flask, no database)
+- `routes/telemetry.py`  `POST /api/ingest/suricata`
 - `routes/mfa.py`  TOTP enrolment endpoints (`/api/mfa/setup`, `/api/mfa/verify`), registered as a blueprint in `app.py`
 - `scripts/partition_migrate.py` one-time conversion of an existing database to partitioned tables (owner role)
 - `scripts/recovery_drill.py` snapshot and verify a restored database (owner, then runtime role)
@@ -370,6 +374,14 @@ Events and Wazuh alerts sent with a key are stored under that key's hospital and
 - The dashboard shows each alert's latest handoff under the summary ("Handoff: analyst2 -> analyst1: note").
   Before this, a handoff note was saved in the history only, and the row showed only the closing note.
 - `GET /api/alerts` adds a `last_handoff` field (null when the alert was never handed off).
+
+**PR 16: Suricata sources, CERT-In clock check and threat taxonomy**
+- `log_sources.kind` must be one of `wazuh`, `suricata_ids`, `ehr_his_audit`, `ad_iam`, `firewall_syslog`, `edr`, `custom`. The API and `manage.py` both refuse other values.
+- `POST /api/ingest/suricata` takes Suricata EVE alert records (one or a list). Only a key from a `suricata_ids` source may post. Other EVE record types are counted as ignored. Alerts are `SURICATA:<sid>`, with `source: suricata`.
+- Clock check: each ingest keeps the latest drift and the largest drift in the last 24 hours per source. `GET /api/data-flow` returns `ntp_in_sync`, `max_skew_seconds` and the threshold. `ntp_in_sync` is `null` until a source has sent events. This is event age as well as clock error, so a source that batches its logs will show lag as skew.
+- Alerts carry `threat_category` (`ransomware`, `phishing`, `credential_abuse_impossible_travel`, `patient_record_snooping`, `medical_device_unexpected_egress`, `unknown_network_asset`, `tampering`, `other`). Alert responses add `sla_target_minutes` (critical 15, high 240, medium 1440, low 10080) and `sla_breached`.
+- `unknown_network_asset` is in the catalog but no rule uses it yet: it needs a comparison with the asset inventory.
+- Tests: `tests/test_hospital_telemetry.py`.
 
 **PR 15: container and edge hardening (OWASP Docker Cheat Sheet)**
 - Compose networks: `soc_internal` is `internal: true` and carries db, migrate, soc-core and worker. `soc_edge` carries nginx only.

@@ -12,7 +12,7 @@ from support import CITY, ORTHO
 def _source(world, tenant):
     name = f"idem-{uuid.uuid4().hex[:8]}"
     with psycopg.connect(world.owner_url) as owner:
-        manage.create_log_source(owner, tenant, name, "test")
+        manage.create_log_source(owner, tenant, name, "custom")
         key = manage.create_ingest_key(owner, tenant, name, "idempotency test")
         sid = owner.execute("SELECT id FROM log_sources WHERE tenant = %s AND name = %s", (tenant, name)).fetchone()[0]
         owner.commit()
