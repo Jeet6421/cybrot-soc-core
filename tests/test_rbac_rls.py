@@ -169,7 +169,9 @@ def test_tenant_leading_indexes_exist(runtime):
     assert set(found) == set(expected)
     for table, index_name in expected.items():
         assert index_name in found[table]
-        assert f"ON public.{table} USING btree (tenant" in found[table], found[table]
+        # A partitioned parent (events) reports its index as "ON ONLY public.<table>".
+        assert (f"ON public.{table} USING btree (tenant" in found[table]
+                or f"ON ONLY public.{table} USING btree (tenant" in found[table]), found[table]
 
 
 

@@ -870,6 +870,8 @@ def ingest():
         e["tenant"] = ident["tenant"]
         e["log_source_id"] = ident["log_source_id"]
         e["occurred_at"] = occurred
+        # Detection compares timestamps as text in detect.FMT, so store the canonical UTC form, whatever the sender sent.
+        e["ts"] = occurred.strftime(detect.FMT)
     c = db()
     _spend_ingest_quota(c, ident["tenant"], ident["log_source_id"], len(evs), raw_bytes, limits)
     made_ids, stored, duplicates = _store_events(c, evs)

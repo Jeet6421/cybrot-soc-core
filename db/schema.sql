@@ -167,10 +167,12 @@ CREATE TABLE IF NOT EXISTS events(id BIGSERIAL, ts TEXT, tenant TEXT, source TEX
   PRIMARY KEY (id, occurred_at)) PARTITION BY RANGE (occurred_at);
 CREATE INDEX IF NOT EXISTS ev_idx ON events(tenant, type, ts);
 CREATE INDEX IF NOT EXISTS ev_host_type_idx ON events(tenant, host, type, ts);
--- PR 13: an identical event (same source id, or same canonical payload) is stored once. The partition key is part of
--- the index, so a replay of the same event (same occurred_at) always lands in the same partition and conflicts there.
+-- PR 13: columns must exist before the index that uses them. A legacy table reaches this point without them.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS log_source_id BIGINT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS occurred_at TIMESTAMPTZ;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+-- PR 13: an identical event (same source id, or same canonical payload) is stored once. The partition key is part of
+-- the index, so a replay of the same event (same occurred_at) always lands in the same partition and conflicts there.
 CREATE UNIQUE INDEX IF NOT EXISTS events_dedupe_uidx ON events(tenant, (COALESCE(log_source_id, 0)), dedupe_key, occurred_at);
 ALTER TABLE events ADD COLUMN IF NOT EXISTS destination TEXT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS data_classification TEXT;
@@ -179,7 +181,6 @@ ALTER TABLE events ADD COLUMN IF NOT EXISTS src_zone TEXT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS dst_zone TEXT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS boundary_violation BOOLEAN;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS approved_change BOOLEAN;
-ALTER TABLE events ADD COLUMN IF NOT EXISTS log_source_id BIGINT;
 
 CREATE TABLE IF NOT EXISTS alerts(id BIGSERIAL PRIMARY KEY, created TEXT, event_ts TEXT, tenant TEXT, rule TEXT,
   rule_version TEXT, severity TEXT, summary TEXT, dkey TEXT, owner TEXT, step TEXT, status TEXT DEFAULT 'new',
